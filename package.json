@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.943.0",
+    "@aws-sdk/client-s3": "^3.943.0",
+    "@aws-sdk/credential-providers": "^3.943.0",
+    "@aws-sdk/lib-dynamodb": "^3.943.0"
+  }
+}
