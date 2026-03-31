@@ -455,6 +455,76 @@ The shell probes each declared registry at startup and merges their module listi
 
 ---
 
+## Local Development Workflow
+
+### The Problem
+
+Modules depend on real infrastructure: S3 for configs, bundles, and data; DynamoDB for project and application state. During development, a module author needs to:
+
+- Run their module against the live shell
+- Load other published modules alongside their new one to see how it fits
+- Drag in real test data (CSVs, images, logs, etc.) and have it behave exactly as it would in production
+- Use edit mode to configure slots and see config writes round-trip correctly
+
+Without a faithful local environment, there will be inconsistencies that only surface when the module is first published and used for real — the worst possible time to discover them.
+
+### Why Real AWS Is Not the Answer for Development
+
+Requiring developers to create a real AWS project for every new module is impractical:
+
+- Every test iteration requires a deploy step to S3
+- Test data uploaded to a real bucket incurs cost and accumulates
+- Multiple developers working on the same project would interfere with each other
+- Edit mode writes would mutate shared config files in real projects
+- There is no clean way to reset state between test runs
+
+### Recommended Approach: Local AWS Emulation (LocalStack)
+
+Run LocalStack locally to emulate S3 and DynamoDB with complete fidelity. The shell and all modules use the same AWS SDK calls against `http://localhost:4566` instead of real AWS — no code changes, no special cases, no divergence between dev and prod behavior.
+
+This is the correct answer because:
+- Edit mode, config writes, resource loading, and data uploads all work identically to production
+- Developers can mix real published modules (pulled from real S3) with their local module under development
+- Test data can be seeded and reset freely without cost or side effects
+- There is no "dev mode" divergence that hides bugs until publish time
+
+### Developer Workflow
+
+1. **Start LocalStack** — `docker compose up` spins up S3 + DynamoDB emulation
+2. **Seed a dev project** — a script creates a project record in local DynamoDB and scaffolds the project directory in local S3 (config.json, placeholder children)
+3. **Start module dev server** — `vite build --watch` in the module directory, or alias import if the module is in this monorepo
+4. **Point the shell at local** — an env var switches the AWS endpoint to LocalStack; the `?config=` URL param points to the dev project in local S3
+5. **Load real published modules into slots** — edit mode pulls from the real module registry; real bundles are fetched from real S3 but run in the local shell
+6. **Drop in test data** — drag files into the UI; they are written to local S3 under the dev project prefix, visible to all modules in the view
+7. **Iterate** — edits to `config.json` round-trip through local S3; DynamoDB state is persistent across restarts
+
+### Mixing Local and Remote
+
+A local dev project can load real published modules from real S3 into its slots alongside the module under development. The shell fetches real bundles with real credentials and runs them locally. This lets a developer see their new module in a realistic composed view without publishing anything.
+
+The reverse — a real production project loading a locally-served bundle — is intentionally not supported. Published projects should only load from verified S3 locations.
+
+### Data Seeding
+
+A `scripts/seed-local.ts` utility (to be built) will:
+- Create a dev project record in local DynamoDB
+- Write a scaffold `config.json` to local S3
+- Optionally copy sample data files (CSVs, images, logs) into the dev project prefix
+
+Developers can maintain multiple named seed presets (e.g. `seed-local --preset=hardware-eval`) to quickly recreate specific test configurations.
+
+### Edit Mode in Local Dev
+
+Because LocalStack emulates S3 and DynamoDB faithfully, edit mode works without any special cases. Config writes go to local S3, lock records go to local DynamoDB, and everything round-trips correctly. When the developer is satisfied, they publish the module bundle to the real registry and recreate the desired project configuration in a real project.
+
+### Open Questions for Local Dev
+
+- **Do we need one dev project per module, or can one shared dev project host all in-development modules?** A shared dev project is simpler but may cause state conflicts if multiple developers work simultaneously. Separate per-developer projects (seeded from the same preset) are cleaner.
+- **How are real-project credentials handled when pulling published modules into a local shell?** The developer needs real AWS credentials available locally in addition to the LocalStack endpoint. The shell needs to know which endpoint to use per-bucket (local vs. real). One approach: a `localBuckets` list in the dev env config; any bucket not on the list uses real AWS.
+- **Should the seed script be runnable without Docker?** An in-process S3/DynamoDB mock (e.g. `dynamo-local`, `mock-aws-s3`) could work for CI, but LocalStack is the recommended path for interactive development because it is more complete.
+
+---
+
 ## Open Questions
 
 - **Config bucket**: URL-specified. Users may host modules in their own buckets; IAM controls actual access. ✓ decided
@@ -462,3 +532,4 @@ The shell probes each declared registry at startup and merges their module listi
 - **Module registry**: Internal primary registry + external registries declared in root config. ✓ decided
 - **Write permissions UI**: Role from DynamoDB project record drives edit button visibility; graceful failure on actual write if IAM lags. ✓ decided
 - **IAM policy sync**: When an owner grants editor access by email, the IAM policy for the project's S3 prefix must be updated. This is done directly via the AWS SDK using the owner's credentials (no Lambda, no API Gateway). The owner's Cognito identity must have iam:PutRolePolicy or s3:PutBucketPolicy rights scoped to the project prefix. Direct SDK calls keep the access grant flow fast and eliminates the need for backend infrastructure.
+- **Local dev infrastructure**: LocalStack recommended for S3 + DynamoDB emulation. Per-developer dev projects seeded from shared presets. Mixed local/real-S3 loading supported via per-bucket endpoint routing. ✓ direction set, implementation pending.

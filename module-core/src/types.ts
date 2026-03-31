@@ -1,0 +1,76 @@
+import type React from "react";
+import type { S3Client } from "@aws-sdk/client-s3";
+
+// ---------------------------------------------------------------------------
+// Core schema types — the central contract between the shell and every module.
+// Every config.json stored in S3 must conform to ModuleConfig.
+// ---------------------------------------------------------------------------
+
+export type Resource = {
+  id: string;           // unique within the project; convention: "{moduleId}/{name}"
+  label: string;        // shown in the resource picker dialog
+  type: "s3-object" | "s3-prefix" | "dynamodb" | "api" | "other";
+  bucket?: string;      // S3 bucket (s3-object, s3-prefix)
+  key?: string;         // exact S3 key (s3-object) or prefix (s3-prefix)
+  table?: string;       // DynamoDB table name
+  region?: string;      // AWS region override (defaults to shell region)
+  endpoint?: string;    // API endpoint URL
+  mimeType?: string;    // hint for consumers (e.g. "text/csv", "image/png")
+  meta?: Record<string, unknown>;
+};
+
+export type ChildSlot = {
+  slotName: string;       // logical name for the slot, e.g. "content", "left-nav", "tab-1"
+  configPath: string;     // S3 key for the child's config.json
+  configBucket?: string;  // S3 bucket; if omitted, inherits from the parent config's bucket
+};
+
+export type ModuleConfig = {
+  id: string;
+  app: {
+    bucket: string;
+    key: string;
+    exportName?: string;  // named export to use; defaults to "default"
+  };
+  meta?: Record<string, unknown>;   // module-specific static settings (tabs, theme, etc.)
+  resources?: Resource[];           // datasets this module declares
+  children?: ChildSlot[];           // named child slots
+};
+
+// ---------------------------------------------------------------------------
+// Module bundle — what a compiled module JS file must export
+// ---------------------------------------------------------------------------
+
+export type ModuleProps = {
+  config: ModuleConfig;
+  // Everything else (credentials, resources, edit mode) comes from React context hooks.
+};
+
+export type ExportContext = {
+  config: ModuleConfig;
+  s3Client: S3Client;
+  projectPrefix: string;  // write exported data under: projectPrefix + config.id + "/export/"
+};
+
+export type ModuleBundle = {
+  default: React.ComponentType<ModuleProps>;
+  onExport?: (ctx: ExportContext) => Promise<void>;
+};
+
+// ---------------------------------------------------------------------------
+// Auth types — defined here so module-core hooks can reference them without
+// depending on auth-shell's Zustand store.
+// ---------------------------------------------------------------------------
+
+export type AwsCredentials = {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  expiration?: Date;
+};
+
+export type UserProfile = {
+  email?: string;
+  name?: string;
+  picture?: string;
+};

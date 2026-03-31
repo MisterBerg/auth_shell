@@ -22,7 +22,11 @@
     "noUnusedParameters": true,
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedSideEffectImports": true
+    "noUncheckedSideEffectImports": true,
+    "paths": {
+      "module-core": ["../module-core/src/index.ts"],
+      "app-landing": ["../app-landing/src/index.tsx"]
+    }
   },
   "include": ["src"]
 }

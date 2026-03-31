@@ -1,4 +1,6 @@
 {
+  "private": true,
+  "workspaces": ["module-core", "auth-shell", "app-landing", "module-template"],
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.943.0",
     "@aws-sdk/client-s3": "^3.943.0",

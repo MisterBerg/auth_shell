@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(lsof -ti:5174)",
+      "Bash(xargs kill:*)",
+      "Bash(netstat -ano)",
+      "Read(//c/Users/notha/projects/hardware_eval_platform/**)",
+      "Bash(xargs -I{} taskkill /PID {} /F)"
+    ]
+  }
+}
