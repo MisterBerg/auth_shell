@@ -1,29 +1,71 @@
-// src/aws/awsClients.ts
-import {
-  DynamoDBClient,
-  type DynamoDBClientConfig,
-} from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { S3Client, type S3ClientConfig } from "@aws-sdk/client-s3";
-import { useAuthStore } from "../stores/authStore";
-import { useConfigStore } from "../stores/configStore";
+import { useAuthStore } from "../stores/authStore.ts";
+import { useConfigStore } from "../stores/configStore.ts";
 
 export interface AwsClients {
   getDdbDocClient: () => Promise<DynamoDBDocumentClient>;
-  getS3Client: () => Promise<S3Client>;
+  getS3Client: (bucket?: string) => Promise<S3Client>;
 }
 
-// naive singletons for underlying clients, but creds are from provider
-let ddbDocClient: DynamoDBDocumentClient | null = null;
-let s3Client: S3Client | null = null;
+// ---------------------------------------------------------------------------
+// Local dev endpoint routing
+// In production builds these are all undefined and the routing is tree-shaken.
+// ---------------------------------------------------------------------------
 
+const localBuckets: ReadonlySet<string> = import.meta.env.DEV
+  ? new Set(
+      (import.meta.env.VITE_LOCAL_BUCKETS ?? "")
+        .split(",")
+        .map((b: string) => b.trim())
+        .filter(Boolean)
+    )
+  : new Set();
+
+const localS3Endpoint: string | undefined = import.meta.env.DEV
+  ? import.meta.env.VITE_LOCAL_S3_ENDPOINT
+  : undefined;
+
+const localDdbEndpoint: string | undefined = import.meta.env.DEV
+  ? import.meta.env.VITE_LOCAL_DYNAMODB_ENDPOINT
+  : undefined;
+
+const localCredentials =
+  import.meta.env.DEV && import.meta.env.VITE_LOCAL_AWS_ACCESS_KEY_ID
+    ? {
+        accessKeyId: import.meta.env.VITE_LOCAL_AWS_ACCESS_KEY_ID as string,
+        secretAccessKey: import.meta.env.VITE_LOCAL_AWS_SECRET_ACCESS_KEY as string,
+      }
+    : undefined;
+
+const localRegion: string | undefined = import.meta.env.DEV
+  ? (import.meta.env.VITE_LOCAL_AWS_REGION as string | undefined)
+  : undefined;
+
+function isLocalBucket(bucket?: string): boolean {
+  return !!bucket && localBuckets.has(bucket);
+}
+
+// ---------------------------------------------------------------------------
+// Client cache — one per endpoint (local and remote can both be in use)
+// ---------------------------------------------------------------------------
+
+let remoteDdbClient: DynamoDBDocumentClient | null = null;
+let localDdbClient: DynamoDBDocumentClient | null = null;
+const s3ClientCache = new Map<string, S3Client>(); // keyed by endpoint URL
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function installAutoResetOnAuthError(client: { middlewareStack: any }) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   client.middlewareStack.addRelativeTo(
     (next: any) => async (args: any) => {
       try {
         return await next(args);
-      } catch (err: any) {
-        const code = err?.name || err?.Code || err?.code;
+      } catch (err: unknown) {
+        const code = (err as { name?: string; Code?: string; code?: string })?.name
+          ?? (err as { Code?: string })?.Code
+          ?? (err as { code?: string })?.code;
 
         if (
           code === "ExpiredTokenException" ||
@@ -31,16 +73,15 @@ function installAutoResetOnAuthError(client: { middlewareStack: any }) {
           code === "InvalidIdentityTokenException" ||
           code === "NotAuthorizedException"
         ) {
-          console.warn("Auth-related AWS error, clearing session", err);
+          console.warn("[awsClients] Auth error — clearing session", err);
           useAuthStore.getState().clearSession();
         }
-
         throw err;
       }
     },
     {
       relation: "after",
-      toMiddleware: "awsAuthMiddleware", // best-effort; name may differ
+      toMiddleware: "awsAuthMiddleware",
       name: "autoResetOnAuthError",
       override: true,
     }
@@ -49,48 +90,83 @@ function installAutoResetOnAuthError(client: { middlewareStack: any }) {
 
 export function getAwsClients(): AwsClients {
   return {
+    /**
+     * Returns a DynamoDB client. In dev, if VITE_LOCAL_DYNAMODB_ENDPOINT is
+     * set, returns a client pointed at DynamoDB Local; otherwise real AWS.
+     */
     getDdbDocClient: async () => {
+      const useLocal = import.meta.env.DEV && !!localDdbEndpoint;
+
+      if (useLocal) {
+        if (!localDdbClient) {
+          const raw = new DynamoDBClient({
+            region: localRegion ?? "us-east-1",
+            endpoint: localDdbEndpoint,
+            credentials: localCredentials ?? { accessKeyId: "local", secretAccessKey: "local" },
+          });
+          localDdbClient = DynamoDBDocumentClient.from(raw, {
+            marshallOptions: { removeUndefinedValues: true },
+          });
+        }
+        return localDdbClient;
+      }
+
       const { config } = useConfigStore.getState();
       const { awsCredentialProvider } = useAuthStore.getState();
-
       if (!config) throw new Error("Config not initialized");
-      if (!awsCredentialProvider)
-        throw new Error("AWS credential provider not available");
+      if (!awsCredentialProvider) throw new Error("AWS credential provider not available");
 
-      if (!ddbDocClient) {
-        const baseConfig: DynamoDBClientConfig = {
+      if (!remoteDdbClient) {
+        const raw = new DynamoDBClient({
           region: config.region,
           credentials: awsCredentialProvider,
-        };
-        const rawClient = new DynamoDBClient(baseConfig);
-        installAutoResetOnAuthError(rawClient);
-        ddbDocClient = DynamoDBDocumentClient.from(rawClient, {
+        });
+        installAutoResetOnAuthError(raw);
+        remoteDdbClient = DynamoDBDocumentClient.from(raw, {
           marshallOptions: { removeUndefinedValues: true },
         });
       }
-
-      return ddbDocClient;
+      return remoteDdbClient;
     },
 
-    getS3Client: async () => {
-      const { config } = useConfigStore.getState();
-      const { awsCredentialProvider } = useAuthStore.getState();
+    /**
+     * Returns an S3 client appropriate for the given bucket.
+     * In dev, buckets listed in VITE_LOCAL_BUCKETS route to MinIO;
+     * all others route to real AWS. In production, always real AWS.
+     */
+    getS3Client: async (bucket?: string) => {
+      const useLocal = import.meta.env.DEV && !!localS3Endpoint && isLocalBucket(bucket);
+      const cacheKey = useLocal ? `local:${localS3Endpoint}` : "remote";
 
-      if (!config) throw new Error("Config not initialized");
-      if (!awsCredentialProvider)
-        throw new Error("AWS credential provider not available");
+      if (s3ClientCache.has(cacheKey)) {
+        return s3ClientCache.get(cacheKey)!;
+      }
 
-      if (!s3Client) {
+      let client: S3Client;
+
+      if (useLocal) {
+        client = new S3Client({
+          region: localRegion ?? "us-east-1",
+          endpoint: localS3Endpoint,
+          credentials: localCredentials ?? { accessKeyId: "local", secretAccessKey: "local" },
+          forcePathStyle: true, // required for MinIO
+        });
+      } else {
+        const { config } = useConfigStore.getState();
+        const { awsCredentialProvider } = useAuthStore.getState();
+        if (!config) throw new Error("Config not initialized");
+        if (!awsCredentialProvider) throw new Error("AWS credential provider not available");
+
         const s3Config: S3ClientConfig = {
           region: config.region,
           credentials: awsCredentialProvider,
         };
-        const client = new S3Client(s3Config);
+        client = new S3Client(s3Config);
         installAutoResetOnAuthError(client);
-        s3Client = client;
       }
 
-      return s3Client;
+      s3ClientCache.set(cacheKey, client);
+      return client;
     },
   };
 }

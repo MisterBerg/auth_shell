@@ -12,7 +12,7 @@ import type { AwsCredentials, UserProfile, Resource } from "./types.ts";
 export type AuthContextValue = {
   awsCredentialProvider: () => Promise<AwsCredentials>;
   userProfile?: UserProfile;
-  getS3Client: () => Promise<S3Client>;
+  getS3Client: (bucket?: string) => Promise<S3Client>;
   getDdbClient: () => Promise<DynamoDBDocumentClient>;
 };
 

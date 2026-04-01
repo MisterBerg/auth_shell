@@ -30,11 +30,10 @@ export function SlotContainer({ slot, parentBucket, fallback }: SlotContainerPro
 
   const LazyModule = useMemo(() => {
     return React.lazy(async () => {
-      const s3 = await getS3Client();
       const { config, Component } = await loadModule(
         bucket,
         slot.configPath,
-        s3,
+        getS3Client,
         registerResources
       );
       // Wrap so we can bind the resolved config without the parent needing to know it.

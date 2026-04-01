@@ -5,7 +5,17 @@
       "Bash(xargs kill:*)",
       "Bash(netstat -ano)",
       "Read(//c/Users/notha/projects/hardware_eval_platform/**)",
-      "Bash(xargs -I{} taskkill /PID {} /F)"
+      "Bash(xargs -I{} taskkill /PID {} /F)",
+      "Bash(cmd /c \"docker compose up -d\")",
+      "Bash(cmd /c \"docker compose up -d 2>&1\")",
+      "Bash(cmd /c \"docker ps\")",
+      "Bash(powershell -Command \"& 'C:\\\\Program Files\\\\RedHat\\\\Podman\\\\podman.exe' machine list 2>&1\")",
+      "Bash(powershell -Command \"& 'C:\\\\Program Files\\\\RedHat\\\\Podman\\\\podman.exe' ps 2>&1\")",
+      "Bash(powershell -Command \"& 'C:\\\\Program Files\\\\RedHat\\\\Podman\\\\podman.exe' compose -f 'c:\\\\Users\\\\notha\\\\projects\\\\hardware_eval_platform\\\\docker-compose.yml' up -d 2>&1\")",
+      "Bash(npm run:*)",
+      "Bash(cp \"c:/Users/notha/projects/hardware_eval_platform/.env.local.example\" \"c:/Users/notha/projects/hardware_eval_platform/auth-shell/.env.local\")",
+      "Bash(npx vite:*)",
+      "Bash(curl -sf http://localhost:5173)"
     ]
   }
 }

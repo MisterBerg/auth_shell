@@ -19,4 +19,20 @@ export default defineConfig({
       "app-landing": path.resolve(__dirname, "../app-landing/src/index.tsx"),
     },
   },
+  server: {
+    proxy: {
+      // Proxy local S3 (MinIO) and DynamoDB requests through the dev server
+      // so the browser never makes cross-origin requests — no CORS needed.
+      "/__local_s3": {
+        target: "http://localhost:9000",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/__local_s3/, ""),
+      },
+      "/__local_ddb": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/__local_ddb/, ""),
+      },
+    },
+  },
 });

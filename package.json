@@ -1,6 +1,16 @@
 {
   "private": true,
   "workspaces": ["module-core", "auth-shell", "app-landing", "module-template"],
+  "scripts": {
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "seed": "tsx scripts/seed-local.ts",
+    "publish:local": "tsx scripts/publish-module.ts --local",
+    "publish": "tsx scripts/publish-module.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.4"
+  },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.943.0",
     "@aws-sdk/client-s3": "^3.943.0",

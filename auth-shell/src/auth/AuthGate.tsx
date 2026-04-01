@@ -1,4 +1,4 @@
-import React, { useEffect, Suspense, useMemo } from "react";
+import React, { useEffect, Suspense, useMemo, Component, type ErrorInfo, type ReactNode } from "react";
 import { loadModule } from "module-core";
 import { useConfigStore } from "../stores/configStore.ts";
 import { useAuthStore } from "../stores/authStore.ts";
@@ -8,6 +8,30 @@ import { CONFIG } from "../config.ts";
 import { initAuthShell } from "./googleCognito.ts";
 import { getModuleLocationFromUrl } from "../remote/urlConfig.ts";
 import type { ModuleConfig } from "module-core";
+
+class ModuleErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("[AuthGate] Module load failed:", error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: "2rem", fontFamily: "monospace", color: "#fca5a5", background: "#0b1120", minHeight: "100vh" }}>
+          <strong>Failed to load module</strong>
+          <pre style={{ marginTop: "1rem", fontSize: "0.8rem", whiteSpace: "pre-wrap" }}>
+            {(this.state.error as Error).message}
+          </pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 /**
  * AuthGate orchestrates the top-level load sequence:
@@ -71,11 +95,10 @@ export const AuthGate: React.FC = () => {
         return { default: Bound };
       }
 
-      const s3 = await getS3Client();
       const { config: moduleConfig, Component } = await loadModule(
         moduleLocation.bucket,
         moduleLocation.configPath,
-        s3,
+        getS3Client,
         registerResources
       );
       const Bound = () => <Component config={moduleConfig as ModuleConfig} />;
@@ -150,23 +173,25 @@ export const AuthGate: React.FC = () => {
   }
 
   return (
-    <Suspense
-      fallback={
-        <div
-          style={{
-            minHeight: "100vh",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            background: "#020617",
-            color: "#e5e7eb",
-          }}
-        >
-          Loading…
-        </div>
-      }
-    >
-      <LazyApp />
-    </Suspense>
+    <ModuleErrorBoundary>
+      <Suspense
+        fallback={
+          <div
+            style={{
+              minHeight: "100vh",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "#020617",
+              color: "#e5e7eb",
+            }}
+          >
+            Loading…
+          </div>
+        }
+      >
+        <LazyApp />
+      </Suspense>
+    </ModuleErrorBoundary>
   );
 };

@@ -2,6 +2,45 @@ import type React from "react";
 import { GetObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import type { ModuleConfig, ModuleProps, Resource } from "./types.ts";
 
+// Serialises IIFE loads so concurrent requests don't race on window.RemoteModule.
+let iifeQueue: Promise<unknown> = Promise.resolve();
+
+function loadIife(jsCode: string): Promise<Record<string, unknown>> {
+  const next = iifeQueue.then(
+    () =>
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        const blob = new Blob([jsCode], { type: "text/javascript" });
+        const url = URL.createObjectURL(blob);
+        const script = document.createElement("script");
+        script.src = url;
+        script.onload = () => {
+          URL.revokeObjectURL(url);
+          script.remove();
+          // Vite IIFE lib builds assign to window[name] where name = lib.name ("RemoteModule")
+          const exports = (window as unknown as Record<string, unknown>)["RemoteModule"] as
+            | Record<string, unknown>
+            | undefined;
+          if (!exports) {
+            reject(new Error('Module did not assign to window.RemoteModule'));
+            return;
+          }
+          // Clear immediately so the next load starts clean
+          delete (window as unknown as Record<string, unknown>)["RemoteModule"];
+          resolve(exports);
+        };
+        script.onerror = () => {
+          URL.revokeObjectURL(url);
+          script.remove();
+          reject(new Error("Script load error — check the browser console for details"));
+        };
+        document.head.appendChild(script);
+      })
+  );
+  // Keep the queue moving even if this load fails
+  iifeQueue = next.catch(() => {});
+  return next;
+}
+
 export type LoadedModule = {
   config: ModuleConfig;
   Component: React.ComponentType<ModuleProps>;
@@ -21,11 +60,12 @@ export type LoadedModule = {
 export async function loadModule(
   configBucket: string,
   configPath: string,
-  s3: S3Client,
+  getS3Client: (bucket?: string) => Promise<S3Client>,
   onResourcesLoaded?: (resources: Resource[]) => void
 ): Promise<LoadedModule> {
-  // Step 1: fetch config
-  const configResp = await s3.send(
+  // Step 1: fetch config — route to correct endpoint for this bucket
+  const configS3 = await getS3Client(configBucket);
+  const configResp = await configS3.send(
     new GetObjectCommand({ Bucket: configBucket, Key: configPath })
   );
   const configJson = await configResp.Body!.transformToString("utf-8");
@@ -36,22 +76,13 @@ export async function loadModule(
     onResourcesLoaded(config.resources);
   }
 
-  // Step 2: fetch bundle
-  const bundleResp = await s3.send(
+  // Step 2: fetch bundle — route to correct endpoint for the bundle's bucket
+  const bundleS3 = await getS3Client(config.app.bucket);
+  const bundleResp = await bundleS3.send(
     new GetObjectCommand({ Bucket: config.app.bucket, Key: config.app.key })
   );
   const jsCode = await bundleResp.Body!.transformToString("utf-8");
-  const blob = new Blob([jsCode], { type: "text/javascript" });
-  const blobUrl = URL.createObjectURL(blob);
-
-  let rawModule: Record<string, unknown>;
-  try {
-    rawModule = await import(/* webpackIgnore: true */ blobUrl) as Record<string, unknown>;
-  } finally {
-    // Revoke after import resolves. The browser retains the parsed module
-    // internally; revoking the URL doesn't unload it.
-    URL.revokeObjectURL(blobUrl);
-  }
+  const rawModule = await loadIife(jsCode);
 
   const exportName = config.app.exportName ?? "default";
   const Component = rawModule[exportName] as React.ComponentType<ModuleProps> | undefined;
