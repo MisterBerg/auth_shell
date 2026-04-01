@@ -1,10 +1,24 @@
-# Hardware Eval Platform — Project Context
+# Jeffspace Loader — Project Context
 
 ## Vision
 
-A modular, config-driven web platform for hardware evaluation workflows. The UI is assembled at runtime from independently deployable React modules, each described by a configuration file stored in S3. The top-level shell authenticates the user, resolves the root config, and recursively loads the module tree. Every module follows the same protocol, so the shell never needs to know what a module does — only how to load it and pass it its config.
+A generic, config-driven micro-frontend framework that assembles a full web application at runtime from independently deployable React modules. The framework has no opinion about what those modules do — they could be hardware evaluation tools, project management dashboards, branded customer portals, or anything else. The shell authenticates the user, resolves a root config file from S3, and recursively loads the module tree. Every module follows the same protocol, so the shell never needs to know what a module does — only how to load it.
 
-The platform is designed to host tools like schematic viewers, BOM managers, task boards, and documentation viewers — all as composable, self-describing modules that an organization can configure without redeploying the shell.
+**Jeffspace** is the first real application built on this framework. It is the default app: an organizational project launcher that lists the user's projects and lets them open, create, and manage them. Jeffspace is not a demo or a placeholder — it demonstrates what a well-built top-level application looks like within the framework. Hardware Eval Platform is a project that runs *inside* Jeffspace, not the framework itself.
+
+The framework is designed to support wildly different use cases in the same shell: a hardware team's evaluation workbench, a customer-branded product portal, an internal productivity suite — each configured independently, each loading the right modules for its context, each optionally carrying its own visual theme.
+
+---
+
+## Naming
+
+| Thing | Name |
+|---|---|
+| The framework (shell + module system) | **Jeffspace Loader** |
+| The default app (project launcher) | **Jeffspace** |
+| An example project running in Jeffspace | Hardware Eval Platform |
+
+The `hep-` prefix on bucket names and table names reflects the original prototype name. These should be renamed to a framework-neutral prefix (e.g. `jsl-`) before any production deployment, but the local dev environment retains `hep-` for now.
 
 ---
 
@@ -12,13 +26,15 @@ The platform is designed to host tools like schematic viewers, BOM managers, tas
 
 ### Entry Point
 
-The user navigates to the shell with a URL that points to a root config file in S3:
+The user navigates to the shell with a URL that optionally points to a root config file in S3:
 
 ```
-https://shell.example.com/?config=apps/hardware-eval/config.json
+https://shell.example.com/?bucket=my-org&config=apps/hardware-eval/config.json
 ```
 
-Both the `bucket` and `key` come from the URL. Users may host valid modules in their own S3 buckets and the shell should not restrict this — IAM controls actual access. If no config is specified, the shell loads a default organizational landing page from a well-known S3 location configured in the shell's deployment config.
+If no `?bucket=&config=` params are present, the shell loads Jeffspace from a well-known S3 location configured in the shell's deployment config.
+
+Users may host valid modules in their own S3 buckets — IAM controls actual access. The shell does not restrict which buckets are valid sources.
 
 ### Auth Shell (`auth-shell`)
 
@@ -26,11 +42,17 @@ Responsibilities:
 - Authenticate the user (Google Sign-In → AWS Cognito Identity Pool → temporary AWS credentials)
 - Resolve the root `ModuleConfig` from S3 using those credentials
 - Bootstrap the recursive module loader
-- Provide global context to the module tree: auth state, AWS credential provider, edit mode flag
+- Provide global context to the module tree: auth state, AWS credential provider, sign-out callback, edit mode flag
 
-Auth is handled before any module is loaded. The module tree never deals with authentication directly — it receives an AWS credential provider via context and uses it to access its own resources.
+Auth is handled before any module is loaded. The module tree never deals with authentication directly — it receives context via hooks and uses the credential provider to access its own resources.
 
 Tech stack: React 19, Vite, Zustand, AWS SDK v3, Google Identity Services.
+
+### Full-Screen Takeover
+
+Loaded modules take over the full viewport. The shell has no persistent top bar or chrome. The reasoning: the top-level frame exists only as an orientation structure for the app's flow, and a persistent shell bar would intrude on every loaded application. Modules that want a header, navigation, or user badge are responsible for rendering those themselves.
+
+This means any shell-level UI element — like the OAuth user badge — must be available as an importable module that top-level apps can include as a child slot. This is intentional: it makes the badge itself a first-class test of the module framework.
 
 ---
 
@@ -79,7 +101,10 @@ type ModuleConfig = {
     exportName?: string;             // named export to use (default: "default")
   };
   meta?: Record<string, unknown>;    // module-specific static configuration
-                                     // (e.g. tab labels, markdown file key, color theme)
+  theme?: {
+    cssKey?: string;                 // S3 key for a project-level stylesheet
+    cssBucket?: string;              // S3 bucket for the stylesheet (defaults to app bucket)
+  };
   resources?: Resource[];            // AWS resources this module has access to
   children?: ChildSlot[];            // named child slots, each with their own config
 };
@@ -87,55 +112,32 @@ type ModuleConfig = {
 
 ### `Resource`
 
-Describes a dataset or AWS resource belonging to a module. Resources are declared in the module's config and registered globally at load time — any module in the tree can access any declared resource. The format is intentionally open-ended since data could be CSV files, images, DynamoDB tables, SQL databases, or anything else.
+Describes a dataset or AWS resource belonging to a module. Resources are declared in the module's config and registered globally at load time — any module in the tree can access any declared resource.
 
 ```ts
 type Resource = {
-  id: string;           // unique ID within the project, used to look up the resource globally
+  id: string;           // unique ID within the project
   label: string;        // human-readable name shown in the resource picker dialog
   type: "s3-object" | "s3-prefix" | "dynamodb" | "api" | "other";
   bucket?: string;      // for S3 types
   key?: string;         // for s3-object: exact key; for s3-prefix: directory prefix
   table?: string;       // for dynamodb
   endpoint?: string;    // for api
-  mimeType?: string;    // hint for consumers (e.g. "text/csv", "image/png", "application/json")
-  meta?: Record<string, unknown>;  // type-specific extras
+  mimeType?: string;    // hint for consumers (e.g. "text/csv", "image/png")
+  meta?: Record<string, unknown>;
 };
 ```
 
 ### `ChildSlot`
 
-A named slot within a module's layout that is filled by a child module. The child's full config is stored at a separate S3 path, resolved lazily when needed.
+A named slot within a module's layout that is filled by a child module.
 
 ```ts
 type ChildSlot = {
-  slotName: string;       // logical name for this slot (e.g. "content", "left-nav", "tab-1")
+  slotName: string;       // logical name (e.g. "content", "left-nav", "user-badge")
   configPath: string;     // S3 key for the child module's config.json
-                          // resolved relative to the same bucket as the parent
+  configBucket?: string;  // defaults to the parent's bucket
 };
-```
-
-### Example Config
-
-```json
-{
-  "id": "hardware-eval-root",
-  "app": {
-    "bucket": "my-org-apps",
-    "key": "apps/hardware-eval/bundle.js"
-  },
-  "meta": {
-    "title": "Hardware Eval"
-  },
-  "resources": [
-    { "type": "dynamodb", "table": "eval-sessions" }
-  ],
-  "children": [
-    { "slotName": "left-nav",  "configPath": "apps/hardware-eval/left-nav/config.json" },
-    { "slotName": "content",   "configPath": "apps/hardware-eval/content/config.json" },
-    { "slotName": "top-bar",   "configPath": "apps/hardware-eval/top-bar/config.json" }
-  ]
-}
 ```
 
 ---
@@ -144,124 +146,163 @@ type ChildSlot = {
 
 ### Two-Step Load
 
-Loading a module is always two steps:
-
 1. **Fetch config** — GET the `config.json` from S3, parse it as `ModuleConfig`
-2. **Fetch bundle** — GET the JS bundle at `config.app.key`, dynamic-import it as a blob URL, extract the named export
+2. **Fetch bundle** — GET the JS bundle, execute it as an IIFE via a blob URL + script tag, extract the named export from `window.RemoteModule`
 
-The current `loadRemoteAppFromS3.ts` implements step 2 only (pointed directly at a bundle). This needs to be refactored into a unified `loadModule(configPath)` function that does both steps.
+The IIFE format (not ES module) is used because browser dynamic imports cannot resolve bare specifiers (`react`, `module-core`) from blob URLs. The shell exposes shared dependencies as window globals; the module bundle declares them as externals referencing those globals.
+
+### Theme Injection
+
+If the resolved `ModuleConfig` contains a `theme.cssKey`, the shell fetches that stylesheet from S3 and injects it as a `<link>` into `<head>` before rendering the module. On navigation away, the stylesheet is removed. This gives each project full visual control — custom color schemes, fonts, branding images — without any module code changes.
+
+CSS custom properties (`--color-primary`, `--font-body`, etc.) are the right primitive: the shell defines defaults, the theme stylesheet overrides them, and modules reference the variables rather than hardcoding values.
+
+### Shared Window Globals
+
+The shell exposes shared dependencies synchronously at boot, before any module script runs:
+
+```ts
+window.__React            = React
+window.__ReactJsxRuntime  = ReactJsxRuntime
+window.__ReactDOM         = ReactDOM
+window.__ModuleCore       = moduleCore   // all of module-core's exports
+```
+
+Each module's Vite/Rollup build marks these as external and maps them to the global names. This is a lightweight alternative to Module Federation.
 
 ### Props Passed to Every Module
 
-Every loaded module component receives a standard set of props:
-
 ```ts
 type ModuleProps = {
-  config: ModuleConfig;    // the module's own resolved config (resources, children, meta)
+  config: ModuleConfig;
 };
 ```
 
-That's it. Everything else a module needs comes from shared React contexts provided by the shell — no tunneling through constructors or prop chains:
+Everything else comes from shared React contexts — no prop tunneling:
 
 | Context | Hook | What it provides |
 |---|---|---|
-| Auth | `useAwsCredentials()` | Credential provider for AWS SDK calls |
+| Auth | `useAuthContext()` | Credential provider, user profile, sign-out, S3 client factory, DDB client |
 | Resource Registry | `useResource(id)` | Descriptor for any resource declared in the project |
-| Resource Picker | `useResourcePicker()` | Opens the standard dataset selection dialog |
 | Edit Mode | `useEditMode()` | Whether the UI is in edit mode |
 
-Modules are not responsible for fetching their own config — they receive it already resolved. They are responsible for rendering their children via `<SlotContainer slotName="…" />`, which reads child config paths from the module's own `config.children`.
+### `AuthContextValue`
+
+```ts
+type AuthContextValue = {
+  awsCredentialProvider: () => Promise<AwsCredentials>;
+  userProfile?: UserProfile;           // name, email, picture from OAuth
+  signOut: () => void;                 // clears session; modules (e.g. user badge) call this
+  getS3Client: (bucket?: string) => Promise<S3Client>;
+  getDdbClient: () => Promise<DynamoDBDocumentClient>;
+};
+```
+
+`signOut` is in the context so that any module (including the OAuth badge module) can trigger it without reaching into the shell's internal store.
 
 ### `<SlotContainer>`
 
-A shared React component (in a common library package) that encapsulates the recursive loading logic:
+A shared React component (in `module-core`) that encapsulates the recursive loading logic:
 
-- Calls the loader with the child's `configPath`
+- Calls the loader with the child's `configPath` and `configBucket`
 - Renders a loading state while fetching
 - Renders an error boundary if loading fails
 - In edit mode, renders a configuration overlay on top of the loaded child
-- Otherwise renders the loaded child component with its resolved `ModuleConfig`
 
-All modules use `<SlotContainer>` for every child slot. This is what makes the recursion uniform.
+All modules use `<SlotContainer>` for every child slot.
+
+---
+
+## The OAuth User Badge (Planned Module)
+
+The OAuth user badge — showing the user's avatar and name, with a dropdown for sign-out and profile actions — is a standalone module, not part of the shell chrome.
+
+**Why a module?** Because the shell has no persistent top bar (full-screen takeover model). Apps that want the badge include it as a child slot; apps that don't (e.g. a kiosk display, an embedded view) simply omit it. This is intentional: the badge is the first real test that the module framework can host framework-level UI, not just application content.
+
+The badge module uses `useAuthContext()` for `userProfile` (avatar, name) and `signOut`. It needs no special access — it's a pure consumer of the auth context like any other module.
+
+Jeffspace includes the badge as a child slot. Custom top-level apps can do the same by adding it to their `children` array in their root config.
 
 ---
 
 ## Global Resource Registry
 
-### Motivation
+Data belongs to the project, not to individual modules. Resources are declared in whichever module's config owns them, but all resources from the entire config tree are aggregated into a single global context that any module can read from.
 
-Data belongs to the project, not to individual modules. A schematic viewer and a BOM editor working in the same project should both be able to reach the same component database without either one passing a handle to the other. Resources are declared in whichever module's config owns them, but all resources from the entire config tree are aggregated into a single global context that any module can read from.
-
-### How It Works
-
-Resource registration is **lazy** — resources are added to the global registry as each module's config is fetched, not by pre-crawling the entire tree at startup. When a `SlotContainer` resolves a child's config, it registers that config's `resources` into the registry before rendering the child. This keeps startup fast and avoids fetching configs for modules the user may never navigate to.
-
-Modules access resources via a hook — no props, no tunneling:
+Registration is **lazy** — resources are added to the registry as each module's config is fetched, not by pre-crawling the entire tree at startup.
 
 ```ts
 // inside any module component
-const csvFile = useResource("component-database-csv");   // returns Resource | undefined
+const csvFile = useResource("component-database-csv");
 ```
 
-The `Resource` descriptor provides the address (S3 key, DynamoDB table, etc.). The module fetches the actual data itself using **TanStack Query**, which provides an app-wide cache shared across all modules:
-
-```ts
-const s3 = useAwsS3Client();   // from shell context
-
-const { data } = useQuery({
-  queryKey: ["resource", "component-database-csv"],
-  queryFn: () => s3.send(new GetObjectCommand({ Bucket: res.bucket, Key: res.key })),
-});
-```
-
-TanStack Query handles caching, deduplication, and background refetch automatically. If two modules request the same resource, only one fetch is made. The query cache is app-wide, so data fetched by one module is immediately available to another that requests the same key.
-
-### Resource Picker Dialog
-
-A shared `<ResourcePicker>` component (in `module-core`) provides a standard UI for modules to let users select from available resources. It reads from `ResourceRegistry` and presents a filterable list showing each resource's label, type, and owning module. Modules open this dialog when they need the user to point them at a dataset — for example, a chart module asking "which table should I visualize?"
-
-In edit mode, resource bindings can be reconfigured through this same dialog. The selected resource `id` is saved into the module's `meta` config in S3.
+The `Resource` descriptor provides the address. The module fetches actual data using `useAwsS3Client()` or `useAwsDdbClient()` from context.
 
 ### Resource ID Uniqueness
 
-Resource `id` values must be unique within a project. Convention: `{moduleId}/{descriptive-name}` (e.g. `hardware-eval-root/component-db`). The shell warns at load time if duplicate IDs are detected across the tree.
+Resource `id` values must be unique within a project. Convention: `{moduleId}/{descriptive-name}`.
 
 ---
 
 ## Edit Mode
 
-A global boolean context (`EditModeContext`) that flows down the entire module tree.
-
-### Behavior
+A global boolean context (`EditModeContext`) flowing down the entire module tree.
 
 When `editMode` is `true`:
+- Every `<SlotContainer>` renders an overlay/border indicating it is configurable
+- Clicking the overlay opens a picker for selecting or replacing the module in that slot
+- The user can delete a slot's module
+- On confirm, the parent module's `config.json` is written back to S3
 
-- Every `<SlotContainer>` renders an overlay/border indicating it is a configurable slot
-- Clicking the overlay opens a picker dialog for selecting or replacing the module in that slot
-- The user can also delete a slot's module entirely
-- When replacing a module, the existing `meta` config is carried over to the new module. If the new module version is incompatible with parts of the old config, it loads what it can and the user rebuilds the rest — no hard failure, best-effort carry-over
-- On confirm, the parent module's `config.json` is written back to S3 with the updated `children` array
-
-Edit mode is toggled at the shell level. Individual modules do not need to implement any edit-mode logic — it is entirely handled by `<SlotContainer>` and the shell picker dialog.
+Edit mode is toggled at the shell level; individual modules implement none of this logic.
 
 ### Permission Model
 
-IAM controls actual S3 write access. The DynamoDB project record lists the owner and authorized editors by OAuth email/identity ID. When the app loads, it reads its own project record to determine the user's role. If the user is owner or an authorized editor, the edit mode button is rendered. If the user's credentials turn out not to have write access despite the role record suggesting otherwise, the worst outcome is a failed S3 write — the UI degrades gracefully rather than breaking. No upfront permission probing needed.
+IAM controls actual S3 write access. The DynamoDB project record lists the owner and authorized editors. If the user's credentials lack write access despite the role record suggesting otherwise, the worst outcome is a failed S3 write — the UI degrades gracefully.
 
 ---
 
-## Default App (Organizational Landing Page)
+## Jeffspace — The Default Application
 
-When no `?config=` parameter is present in the URL, the shell loads a default module from a well-known S3 path (configured in the shell's own deployment config, not hardcoded in source).
+Jeffspace is a full-screen application built on Jeffspace Loader. It is the default experience when no `?config=` param is in the URL, and it demonstrates what a polished top-level application looks like within the framework.
 
-The default app is itself a module following the same schema. It is responsible for:
+### Layout
 
-- Displaying the authenticated user's profile
-- Listing projects the user owns or has been added to as a collaborator
-- Each project entry links to that project's root config (i.e. sets `?config=` and navigates)
-- In edit mode, allowing the user to create a new project (writes a new config scaffold to S3)
+Full-screen. No shell chrome. Jeffspace manages its own header, navigation, and layout. The OAuth badge module is included as a child slot — positioned in the corner, optional, demonstrating the framework's composability.
 
-Project membership data lives in DynamoDB. The default app's config declares that table as a resource, and it reads/writes it directly using the AWS credential provider from context.
+### Project List
+
+Jeffspace's main view is a **tabbed interface** with two tabs:
+
+- **My Projects** — projects the user owns, sorted by most-recently-updated, single DynamoDB query (one page of results)
+- **Shared with Me** — projects where the user is a collaborator, queried via a separate GSI
+
+The tabbed layout is preferred over two separate listboxes because it keeps selection and details state simple: whichever tab is active drives which project's metadata is shown in the details panel.
+
+### Project Selection & Details
+
+Selecting a project in either tab opens a **details panel** (slide-in or side panel) showing:
+- Project name
+- Thumbnail image (if `thumbnailKey` is set)
+- Description
+- Owner (for shared projects)
+- Last modified date
+- An **Open** button that navigates to the project (`?bucket=&config=`)
+
+This two-stage interaction keeps the project list lightweight — card data comes from the DynamoDB query, richer metadata loads only on selection.
+
+### Creating a Project
+
+A **+** button in Jeffspace's own header opens a new project flow. On completion it:
+1. Writes a new `config.json` scaffold to S3 under `projects/{newId}/`
+2. Writes a DynamoDB record for the new project
+3. Navigates to the new project URL
+
+The + button is part of Jeffspace, not the shell. Other top-level apps do not inherit it.
+
+### Navigation
+
+The URL is the navigation state. Opening a project sets `?bucket=&config=` and navigates. The browser's back button returns to Jeffspace (bare URL). No home button needed — users bookmark Jeffspace and their frequent projects directly.
 
 ### Project Registry Schema (DynamoDB)
 
@@ -273,35 +314,62 @@ SK: projectId
 Attributes:
   role: "owner" | "editor" | "viewer"
   rootConfigPath: string        // S3 key for the project's root config.json
-  rootBucket: string            // S3 bucket for the project
+  rootBucket: string
   displayName: string
   description?: string
+  thumbnailKey?: string         // S3 key for a preview image
   createdAt: string (ISO 8601)
   updatedAt: string (ISO 8601)
+
+GSI: sharedWithUserId-updatedAt-index
+  PK: sharedWithUserId          // the collaborator's userId
+  SK: updatedAt                 // for sort order in "Shared with Me" tab
 ```
 
-Ownership and editor lists are maintained in this table. The project owner can add or remove editors and viewers by their OAuth email. IAM permission policies for the project's S3 prefix are created and updated dynamically as users are granted or revoked access — the shell or a backend function handles policy generation so the DynamoDB record and IAM stay in sync.
+The GSI on `sharedWithUserId` enables the "Shared with Me" tab to query in a single call without scanning. Design this GSI into the table at creation — retrofitting it is possible but disruptive.
 
 ### Resource Provisioning
 
-The default resource set provisioned at project creation:
+Default resources provisioned at project creation:
 - An S3 prefix (`projects/{projectId}/`) owned by the project
-- One shared DynamoDB table (`{projectId}-data`) for all modules in the project to use, with module-prefixed keys to avoid collisions
+- One shared DynamoDB table (`{projectId}-data`) for all modules in the project, with module-prefixed keys to avoid collisions
 
-Modules that require additional infrastructure (e.g. a dedicated DynamoDB table for high-volume data) declare this in their registry entry. When such a module is added to a project in edit mode, the shell prompts the owner to approve provisioning. All provisioned resources are recorded in the project manifest (see below).
+---
+
+## Project Export & Archive
+
+Before deletion or for backup, the shell produces a self-contained zip of the project.
+
+### Export Flow
+
+1. Shell reads the full config tree to enumerate all loaded modules
+2. For each module that exports an `onExport` function, the shell calls it sequentially
+3. Each module fetches its external data and writes it into its subdirectory under the project prefix
+4. Shell downloads the entire S3 prefix as a zip including `manifest.json`
+
+### Module Export Protocol
+
+```ts
+export async function onExport(ctx: {
+  config: ModuleConfig;
+  s3: S3Client;
+  projectPrefix: string;
+}): Promise<void> {
+  // fetch external data, write to S3
+}
+```
+
+Modules that only use S3 resources need not implement `onExport`.
 
 ### Project Manifest (`manifest.json`)
 
-A file written to the root of every project's S3 prefix. It is the authoritative record of everything the project owns or depends on. Updated whenever a resource is provisioned or an external source is linked.
+Authoritative record of everything the project owns or depends on.
 
 ```json
 {
   "projectId": "hardware-eval-abc123",
   "createdAt": "2026-03-31T00:00:00Z",
-  "s3": {
-    "bucket": "my-org-apps",
-    "prefix": "projects/hardware-eval-abc123/"
-  },
+  "s3": { "bucket": "my-org-apps", "prefix": "projects/hardware-eval-abc123/" },
   "provisionedResources": [
     { "type": "dynamodb", "table": "hardware-eval-abc123-data", "region": "us-east-2" }
   ],
@@ -311,252 +379,160 @@ A file written to the root of every project's S3 prefix. It is the authoritative
 }
 ```
 
-At project deletion, the shell reads the manifest and tears down every `provisionedResources` entry before removing the S3 prefix.
-
----
-
-## Project Export & Archive
-
-Before a project is deleted — or simply for backup — the shell can produce a self-contained zip of the entire project.
-
-### Export Flow
-
-1. Shell reads the full config tree to enumerate all loaded modules
-2. For each module that exports an `onExport` function, the shell calls it sequentially, passing S3 write access and the project prefix
-3. Each module is responsible for fetching its own external data (API responses, non-S3 sources) and writing it into its subdirectory under the project prefix in a predictable layout
-4. Once all modules complete, the shell downloads the entire S3 prefix as a zip
-5. The manifest is included in the zip
-
-### Module Export Protocol
-
-Exporting external data is optional but standardized. A module bundle may export an `onExport` function alongside its default component:
-
-```ts
-// module bundle exports:
-export default function MyComponent(props: ModuleProps) { … }
-
-export async function onExport(ctx: {
-  config: ModuleConfig;
-  s3: S3Client;
-  projectPrefix: string;  // module writes under: projectPrefix + config.id + "/export/"
-}): Promise<void> {
-  // fetch external data, write to S3
-}
-```
-
-Modules that only use S3 resources need not implement `onExport` — their data is already in the project prefix. Only modules with external dependencies (APIs, non-project DynamoDB tables, etc.) need to implement it.
-
-### Re-import
-
-A zip produced by export can be re-imported to reconstitute the project. The shell detects a `manifest.json` in the uploaded zip, creates a new project record, and re-provisions any resources listed in `provisionedResources`. External source links are preserved in the manifest but the module may need reconfiguration if the external endpoint has changed.
-
 ---
 
 ## Concurrent Edit Locking
-
-Only one user may be in edit mode for a project at a time. This is enforced via a lock record written directly to DynamoDB:
 
 ```
 Table: org-projects-locks
 PK: projectId
 Attributes:
   lockedBy: string      // OAuth email of the active editor
-  lockedAt: string      // ISO 8601
-  ttl: number           // Unix epoch; DynamoDB auto-expires the record
+  lockedAt: string
+  ttl: number           // Unix epoch; DynamoDB auto-expires
 ```
 
-When a user enters edit mode, the shell writes this record with a TTL of 30 minutes. A heartbeat refreshes the TTL every few minutes while edit mode is active. On clean exit from edit mode the record is deleted immediately.
-
-Other users see the lock in the UI — the edit button is replaced with "Editing locked by jeff@…". Users with write access (owner or editor role) may override the lock, which overwrites the record and steals edit mode. The previous editor's next heartbeat will find they no longer hold the lock and exit edit mode gracefully.
+Lock acquired on edit mode entry (TTL 30 min), refreshed by heartbeat, deleted on clean exit. Other users see "Editing locked by jeff@…". Owners/editors may override the lock.
 
 ---
 
 ## Shared Dependencies & Build Strategy
 
-Because every module is a separately built JS bundle, shared dependencies (React, React DOM, AWS SDK) must not be duplicated at runtime. Strategy:
-
-- The shell exposes React, ReactDOM, Zustand, and TanStack Query as globals on `window.__SHELL_DEPS__`
-- Each module's build config (Vite/Rollup) marks these as external and reads them from `window.__SHELL_DEPS__` at runtime
-- TanStack Query's `QueryClient` is instantiated once in the shell and provided via `QueryClientProvider` — all modules share the same cache instance
-- This is a lightweight alternative to Webpack Module Federation and works with Vite-built modules
-
-Each module bundle is built as an ES module (`format: "es"`) with a single default (or named) export that is the root React component.
+- Shell exposes React, ReactDOM, and module-core as window globals at boot
+- Module builds declare these as externals mapped to the global names
+- IIFE format (`format: "iife"`, `name: "RemoteModule"`) — not ES module — to avoid bare specifier failures in blob URL contexts
+- Each module is serialised through a queue to prevent `window.RemoteModule` race conditions during concurrent slot loads
 
 ---
 
 ## Packages in This Monorepo
 
-| Package | Purpose |
-|---|---|
-| `auth-shell` | Host application: auth, config resolution, module bootstrapping |
-| `module-core` *(planned)* | Shared types (`ModuleConfig`, `ModuleProps`, `Resource`, `ChildSlot`), `<SlotContainer>`, `loadModule()`, `EditModeContext` |
-| `app-landing` *(planned)* | Default organizational landing page module |
-| `app-markdown-viewer` *(planned)* | Simple module: renders markdown from an S3 resource |
-| `app-tab-viewer` *(planned)* | Module with a top tab bar; each tab is a child slot |
-| `app-task-board` *(planned)* | Jira-like task board backed by DynamoDB |
+| Package | Purpose | Status |
+|---|---|---|
+| `auth-shell` | Host application: auth, config resolution, module bootstrapping | Working |
+| `module-core` | Shared types, `<SlotContainer>`, `loadModule()`, contexts, hooks | Working |
+| `app-landing` | Jeffspace — the default organizational project launcher | In progress |
+| `module-template` | Starter template for new modules | Working |
+| `scripts/` | `seed-local.ts`, `publish-module.ts` | Working |
 
----
-
-## Current State of the Codebase
-
-- `auth-shell` is functional for auth (Google → Cognito) and loads a single remote bundle pointed to directly by URL params
-- URL params currently point to a bundle (`?bucket=&key=`); this needs to change to point to a config file (`?config=`)
-- No `module-core` package exists yet; shared types are inline in `auth-shell`
-- No default landing page exists; missing URL params currently shows an error screen
-- Microsoft auth is stubbed (placeholder button, not implemented)
-- Shell config (`region`, `identityPoolId`, `googleClientId`) is hardcoded in `src/config.ts`; should move to environment variables or a bootstrapped fetch
+Planned modules:
+| `module-oauth-badge` | Reusable user avatar/name badge with sign-out dropdown — first framework-level module | Planned |
+| `app-markdown-viewer` | Simple module: renders markdown from an S3 resource | Planned |
+| `app-tab-viewer` | Module with a top tab bar; each tab is a child slot | Planned |
+| `app-task-board` | Jira-like task board backed by DynamoDB | Planned |
 
 ---
 
 ## Module Registry
 
-The edit-mode picker draws modules from one or more registries. The primary registry is an internal platform service (DynamoDB + S3), but external registries can also be used.
+The edit-mode picker draws modules from one or more registries.
 
 ### Publishing & Ownership
 
-- Users publish modules by name. The original publisher owns all versions published under that name.
-- Other users may publish under a different name (forks or custom variants); they own their own name.
-- Published modules are versioned. The registry always offers all historical versions alongside the latest.
-- Configs reference modules by name and resolve to the latest bundle at load time (latest-pointer model). This means module updates are picked up automatically without reconfiguring.
+- Users publish modules by name. The original publisher owns all versions under that name.
+- Published modules are versioned. The registry retains all historical versions alongside latest.
+- Configs reference modules by name and resolve to the latest bundle at load time (latest-pointer model).
 
 ### Module Registry Record (DynamoDB)
 
 ```
 Table: module-registry
-PK: moduleName (globally unique, owner-namespaced e.g. "jeff/tab-viewer")
-SK: version (semver string, e.g. "1.0.0"; "latest" is a pointer record)
+PK: moduleName (e.g. "jeff/tab-viewer")
+SK: version (semver, e.g. "1.0.0"; "latest" is a pointer record)
 
 Attributes:
-  ownerId: string               // OAuth email of publisher
-  bundlePath: string            // S3 key for the compiled bundle
-  bundleBucket: string
-  category: string              // e.g. "layout", "viewer", "data", "utility"
-  displayName: string
-  description?: string
-  thumbnailUrl?: string         // S3 URL for a preview image of the rendered module
-  previewImageUrl?: string      // full screenshot if available
-  publishedAt: string (ISO 8601)
-  tags?: string[]
+  ownerId, bundlePath, bundleBucket, category, displayName,
+  description?, thumbnailUrl?, publishedAt, tags?
 ```
 
 ### External Registries
 
-Nothing prevents a config or sub-module config from pointing to an S3 location outside the internal registry. To support the edit-mode picker for external sources (including their thumbnails and metadata), the **root-level config** can declare external registry endpoints:
+Root-level configs may declare external registries:
 
 ```json
-{
-  "externalRegistries": [
-    { "name": "Partner Org", "endpoint": "https://modules.partner.example.com/registry.json" }
-  ]
-}
+{ "externalRegistries": [{ "name": "Partner Org", "endpoint": "https://…/registry.json" }] }
 ```
 
-The shell probes each declared registry at startup and merges their module listings into the picker. Thumbnails and metadata come from the registry response itself, so no special trust relationship is needed — the root config owner decides which external sources to include.
+The shell merges their listings into the picker at startup.
 
 ---
 
 ## Local Development Workflow
 
-### The Problem
+### Infrastructure
 
-Modules depend on real infrastructure: S3 for configs, bundles, and data; DynamoDB for project and application state. During development, a module author needs to:
+DynamoDB Local + MinIO in Docker Compose (`docker-compose.yml`). Both use the standard AWS SDK — only the endpoint URL changes between local and production.
 
-- Run their module against the live shell
-- Load other published modules alongside their new one to see how it fits
-- Drag in real test data (CSVs, images, logs, etc.) and have it behave exactly as it would in production
-- Use edit mode to configure slots and see config writes round-trip correctly
+Chosen over LocalStack: DynamoDB Local is maintained by Amazon (exact API compatibility); MinIO is battle-tested S3-compatible storage. Lighter weight and covers exactly what this platform needs.
 
-Without a faithful local environment, there will be inconsistencies that only surface when the module is first published and used for real — the worst possible time to discover them.
+### Vite Proxy for Local S3 and DynamoDB
 
-### Why Real AWS Is Not the Answer for Development
+Browser requests to MinIO and DynamoDB Local are routed through the Vite dev server proxy to avoid CORS issues entirely:
 
-Requiring developers to create a real AWS project for every new module is impractical:
+```
+VITE_LOCAL_S3_ENDPOINT=http://localhost:5173/__local_s3
+VITE_LOCAL_DYNAMODB_ENDPOINT=http://localhost:5173/__local_ddb
+```
 
-- Every test iteration requires a deploy step to S3
-- Test data uploaded to a real bucket incurs cost and accumulates
-- Multiple developers working on the same project would interfere with each other
-- Edit mode writes would mutate shared config files in real projects
-- There is no clean way to reset state between test runs
-
-### Recommended Approach: DynamoDB Local + MinIO in Docker
-
-Run **DynamoDB Local** (Amazon's official emulator) and **MinIO** (S3-compatible storage) together in a `docker-compose.yml`. Both use the standard AWS SDK — only the endpoint URL changes between local and production. No code changes, no special cases, no divergence.
-
-Chosen over LocalStack because:
-- DynamoDB Local is maintained by Amazon — exact API compatibility
-- MinIO is battle-tested S3-compatible storage (used in production by many organizations)
-- Lighter weight than LocalStack; covers exactly what this platform needs
-- LocalStack remains an option if services beyond S3 + DynamoDB are ever needed
+The Vite config proxies `/__local_s3/*` → `localhost:9000` and `/__local_ddb/*` → `localhost:8000`. The browser never makes cross-origin requests.
 
 ### The Publish Script
 
-`scripts/publish-module.ts` is a first-class tool in this monorepo. It handles the full publish lifecycle and is the same script used for local test publishes and real publishes — only the endpoint config changes.
+`scripts/publish-module.ts` is the same script for local test publishes and real publishes — only the endpoint config changes.
 
-What it does:
 1. Runs `vite build` in the target module directory
-2. Versions the output: writes `bundle.v{semver}.js` and updates the `latest` pointer (`bundle.js`)
-3. Uploads the bundle and a config template to S3 (MinIO locally, real S3 in production)
-4. Writes/updates the module registry record in DynamoDB (name, owner, version, category, thumbnail, etc.)
+2. Versions the output: writes `bundle.v{semver}.js`, updates `bundle.js` pointer
+3. Uploads to S3 (MinIO locally, real S3 in production)
+4. Writes/updates the module registry record in DynamoDB
 
-Usage:
 ```
-# Test publish against local Docker environment
-npx ts-node scripts/publish-module.ts --module=app-landing --local
-
-# Real publish
-npx ts-node scripts/publish-module.ts --module=app-landing
+npm run publish-module -- --module=app-landing --local   # local MinIO
+npm run publish-module -- --module=app-landing            # real AWS
 ```
-
-The `--local` flag swaps all endpoints to `http://localhost:9000` (MinIO) and `http://localhost:8000` (DynamoDB Local). Everything else is identical.
 
 ### Full Developer Lifecycle
 
-**Phase 1 — Local development (source)**
-Module is aliased directly into the shell via Vite. Fast HMR, no build step. Good for initial UI development. Does not test the build or publish path.
+**Phase 1 — Source alias**: Module aliased directly into shell via Vite. Fast HMR, no build step. Good for initial UI development.
 
-**Phase 2 — Local test publish**
-Run the publish script with `--local`. The module is built, versioned, and uploaded to MinIO. The shell loads it through the full registry → config → bundle path, exactly as production would. Edit mode, slot configuration, and config writes all round-trip through local DynamoDB and MinIO. Catches build config bugs, missing externals, and export name issues before they reach real AWS.
+**Phase 2 — Local test publish**: Full build → version → upload → registry record against MinIO + DynamoDB Local. Exercises the complete path including edit mode, config writes, and slot configuration.
 
-**Phase 3 — Real publish**
-Same script, no `--local` flag. Points at real S3 and real DynamoDB. Behavior is identical to Phase 2.
-
-This three-phase flow means there is no moment where a module is "live in production for the first time" — by Phase 3 it has already been exercised through the complete path.
+**Phase 3 — Real publish**: Same script, no `--local`. Behavior identical to Phase 2.
 
 ### Per-Developer Isolation
 
-Each developer runs their own Docker environment with their own seeded dev project. The seed script (`scripts/seed-local.ts`) creates:
-- A dev project record in local DynamoDB
-- A scaffold `config.json` in MinIO under `projects/{developer-name}-dev/`
-- Optional sample data files (CSVs, images, logs) under the same prefix
-
-Named presets let developers quickly recreate specific test configurations:
 ```
-npx ts-node scripts/seed-local.ts --preset=hardware-eval --developer=jeff
+npm run seed -- --developer=jeff        # scaffold dev project
+npm run seed -- --developer=jeff --reset  # wipe and re-seed
 ```
 
-Multiple developers do not share a local environment — each has their own Docker instance. This prevents config write conflicts during edit mode testing.
+The seed script creates buckets, DynamoDB tables, a scaffold `config.json`, and a project record. Each developer runs their own Docker instance.
 
 ### Per-Bucket Endpoint Routing
 
-When a local dev shell loads a real published module from real S3 alongside a local module, the shell needs to route S3 calls to the correct endpoint. A `VITE_LOCAL_BUCKETS` env var lists buckets served by MinIO; all others use real AWS:
-
 ```
-VITE_LOCAL_BUCKETS=jeff-dev-project,jeff-dev-registry
+VITE_LOCAL_BUCKETS=hep-dev-modules,hep-dev-registry
 ```
 
-The AWS client factory checks this list before creating each client. This logic is entirely absent from production builds (`import.meta.env.DEV` guard). Modules never know which endpoint they're talking to.
-
-### Edit Mode in Local Dev
-
-DynamoDB Local and MinIO emulate the APIs faithfully, so edit mode works without any special cases. Config writes, lock records, resource uploads — all round-trip correctly. Developers test the full edit → save → reload cycle locally before touching real infrastructure.
+The S3 client factory checks this list before creating each client — local buckets route to MinIO, others route to real AWS. Entirely absent from production builds.
 
 ---
 
-## Open Questions
+## Open Questions / Decisions
 
-- **Config bucket**: URL-specified. Users may host modules in their own buckets; IAM controls actual access. ✓ decided
-- **Module versioning**: Latest-pointer model (`bundle.js` always reflects latest publish). Registry retains all historical versions for rollback. ✓ decided
-- **Module registry**: Internal primary registry + external registries declared in root config. ✓ decided
-- **Write permissions UI**: Role from DynamoDB project record drives edit button visibility; graceful failure on actual write if IAM lags. ✓ decided
-- **IAM policy sync**: When an owner grants editor access by email, the IAM policy for the project's S3 prefix must be updated. This is done directly via the AWS SDK using the owner's credentials (no Lambda, no API Gateway). The owner's Cognito identity must have iam:PutRolePolicy or s3:PutBucketPolicy rights scoped to the project prefix. Direct SDK calls keep the access grant flow fast and eliminates the need for backend infrastructure.
-- **Local dev infrastructure**: DynamoDB Local + MinIO in Docker Compose. Per-developer isolated environments seeded from shared presets. Per-bucket endpoint routing for mixing local and real S3. Publish script (`scripts/publish-module.ts`) is the same for local and production, switched by `--local` flag. ✓ decided
+| Topic | Decision |
+|---|---|
+| Config source | URL params (`?bucket=&config=`); any bucket allowed; IAM controls access |
+| Default when no params | Load Jeffspace from well-known S3 path in shell deployment config |
+| Module versioning | Latest-pointer model (`bundle.js`); registry retains all versions |
+| Module format | IIFE with window globals; not ES module (blob URL bare specifier limitation) |
+| Module registry | Internal primary + external registries declared in root config |
+| Write permissions | Role from DynamoDB drives UI; graceful failure on actual write |
+| IAM policy sync | Direct SDK calls from owner's credentials; no Lambda required |
+| Local dev infrastructure | DynamoDB Local + MinIO in Docker; Vite proxy eliminates CORS |
+| Shell chrome | None — full-screen takeover; shell has no persistent top bar |
+| OAuth user badge | Standalone module, optional child slot; first framework-level module |
+| Navigation | URL is state; browser back returns to Jeffspace; no home button |
+| Theming | CSS file loaded from S3 path in `config.theme.cssKey`; CSS custom properties |
+| Shared projects display | Tabbed (My Projects / Shared with Me); selection opens details panel |
+| Shared projects query | GSI on `sharedWithUserId` + `updatedAt` sort key in `org-projects` table |
+| `signOut` in context | Yes — in `AuthContextValue` so badge module can trigger it via hook |

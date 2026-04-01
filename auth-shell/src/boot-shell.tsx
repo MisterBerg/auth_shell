@@ -18,13 +18,14 @@ win["__ReactDOM"] = ReactDOM;
 win["__ModuleCore"] = moduleCore;
 
 function ShellAuthProvider({ children }: { children: React.ReactNode }) {
-  const { awsCredentialProvider, userProfile } = useAuthStore();
+  const { awsCredentialProvider, userProfile, signOut } = useAuthStore();
   const { getS3Client, getDdbDocClient } = getAwsClients();
 
   const authValue: AuthContextValue = {
     awsCredentialProvider:
       awsCredentialProvider ?? (() => Promise.reject(new Error("Not signed in"))),
     userProfile,
+    signOut,
     getS3Client,
     getDdbClient: getDdbDocClient,
   };

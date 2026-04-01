@@ -117,11 +117,26 @@ async function ensureTable(name: string, pkName: string, skName?: string) {
     AttributeDefinitions: [
       { AttributeName: pkName, AttributeType: "S" },
       ...(skName ? [{ AttributeName: skName, AttributeType: "S" }] : []),
+      // GSI attributes for org-projects shared-project lookup
+      ...(name === PROJECTS_TABLE ? [
+        { AttributeName: "sharedWithUserId", AttributeType: "S" },
+        { AttributeName: "updatedAt", AttributeType: "S" },
+      ] : []),
     ],
     KeySchema: [
       { AttributeName: pkName, KeyType: "HASH" },
       ...(skName ? [{ AttributeName: skName, KeyType: "RANGE" }] : []),
     ],
+    ...(name === PROJECTS_TABLE ? {
+      GlobalSecondaryIndexes: [{
+        IndexName: "sharedWithUserId-updatedAt-index",
+        KeySchema: [
+          { AttributeName: "sharedWithUserId", KeyType: "HASH" },
+          { AttributeName: "updatedAt", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "ALL" },
+      }],
+    } : {}),
     BillingMode: "PAY_PER_REQUEST",
   }));
   console.log(`  ✓ table "${name}" created`);

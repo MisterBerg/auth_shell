@@ -12,6 +12,10 @@ import type { AwsCredentials, UserProfile, Resource } from "./types.ts";
 export type AuthContextValue = {
   awsCredentialProvider: () => Promise<AwsCredentials>;
   userProfile?: UserProfile;
+  /** Clears the session and returns the user to the sign-in screen.
+   *  Exposed here so modules (e.g. the OAuth badge) can trigger sign-out
+   *  without reaching into the shell's internal store. */
+  signOut: () => void;
   getS3Client: (bucket?: string) => Promise<S3Client>;
   getDdbClient: () => Promise<DynamoDBDocumentClient>;
 };
