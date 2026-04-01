@@ -478,50 +478,77 @@ Requiring developers to create a real AWS project for every new module is imprac
 - Edit mode writes would mutate shared config files in real projects
 - There is no clean way to reset state between test runs
 
-### Recommended Approach: Local AWS Emulation (LocalStack)
+### Recommended Approach: DynamoDB Local + MinIO in Docker
 
-Run LocalStack locally to emulate S3 and DynamoDB with complete fidelity. The shell and all modules use the same AWS SDK calls against `http://localhost:4566` instead of real AWS — no code changes, no special cases, no divergence between dev and prod behavior.
+Run **DynamoDB Local** (Amazon's official emulator) and **MinIO** (S3-compatible storage) together in a `docker-compose.yml`. Both use the standard AWS SDK — only the endpoint URL changes between local and production. No code changes, no special cases, no divergence.
 
-This is the correct answer because:
-- Edit mode, config writes, resource loading, and data uploads all work identically to production
-- Developers can mix real published modules (pulled from real S3) with their local module under development
-- Test data can be seeded and reset freely without cost or side effects
-- There is no "dev mode" divergence that hides bugs until publish time
+Chosen over LocalStack because:
+- DynamoDB Local is maintained by Amazon — exact API compatibility
+- MinIO is battle-tested S3-compatible storage (used in production by many organizations)
+- Lighter weight than LocalStack; covers exactly what this platform needs
+- LocalStack remains an option if services beyond S3 + DynamoDB are ever needed
 
-### Developer Workflow
+### The Publish Script
 
-1. **Start LocalStack** — `docker compose up` spins up S3 + DynamoDB emulation
-2. **Seed a dev project** — a script creates a project record in local DynamoDB and scaffolds the project directory in local S3 (config.json, placeholder children)
-3. **Start module dev server** — `vite build --watch` in the module directory, or alias import if the module is in this monorepo
-4. **Point the shell at local** — an env var switches the AWS endpoint to LocalStack; the `?config=` URL param points to the dev project in local S3
-5. **Load real published modules into slots** — edit mode pulls from the real module registry; real bundles are fetched from real S3 but run in the local shell
-6. **Drop in test data** — drag files into the UI; they are written to local S3 under the dev project prefix, visible to all modules in the view
-7. **Iterate** — edits to `config.json` round-trip through local S3; DynamoDB state is persistent across restarts
+`scripts/publish-module.ts` is a first-class tool in this monorepo. It handles the full publish lifecycle and is the same script used for local test publishes and real publishes — only the endpoint config changes.
 
-### Mixing Local and Remote
+What it does:
+1. Runs `vite build` in the target module directory
+2. Versions the output: writes `bundle.v{semver}.js` and updates the `latest` pointer (`bundle.js`)
+3. Uploads the bundle and a config template to S3 (MinIO locally, real S3 in production)
+4. Writes/updates the module registry record in DynamoDB (name, owner, version, category, thumbnail, etc.)
 
-A local dev project can load real published modules from real S3 into its slots alongside the module under development. The shell fetches real bundles with real credentials and runs them locally. This lets a developer see their new module in a realistic composed view without publishing anything.
+Usage:
+```
+# Test publish against local Docker environment
+npx ts-node scripts/publish-module.ts --module=app-landing --local
 
-The reverse — a real production project loading a locally-served bundle — is intentionally not supported. Published projects should only load from verified S3 locations.
+# Real publish
+npx ts-node scripts/publish-module.ts --module=app-landing
+```
 
-### Data Seeding
+The `--local` flag swaps all endpoints to `http://localhost:9000` (MinIO) and `http://localhost:8000` (DynamoDB Local). Everything else is identical.
 
-A `scripts/seed-local.ts` utility (to be built) will:
-- Create a dev project record in local DynamoDB
-- Write a scaffold `config.json` to local S3
-- Optionally copy sample data files (CSVs, images, logs) into the dev project prefix
+### Full Developer Lifecycle
 
-Developers can maintain multiple named seed presets (e.g. `seed-local --preset=hardware-eval`) to quickly recreate specific test configurations.
+**Phase 1 — Local development (source)**
+Module is aliased directly into the shell via Vite. Fast HMR, no build step. Good for initial UI development. Does not test the build or publish path.
+
+**Phase 2 — Local test publish**
+Run the publish script with `--local`. The module is built, versioned, and uploaded to MinIO. The shell loads it through the full registry → config → bundle path, exactly as production would. Edit mode, slot configuration, and config writes all round-trip through local DynamoDB and MinIO. Catches build config bugs, missing externals, and export name issues before they reach real AWS.
+
+**Phase 3 — Real publish**
+Same script, no `--local` flag. Points at real S3 and real DynamoDB. Behavior is identical to Phase 2.
+
+This three-phase flow means there is no moment where a module is "live in production for the first time" — by Phase 3 it has already been exercised through the complete path.
+
+### Per-Developer Isolation
+
+Each developer runs their own Docker environment with their own seeded dev project. The seed script (`scripts/seed-local.ts`) creates:
+- A dev project record in local DynamoDB
+- A scaffold `config.json` in MinIO under `projects/{developer-name}-dev/`
+- Optional sample data files (CSVs, images, logs) under the same prefix
+
+Named presets let developers quickly recreate specific test configurations:
+```
+npx ts-node scripts/seed-local.ts --preset=hardware-eval --developer=jeff
+```
+
+Multiple developers do not share a local environment — each has their own Docker instance. This prevents config write conflicts during edit mode testing.
+
+### Per-Bucket Endpoint Routing
+
+When a local dev shell loads a real published module from real S3 alongside a local module, the shell needs to route S3 calls to the correct endpoint. A `VITE_LOCAL_BUCKETS` env var lists buckets served by MinIO; all others use real AWS:
+
+```
+VITE_LOCAL_BUCKETS=jeff-dev-project,jeff-dev-registry
+```
+
+The AWS client factory checks this list before creating each client. This logic is entirely absent from production builds (`import.meta.env.DEV` guard). Modules never know which endpoint they're talking to.
 
 ### Edit Mode in Local Dev
 
-Because LocalStack emulates S3 and DynamoDB faithfully, edit mode works without any special cases. Config writes go to local S3, lock records go to local DynamoDB, and everything round-trips correctly. When the developer is satisfied, they publish the module bundle to the real registry and recreate the desired project configuration in a real project.
-
-### Open Questions for Local Dev
-
-- **Do we need one dev project per module, or can one shared dev project host all in-development modules?** A shared dev project is simpler but may cause state conflicts if multiple developers work simultaneously. Separate per-developer projects (seeded from the same preset) are cleaner.
-- **How are real-project credentials handled when pulling published modules into a local shell?** The developer needs real AWS credentials available locally in addition to the LocalStack endpoint. The shell needs to know which endpoint to use per-bucket (local vs. real). One approach: a `localBuckets` list in the dev env config; any bucket not on the list uses real AWS.
-- **Should the seed script be runnable without Docker?** An in-process S3/DynamoDB mock (e.g. `dynamo-local`, `mock-aws-s3`) could work for CI, but LocalStack is the recommended path for interactive development because it is more complete.
+DynamoDB Local and MinIO emulate the APIs faithfully, so edit mode works without any special cases. Config writes, lock records, resource uploads — all round-trip correctly. Developers test the full edit → save → reload cycle locally before touching real infrastructure.
 
 ---
 
@@ -532,4 +559,4 @@ Because LocalStack emulates S3 and DynamoDB faithfully, edit mode works without 
 - **Module registry**: Internal primary registry + external registries declared in root config. ✓ decided
 - **Write permissions UI**: Role from DynamoDB project record drives edit button visibility; graceful failure on actual write if IAM lags. ✓ decided
 - **IAM policy sync**: When an owner grants editor access by email, the IAM policy for the project's S3 prefix must be updated. This is done directly via the AWS SDK using the owner's credentials (no Lambda, no API Gateway). The owner's Cognito identity must have iam:PutRolePolicy or s3:PutBucketPolicy rights scoped to the project prefix. Direct SDK calls keep the access grant flow fast and eliminates the need for backend infrastructure.
-- **Local dev infrastructure**: LocalStack recommended for S3 + DynamoDB emulation. Per-developer dev projects seeded from shared presets. Mixed local/real-S3 loading supported via per-bucket endpoint routing. ✓ direction set, implementation pending.
+- **Local dev infrastructure**: DynamoDB Local + MinIO in Docker Compose. Per-developer isolated environments seeded from shared presets. Per-bucket endpoint routing for mixing local and real S3. Publish script (`scripts/publish-module.ts`) is the same for local and production, switched by `--local` flag. ✓ decided
