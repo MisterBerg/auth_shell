@@ -28,6 +28,7 @@ export {
   useAwsS3Client,
   useAwsDdbClient,
   useUserProfile,
+  useSignOut,
   useResource,
   useAllResources,
   useRegisterResources,

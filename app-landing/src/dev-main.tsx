@@ -23,6 +23,7 @@ const mockAuthValue: AuthContextValue = {
     email: "dev@example.com",
     picture: "https://ui-avatars.com/api/?name=Dev+User&background=3b82f6&color=fff",
   },
+  signOut: () => console.info("[dev] signOut called"),
   getS3Client: () => Promise.reject(new Error("S3 not available in dev harness")),
   getDdbClient: () => Promise.reject(new Error("DynamoDB not available in dev harness")),
 };

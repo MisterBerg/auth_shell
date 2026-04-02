@@ -36,6 +36,11 @@ export function useUserProfile() {
   return useAuthContext().userProfile;
 }
 
+/** Returns the sign-out function. Clears the session and returns to the sign-in screen. */
+export function useSignOut() {
+  return useAuthContext().signOut;
+}
+
 // ---------------------------------------------------------------------------
 // Resource registry hooks
 // ---------------------------------------------------------------------------

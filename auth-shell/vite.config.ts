@@ -21,13 +21,9 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      // Proxy local S3 (MinIO) and DynamoDB requests through the dev server
-      // so the browser never makes cross-origin requests — no CORS needed.
-      "/__local_s3": {
-        target: "http://localhost:9000",
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/__local_s3/, ""),
-      },
+      // Proxy DynamoDB Local requests to avoid CORS issues.
+      // S3 (MinIO) is accessed directly — buckets are set to public for local dev,
+      // which avoids the request-signing path mismatch that a proxy would cause.
       "/__local_ddb": {
         target: "http://localhost:8000",
         changeOrigin: true,

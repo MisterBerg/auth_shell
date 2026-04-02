@@ -150,6 +150,11 @@ export function getAwsClients(): AwsClients {
           endpoint: localS3Endpoint,
           credentials: localCredentials ?? { accessKeyId: "local", secretAccessKey: "local" },
           forcePathStyle: true, // required for MinIO
+          // MinIO drops the connection (rather than returning a clean error) for the
+          // x-amz-checksum-* headers the browser SDK adds automatically to PUT requests.
+          // Disable automatic checksum calculation for local dev only.
+          requestChecksumCalculation: "WHEN_REQUIRED",
+          responseChecksumValidation: "WHEN_REQUIRED",
         });
       } else {
         const { config } = useConfigStore.getState();

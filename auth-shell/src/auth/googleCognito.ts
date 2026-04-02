@@ -4,6 +4,7 @@ import type { AppConfig } from "../config";
 import {
   useAuthStore,
   registerAuthHandlers,
+  loadSavedSession,
   type AwsCredentials,
 } from "../stores/authStore";
 
@@ -164,6 +165,18 @@ type InitAuthShellOptions = {
 
 export function initAuthShell({ config }: InitAuthShellOptions) {
   storedConfig = config;
+
+  // Restore session from sessionStorage if a previous Google token was saved.
+  // This keeps the user signed in across hard reloads within the same tab session.
+  const saved = loadSavedSession();
+  if (saved && !useAuthStore.getState().isSignedIn) {
+    const awsCredentialProvider = makeAwsCredentialProviderFromGoogle(config, saved.googleToken);
+    useAuthStore.getState().setGoogleSession({
+      googleToken: saved.googleToken,
+      userProfile: saved.userProfile,
+      awsCredentialProvider,
+    });
+  }
 
   // Register handlers so the store always has something (even if we don't
   // call signInWithGoogle from UI anymore, this keeps the plumbing sane).

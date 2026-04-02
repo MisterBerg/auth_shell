@@ -1,4 +1,4 @@
-import React, { useEffect, Suspense, useMemo, Component, type ErrorInfo, type ReactNode } from "react";
+import React, { useEffect, useState, Suspense, useMemo, Component, type ErrorInfo, type ReactNode } from "react";
 import { loadModule } from "module-core";
 import { useConfigStore } from "../stores/configStore.ts";
 import { useAuthStore } from "../stores/authStore.ts";
@@ -34,16 +34,27 @@ class ModuleErrorBoundary extends Component<
 }
 
 /**
+ * Reads the current URL and returns the module location.
+ * Called on every render so it always reflects the live URL.
+ */
+function getCurrentModuleLocation() {
+  const fromUrl = getModuleLocationFromUrl();
+  if (fromUrl) return { ...fromUrl, isDefault: false };
+  return {
+    bucket: CONFIG.defaultAppBucket,
+    configPath: CONFIG.defaultAppConfigPath,
+    isDefault: true,
+  };
+}
+
+/**
  * AuthGate orchestrates the top-level load sequence:
  *
  * 1. Initialise auth (Google GIS + Cognito) on first render.
  * 2. Show sign-in UI until the user is authenticated.
- * 3. Resolve the module to load:
- *      - If ?bucket=&config= present → load that module
- *      - Otherwise              → load the default org landing page
- * 4. Two-step load via module-core's loadModule():
- *      a. Fetch config.json from S3
- *      b. Fetch and dynamic-import the JS bundle
+ * 3. Resolve the module to load from URL params (or default).
+ * 4. Navigate between modules via history.pushState — no page reloads,
+ *    so the auth session is preserved in memory.
  * 5. Render the loaded component inside a Suspense boundary.
  */
 export const AuthGate: React.FC = () => {
@@ -53,6 +64,9 @@ export const AuthGate: React.FC = () => {
   const getS3Client = useAwsS3Client();
   const registerResources = useRegisterResources();
 
+  // Track the current URL location as state so navigation triggers re-render
+  const [moduleLocation, setModuleLocation] = useState(getCurrentModuleLocation);
+
   // One-time shell init
   useEffect(() => {
     if (!config) {
@@ -61,34 +75,40 @@ export const AuthGate: React.FC = () => {
     }
   }, [config, setConfig]);
 
-  // Resolve which module to load from URL or fall back to default
-  const moduleLocation = useMemo(() => {
-    const fromUrl = getModuleLocationFromUrl();
-    if (fromUrl) return fromUrl;
-    return {
-      bucket: CONFIG.defaultAppBucket,
-      configPath: CONFIG.defaultAppConfigPath,
-    };
+  // Listen for browser back/forward navigation
+  useEffect(() => {
+    const onPopState = () => setModuleLocation(getCurrentModuleLocation());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  // Listen for in-app navigation dispatched by modules (e.g. Jeffspace opening a project)
+  useEffect(() => {
+    const onNavigate = () => setModuleLocation(getCurrentModuleLocation());
+    window.addEventListener("shell:navigate", onNavigate);
+    return () => window.removeEventListener("shell:navigate", onNavigate);
   }, []);
 
   const ready = isSignedIn && !!awsCredentialProvider;
 
-  // Build the lazy component once auth is ready and the location is known
+  // Build the lazy component whenever auth becomes ready or the location changes
   const LazyApp = useMemo(() => {
     if (!ready) return null;
 
-    const isDefaultApp =
-      !getModuleLocationFromUrl() &&
-      import.meta.env.DEV;
+    const { bucket, configPath, isDefault } = moduleLocation;
+    const useDevAlias = isDefault && import.meta.env.DEV;
 
     return React.lazy(async (): Promise<{ default: React.ComponentType }> => {
       // Dev-mode shortcut: load app-landing directly from source instead of S3
       // so the default landing page works without a deployed bucket.
-      if (isDefaultApp) {
+      if (useDevAlias) {
         const { default: LandingApp } = await import("app-landing");
         const devConfig: ModuleConfig = {
           id: "app-landing-dev",
-          app: { bucket: "dev", key: "bundle.js" },
+          // Use the same local bucket names as the seed script so that
+          // isLocalBucket() routes writes to MinIO rather than real AWS.
+          app: { bucket: "hep-dev-registry", key: "bundle.js" },
+          meta: { projectsBucket: "hep-dev-modules" },
         };
         const Bound = () => <LandingApp config={devConfig} />;
         Bound.displayName = "RootModule[dev]";
@@ -96,8 +116,8 @@ export const AuthGate: React.FC = () => {
       }
 
       const { config: moduleConfig, Component } = await loadModule(
-        moduleLocation.bucket,
-        moduleLocation.configPath,
+        bucket,
+        configPath,
         getS3Client,
         registerResources
       );
@@ -107,7 +127,7 @@ export const AuthGate: React.FC = () => {
     });
   }, [ready, moduleLocation, getS3Client, registerResources]);
 
-  // Sign-in screen (shown until authenticated)
+  // Sign-in screen
   if (!ready || !LazyApp) {
     return (
       <div

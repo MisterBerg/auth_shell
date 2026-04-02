@@ -22,6 +22,7 @@ import {
   PutObjectCommand,
   DeleteObjectsCommand,
   ListObjectsV2Command,
+  PutBucketPolicyCommand,
 } from "@aws-sdk/client-s3";
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,22 @@ async function ensureBucket(bucket: string) {
       throw err;
     }
   }
+
+  // Make the bucket public so the browser SDK can read and write without
+  // request-signing path issues (a local-dev-only convenience — not for prod).
+  await s3.send(new PutBucketPolicyCommand({
+    Bucket: bucket,
+    Policy: JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [{
+        Effect: "Allow",
+        Principal: "*",
+        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+        Resource: [`arn:aws:s3:::${bucket}`, `arn:aws:s3:::${bucket}/*`],
+      }],
+    }),
+  }));
+  console.log(`  ✓ bucket "${bucket}" set to public`);
 }
 
 async function emptyBucketPrefix(bucket: string, prefix: string) {
@@ -198,7 +215,11 @@ async function main() {
       bucket: REGISTRY_BUCKET,
       key: "modules/app-landing/bundle.js",
     },
-    meta: { title: `${developer}'s Dev Project` },
+    meta: {
+      title: `${developer}'s Dev Project`,
+      // The bucket where new project config.json files will be written by Jeffspace
+      projectsBucket: MODULES_BUCKET,
+    },
     resources: [],
     children: [],
   };

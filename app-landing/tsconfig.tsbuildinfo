@@ -1,1 +1,1 @@
-{"root":["./src/dev-main.tsx","./src/index.tsx"],"version":"5.9.3"}
+{"root":["./src/newprojectdialog.tsx","./src/projectdetails.tsx","./src/projecttabs.tsx","./src/topbar.tsx","./src/dev-main.tsx","./src/index.tsx","./src/types.ts","./src/useprojects.ts"],"version":"5.9.3"}

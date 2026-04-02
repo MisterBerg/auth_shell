@@ -1,100 +1,118 @@
-import React from "react";
+import React, { useState, useCallback } from "react";
 import type { ModuleProps } from "module-core";
-import { useUserProfile, useAwsDdbClient, useEditMode } from "module-core";
+import { useUserProfile } from "module-core";
+import { TopBar } from "./TopBar.tsx";
+import { ProjectTabs } from "./ProjectTabs.tsx";
+import { ProjectDetails } from "./ProjectDetails.tsx";
+import { NewProjectDialog } from "./NewProjectDialog.tsx";
+import { useMyProjects, useSharedProjects, useCreateProject } from "./useProjects.ts";
+import type { ProjectRecord } from "./types.ts";
 
 /**
- * app-landing — the default organizational landing page.
+ * Jeffspace — the default organizational project launcher.
  *
- * Loaded by auth-shell when no ?config= URL param is present.
- * Responsibilities:
- *   - Display the authenticated user's profile
- *   - List projects the user owns or has been added to (from DynamoDB org-projects table)
- *   - Each project navigates to ?bucket=...&config=... for that project's root config
- *   - In edit mode, allow creating a new project
+ * Loaded by auth-shell when no ?bucket=&config= URL params are present.
+ * Full-screen layout with a persistent top bar (Jeffspace-specific chrome).
+ *
+ * config.meta is expected to carry:
+ *   projectsBucket  — bucket where project config.json files live
  */
-export default function LandingApp({ config }: ModuleProps) {
+export default function JeffspaceApp({ config }: ModuleProps) {
   const userProfile = useUserProfile();
-  const getDdbClient = useAwsDdbClient();
-  const { editMode } = useEditMode();
+  const createProject = useCreateProject();
 
-  // TODO: fetch projects from DynamoDB org-projects table using getDdbClient()
-  // Table: org-projects  PK: userId (OAuth email)  SK: projectId
-  void getDdbClient; // will be used when project fetching is implemented
-  void config;
+  const userId = userProfile?.email ?? "";
+  const projectsBucket = (config.meta?.projectsBucket as string | undefined) ?? config.app.bucket;
+
+  const { projects: myProjects, loading: myLoading, error: myError, reload: reloadMine } = useMyProjects(userId);
+  const { projects: sharedProjects, loading: sharedLoading, error: sharedError } = useSharedProjects(userId);
+
+  const [activeTab, setActiveTab] = useState<"mine" | "shared">("mine");
+  const [selectedProject, setSelectedProject] = useState<ProjectRecord | undefined>();
+  const [showNewDialog, setShowNewDialog] = useState(false);
+
+  const handleSelectProject = useCallback((project: ProjectRecord) => {
+    setSelectedProject((prev) =>
+      prev?.projectId === project.projectId ? undefined : project
+    );
+  }, []);
+
+  const navigateTo = useCallback((bucket: string, configPath: string) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("bucket", bucket);
+    url.searchParams.set("config", configPath);
+    history.pushState(null, "", url.toString());
+    // Tell the shell to re-read the URL and swap the loaded module
+    window.dispatchEvent(new Event("shell:navigate"));
+  }, []);
+
+  const handleOpenProject = useCallback((project: ProjectRecord) => {
+    navigateTo(project.rootBucket, project.rootConfigPath);
+  }, [navigateTo]);
+
+  const handleCreateProject = useCallback(async (displayName: string, description: string) => {
+    const created = await createProject({
+      userId,
+      displayName,
+      description: description || undefined,
+      projectsBucket,
+      registryBucket: config.app.bucket,
+    });
+    setShowNewDialog(false);
+    reloadMine();
+    navigateTo(created.rootBucket, created.rootConfigPath);
+  }, [userId, projectsBucket, config.app.bucket, createProject, reloadMine, navigateTo]);
 
   return (
     <div
       style={{
-        minHeight: "100vh",
-        fontFamily: "system-ui, sans-serif",
-        background: "#0b1120",
+        display: "flex",
+        flexDirection: "column",
+        height: "100vh",
+        background: "#080f1c",
         color: "#e5e7eb",
-        padding: "2rem",
+        fontFamily: "system-ui, -apple-system, sans-serif",
+        overflow: "hidden",
       }}
     >
-      {/* Header */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          marginBottom: "2rem",
-          borderBottom: "1px solid #1e2d40",
-          paddingBottom: "1rem",
-        }}
-      >
-        <h1 style={{ fontSize: "1.5rem", margin: 0 }}>Hardware Eval Platform</h1>
-        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-          {userProfile?.picture && (
-            <img
-              src={userProfile.picture}
-              alt={userProfile.name ?? "User"}
-              style={{ width: 36, height: 36, borderRadius: "50%" }}
-            />
-          )}
-          <span style={{ fontSize: "0.9rem", color: "#9ca3af" }}>
-            {userProfile?.name ?? userProfile?.email ?? "Signed in"}
-          </span>
-        </div>
+      <TopBar
+        userProfile={userProfile}
+        onNewProject={() => setShowNewDialog(true)}
+      />
+
+      {/* Content area — tabs + optional details panel */}
+      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+        <ProjectTabs
+          activeTab={activeTab}
+          onTabChange={(tab) => {
+            setActiveTab(tab);
+            setSelectedProject(undefined);
+          }}
+          myProjects={myProjects}
+          myLoading={myLoading}
+          myError={myError}
+          sharedProjects={sharedProjects}
+          sharedLoading={sharedLoading}
+          sharedError={sharedError}
+          selectedProject={selectedProject}
+          onSelectProject={handleSelectProject}
+        />
+
+        {selectedProject && (
+          <ProjectDetails
+            project={selectedProject}
+            onOpen={handleOpenProject}
+            onClose={() => setSelectedProject(undefined)}
+          />
+        )}
       </div>
 
-      {/* Projects section */}
-      <section>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            marginBottom: "1rem",
-          }}
-        >
-          <h2 style={{ fontSize: "1.1rem", margin: 0 }}>Projects</h2>
-          {editMode && (
-            <button
-              onClick={() => {
-                // TODO: open new-project dialog
-                console.info("[landing] new project");
-              }}
-              style={{
-                padding: "0.4rem 0.9rem",
-                borderRadius: 6,
-                border: "1px solid #3b82f6",
-                background: "transparent",
-                color: "#3b82f6",
-                cursor: "pointer",
-                fontSize: "0.85rem",
-              }}
-            >
-              + New Project
-            </button>
-          )}
-        </div>
-
-        {/* Placeholder — replace with fetched project list */}
-        <p style={{ color: "#6b7280", fontSize: "0.9rem" }}>
-          No projects yet. {editMode ? "Click \"+ New Project\" to get started." : "Ask an owner to add you to a project."}
-        </p>
-      </section>
+      {showNewDialog && (
+        <NewProjectDialog
+          onConfirm={handleCreateProject}
+          onCancel={() => setShowNewDialog(false)}
+        />
+      )}
     </div>
   );
 }

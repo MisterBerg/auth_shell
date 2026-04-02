@@ -30,7 +30,52 @@ export type AuthState = {
   setError: (error?: string) => void;
 };
 
-// These functions will be wired to the Google/Cognito module:
+// ---------------------------------------------------------------------------
+// Session persistence — keeps the user signed in across hard reloads.
+// We store the Google ID token in sessionStorage (tab-scoped, not persisted
+// across browser restarts). On load, if a token is found we rebuild the
+// credential provider from it via googleCognito.ts.
+// ---------------------------------------------------------------------------
+
+const SESSION_KEY = "jsl:googleToken";
+const PROFILE_KEY = "jsl:userProfile";
+
+export function saveSession(googleToken: string, userProfile: AuthState["userProfile"]) {
+  try {
+    sessionStorage.setItem(SESSION_KEY, googleToken);
+    sessionStorage.setItem(PROFILE_KEY, JSON.stringify(userProfile ?? {}));
+  } catch {
+    // sessionStorage unavailable — continue without persistence
+  }
+}
+
+export function loadSavedSession(): { googleToken: string; userProfile: AuthState["userProfile"] } | null {
+  try {
+    const token = sessionStorage.getItem(SESSION_KEY);
+    const profile = sessionStorage.getItem(PROFILE_KEY);
+    if (!token) return null;
+    return {
+      googleToken: token,
+      userProfile: profile ? JSON.parse(profile) : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function clearSavedSession() {
+  try {
+    sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(PROFILE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+// ---------------------------------------------------------------------------
+// External handler registration (wired by googleCognito.ts)
+// ---------------------------------------------------------------------------
+
 let _externalSignIn: (() => void) | null = null;
 let _externalSignOut: (() => void) | null = null;
 
@@ -50,7 +95,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   loading: false,
   error: undefined,
 
-  setGoogleSession: ({ googleToken, userProfile, awsCredentialProvider }) =>
+  setGoogleSession: ({ googleToken, userProfile, awsCredentialProvider }) => {
+    saveSession(googleToken, userProfile);
     set({
       isSignedIn: true,
       googleToken,
@@ -58,9 +104,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       awsCredentialProvider,
       loading: false,
       error: undefined,
-    }),
+    });
+  },
 
-  clearSession: () =>
+  clearSession: () => {
+    clearSavedSession();
     set({
       isSignedIn: false,
       googleToken: undefined,
@@ -68,7 +116,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       awsCredentialProvider: undefined,
       loading: false,
       error: undefined,
-    }),
+    });
+  },
 
   setLoading: (loading) => set({ loading }),
   setError: (error) => set({ error }),
@@ -82,8 +131,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     _externalSignIn();
   },
 
-   signInWithMicrosoft: () => {
-    // For now, just show a friendly message; later we’ll plug in MS auth.
+  signInWithMicrosoft: () => {
     get().setLoading(false);
     get().setError("Microsoft sign-in is not implemented yet.");
     console.info("Microsoft sign-in placeholder invoked");
