@@ -1,18 +1,17 @@
-import React, { useState, useCallback } from "react";
-import type { ModuleProps } from "module-core";
-import { useUserProfile } from "module-core";
+import React, { useState, useCallback, useRef } from "react";
+import type { ModuleProps, ModuleRegistryEntry } from "module-core";
+import { useUserProfile, useAwsS3Client, ModulePicker } from "module-core";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { TopBar } from "./TopBar.tsx";
 import { ProjectTabs } from "./ProjectTabs.tsx";
 import { ProjectDetails } from "./ProjectDetails.tsx";
 import { NewProjectDialog } from "./NewProjectDialog.tsx";
 import { useMyProjects, useSharedProjects, useCreateProject } from "./useProjects.ts";
+import type { CreatedProject } from "./useProjects.ts";
 import type { ProjectRecord } from "./types.ts";
 
 /**
  * Jeffspace — the default organizational project launcher.
- *
- * Loaded by auth-shell when no ?bucket=&config= URL params are present.
- * Full-screen layout with a persistent top bar (Jeffspace-specific chrome).
  *
  * config.meta is expected to carry:
  *   projectsBucket  — bucket where project config.json files live
@@ -20,6 +19,9 @@ import type { ProjectRecord } from "./types.ts";
 export default function JeffspaceApp({ config }: ModuleProps) {
   const userProfile = useUserProfile();
   const createProject = useCreateProject();
+  const getS3Client = useAwsS3Client();
+  const getS3ClientRef = useRef(getS3Client);
+  getS3ClientRef.current = getS3Client;
 
   const userId = userProfile?.email ?? "";
   const projectsBucket = (config.meta?.projectsBucket as string | undefined) ?? config.app.bucket;
@@ -29,7 +31,11 @@ export default function JeffspaceApp({ config }: ModuleProps) {
 
   const [activeTab, setActiveTab] = useState<"mine" | "shared">("mine");
   const [selectedProject, setSelectedProject] = useState<ProjectRecord | undefined>();
+
+  // New project flow: step 1 = name/description dialog, step 2 = module picker
   const [showNewDialog, setShowNewDialog] = useState(false);
+  const [pendingProject, setPendingProject] = useState<CreatedProject | undefined>();
+  const [assignError, setAssignError] = useState<string | undefined>();
 
   const handleSelectProject = useCallback((project: ProjectRecord) => {
     setSelectedProject((prev) =>
@@ -42,7 +48,6 @@ export default function JeffspaceApp({ config }: ModuleProps) {
     url.searchParams.set("bucket", bucket);
     url.searchParams.set("config", configPath);
     history.pushState(null, "", url.toString());
-    // Tell the shell to re-read the URL and swap the loaded module
     window.dispatchEvent(new Event("shell:navigate"));
   }, []);
 
@@ -50,18 +55,57 @@ export default function JeffspaceApp({ config }: ModuleProps) {
     navigateTo(project.rootBucket, project.rootConfigPath);
   }, [navigateTo]);
 
-  const handleCreateProject = useCallback(async (displayName: string, description: string) => {
+  // Step 1: user fills in name + description → create DDB record → show picker
+  const handleNewProjectConfirm = useCallback(async (displayName: string, description: string) => {
     const created = await createProject({
       userId,
       displayName,
       description: description || undefined,
       projectsBucket,
-      registryBucket: config.app.bucket,
     });
     setShowNewDialog(false);
+    setPendingProject(created);
+    setAssignError(undefined);
+  }, [userId, projectsBucket, createProject]);
+
+  // Step 2: user picks a root module → write config.json → navigate
+  const handleModuleSelected = useCallback(async (entry: ModuleRegistryEntry) => {
+    if (!pendingProject) return;
+    setAssignError(undefined);
+
+    const rootConfig = {
+      id: pendingProject.projectId,
+      app: { bucket: entry.bundleBucket, key: entry.bundlePath },
+      meta: { title: pendingProject.displayName },
+      resources: [],
+      children: [],
+    };
+
+    try {
+      const s3 = await getS3ClientRef.current(pendingProject.rootBucket);
+      await s3.send(new PutObjectCommand({
+        Bucket: pendingProject.rootBucket,
+        Key: pendingProject.rootConfigPath,
+        Body: JSON.stringify(rootConfig, null, 2),
+        ContentType: "application/json",
+      }));
+    } catch (err: unknown) {
+      setAssignError(`Failed to save project config: ${(err as Error).message}`);
+      return;
+    }
+
     reloadMine();
-    navigateTo(created.rootBucket, created.rootConfigPath);
-  }, [userId, projectsBucket, config.app.bucket, createProject, reloadMine, navigateTo]);
+    setPendingProject(undefined);
+    navigateTo(pendingProject.rootBucket, pendingProject.rootConfigPath);
+  }, [pendingProject, reloadMine, navigateTo]);
+
+  const handlePickerCancel = useCallback(() => {
+    // Project DDB record exists but has no config — user can retry by clicking the project
+    // if they want, or we just leave it. For now, dismiss without navigating.
+    setPendingProject(undefined);
+    setAssignError(undefined);
+    reloadMine();
+  }, [reloadMine]);
 
   return (
     <div
@@ -80,7 +124,6 @@ export default function JeffspaceApp({ config }: ModuleProps) {
         onNewProject={() => setShowNewDialog(true)}
       />
 
-      {/* Content area — tabs + optional details panel */}
       <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
         <ProjectTabs
           activeTab={activeTab}
@@ -109,8 +152,21 @@ export default function JeffspaceApp({ config }: ModuleProps) {
 
       {showNewDialog && (
         <NewProjectDialog
-          onConfirm={handleCreateProject}
+          onConfirm={handleNewProjectConfirm}
           onCancel={() => setShowNewDialog(false)}
+        />
+      )}
+
+      {/* Step 2: module picker shown after project record is created */}
+      {pendingProject && (
+        <ModulePicker
+          onSelect={handleModuleSelected}
+          onCancel={handlePickerCancel}
+          headerOverride={{
+            title: "Choose a starting module",
+            subtitle: `For "${pendingProject.displayName}" — pick the root module for this project`,
+          }}
+          errorMessage={assignError}
         />
       )}
     </div>

@@ -35,10 +35,11 @@ export {
   useAllResources,
   useRegisterResources,
   useEditMode,
+  useReplaceModule,
 } from "./hooks.ts";
 
 // Module loader
-export { loadModule } from "./loadModule.ts";
+export { loadModule, loadBundle } from "./loadModule.ts";
 export type { LoadedModule } from "./loadModule.ts";
 
 // Recursive slot renderer

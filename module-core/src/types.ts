@@ -20,9 +20,15 @@ export type Resource = {
 };
 
 export type ChildSlot = {
-  slotName: string;       // logical name for the slot, e.g. "content", "left-nav", "tab-1"
-  configPath: string;     // S3 key for the child's config.json
-  configBucket?: string;  // S3 bucket; if omitted, inherits from the parent config's bucket
+  slotId: string;           // logical name for this slot; semantics defined by the parent module
+  app: {
+    bucket: string;         // S3 bucket containing the bundle
+    key: string;            // S3 key for the JS bundle
+    exportName?: string;    // named export; defaults to "default"
+  };
+  meta?: Record<string, unknown>;   // slot-specific config; meaning defined entirely by the parent module
+  resources?: Resource[];           // resources declared by this slot
+  children?: ChildSlot[];           // recursive; this slot's own child slots
 };
 
 export type ModuleConfig = {

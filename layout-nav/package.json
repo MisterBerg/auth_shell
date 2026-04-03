@@ -1,15 +1,15 @@
 {
-  "name": "app-empty",
+  "name": "layout-nav",
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "jsl": {
+    "displayName": "Nav Layout",
+    "category": "layout",
+    "description": "Top bar with right slot, left sidebar navigation, and a main content pane"
+  },
   "scripts": {
     "build": "tsc -b && vite build"
-  },
-  "jsl": {
-    "displayName": "Empty Project",
-    "category": "app",
-    "description": "Blank project canvas — opens the module picker to choose your root module"
   },
   "dependencies": {
     "module-core": "*",

@@ -21,12 +21,12 @@ function loadIife(jsCode: string): Promise<Record<string, unknown>> {
             | Record<string, unknown>
             | undefined;
           if (!exports) {
-            reject(new Error('Module did not assign to window.RemoteModule'));
+            reject(new Error("Module did not assign to window.RemoteModule"));
             return;
           }
-            // `var RemoteModule` in a classic script is non-configurable on window
-          // (cannot be deleted). Safe to skip: the IIFE queue is serialised so
-          // the next load will simply overwrite the property.
+          // `var RemoteModule` in a classic script is non-configurable on window
+          // (cannot be deleted). The IIFE queue is serialised so the next load
+          // safely overwrites the property.
           resolve(exports);
         };
         script.onerror = () => {
@@ -49,14 +49,40 @@ export type LoadedModule = {
 };
 
 /**
- * Two-step module loader:
- * 1. Fetch and parse the config.json from S3
- * 2. Fetch the JS bundle declared in config.app, dynamic-import it as a blob URL,
- *    extract the component export, and return everything together.
+ * Fetches a JS bundle from S3 and executes it as an IIFE, returning the
+ * named component export.
  *
- * Resource registration is lazy — called here as soon as the config is parsed,
- * before the bundle is fetched, so resources are available to the registry
- * as early as possible.
+ * Used by SlotContainer to load a child slot directly from its inline app
+ * config — no separate config.json fetch required.
+ */
+export async function loadBundle(
+  bucket: string,
+  key: string,
+  getS3Client: (bucket?: string) => Promise<S3Client>,
+  exportName: string = "default"
+): Promise<React.ComponentType<ModuleProps>> {
+  const s3 = await getS3Client(bucket);
+  const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const jsCode = await resp.Body!.transformToString("utf-8");
+  const rawModule = await loadIife(jsCode);
+
+  const Component = rawModule[exportName] as React.ComponentType<ModuleProps> | undefined;
+  if (!Component) {
+    throw new Error(
+      `Bundle "${key}" does not export "${exportName}". ` +
+      `Available exports: ${Object.keys(rawModule).join(", ")}`
+    );
+  }
+  return Component;
+}
+
+/**
+ * Two-step root module loader:
+ * 1. Fetch and parse the config.json from S3
+ * 2. Fetch the JS bundle declared in config.app, execute it, extract the component
+ *
+ * Used by AuthGate to load the root module from a URL-specified config.json.
+ * Child slots use loadBundle directly since their config is inline in the parent.
  */
 export async function loadModule(
   configBucket: string,
@@ -64,7 +90,7 @@ export async function loadModule(
   getS3Client: (bucket?: string) => Promise<S3Client>,
   onResourcesLoaded?: (resources: Resource[]) => void
 ): Promise<LoadedModule> {
-  // Step 1: fetch config — route to correct endpoint for this bucket
+  // Step 1: fetch config
   const configS3 = await getS3Client(configBucket);
   const configResp = await configS3.send(
     new GetObjectCommand({ Bucket: configBucket, Key: configPath })
@@ -77,9 +103,9 @@ export async function loadModule(
     onResourcesLoaded(config.resources);
   }
 
-  // Step 2: fetch bundle — route to correct endpoint for the bundle's bucket
-  const bundleS3 = await getS3Client(config.app.bucket);
-  const bundleResp = await bundleS3.send(
+  // Step 2: fetch and run bundle
+  const s3 = await getS3Client(config.app.bucket);
+  const bundleResp = await s3.send(
     new GetObjectCommand({ Bucket: config.app.bucket, Key: config.app.key })
   );
   const jsCode = await bundleResp.Body!.transformToString("utf-8");
@@ -87,7 +113,6 @@ export async function loadModule(
 
   const exportName = config.app.exportName ?? "default";
   const Component = rawModule[exportName] as React.ComponentType<ModuleProps> | undefined;
-
   if (!Component) {
     throw new Error(
       `Module "${config.id}" does not export "${exportName}". ` +

@@ -19,8 +19,6 @@ export default defineConfig({
     rollupOptions: {
       external: ["react", "react/jsx-runtime", "react-dom", "module-core"],
       output: {
-        // Force exports into a { default, ... } object so loadModule can
-        // always find the component at rawModule["default"].
         exports: "named",
         globals: {
           "react": "__React",

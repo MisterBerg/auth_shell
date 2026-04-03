@@ -1,10 +1,11 @@
-import { useContext } from "react";
+import { useContext, useCallback } from "react";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import {
   AuthContext,
   ResourceRegistryContext,
   EditModeContext,
 } from "./context.tsx";
-import type { Resource } from "./types.ts";
+import type { ModuleConfig, ModuleRegistryEntry, Resource } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Auth hooks
@@ -77,4 +78,42 @@ export function useRegisterResources() {
 export function useEditMode() {
   const { editMode, setEditMode, lockHolder } = useContext(EditModeContext);
   return { editMode, setEditMode, lockHolder };
+}
+
+// ---------------------------------------------------------------------------
+// useReplaceModule
+// Replaces the root module (the one loaded from the URL's config.json) with
+// a new module. Preserves id, meta, resources, and children from the current
+// config, only swapping out app. Used for:
+//   - First-time module assignment when creating a project
+//   - Edit-mode root module swap
+// ---------------------------------------------------------------------------
+
+export function useReplaceModule() {
+  const { getS3Client } = useAuthContext();
+
+  return useCallback(async (entry: ModuleRegistryEntry, currentConfig: ModuleConfig) => {
+    const params = new URLSearchParams(window.location.search);
+    const configBucket = params.get("bucket");
+    const configPath = params.get("config");
+
+    if (!configBucket || !configPath) {
+      throw new Error("Cannot determine config location from URL — missing ?bucket= or ?config=");
+    }
+
+    const newConfig: ModuleConfig = {
+      ...currentConfig,
+      app: { bucket: entry.bundleBucket, key: entry.bundlePath },
+    };
+
+    const s3 = await getS3Client(configBucket);
+    await s3.send(new PutObjectCommand({
+      Bucket: configBucket,
+      Key: configPath,
+      Body: JSON.stringify(newConfig, null, 2),
+      ContentType: "application/json",
+    }));
+
+    window.dispatchEvent(new Event("shell:navigate"));
+  }, [getS3Client]);
 }

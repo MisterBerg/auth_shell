@@ -5,6 +5,8 @@ import type { ModuleRegistryEntry, ModuleCategory } from "./types.ts";
 type ModulePickerProps = {
   onSelect: (entry: ModuleRegistryEntry) => void;
   onCancel: () => void;
+  headerOverride?: { title: string; subtitle: string };
+  errorMessage?: string;
 };
 
 const CATEGORY_LABELS: Record<ModuleCategory | "unknown", string> = {
@@ -26,7 +28,7 @@ const CATEGORY_DESCRIPTIONS: Record<ModuleCategory | "unknown", string> = {
  * choose a module, grouped by category. Used by app-empty (root slot picker)
  * and SlotContainer (child slot picker in edit mode).
  */
-export function ModulePicker({ onSelect, onCancel }: ModulePickerProps) {
+export function ModulePicker({ onSelect, onCancel, headerOverride, errorMessage }: ModulePickerProps) {
   const { entries, loading, error } = useModuleRegistry();
 
   // Close on Escape
@@ -87,10 +89,10 @@ export function ModulePicker({ onSelect, onCancel }: ModulePickerProps) {
         >
           <div>
             <h2 style={{ margin: 0, fontSize: "1rem", fontWeight: 600, color: "#e5e7eb" }}>
-              Choose a Module
+              {headerOverride?.title ?? "Choose a Module"}
             </h2>
             <p style={{ margin: "0.2rem 0 0", fontSize: "0.8rem", color: "#6b7280" }}>
-              Select the module that will fill this slot
+              {headerOverride?.subtitle ?? "Select the module that will fill this slot"}
             </p>
           </div>
           <button
@@ -121,6 +123,12 @@ export function ModulePicker({ onSelect, onCancel }: ModulePickerProps) {
           {error && (
             <p style={{ color: "#fca5a5", fontSize: "0.875rem", textAlign: "center", marginTop: "2rem" }}>
               Failed to load registry: {error}
+            </p>
+          )}
+
+          {errorMessage && (
+            <p style={{ color: "#fca5a5", fontSize: "0.875rem", textAlign: "center", marginTop: "0.5rem", marginBottom: 0 }}>
+              {errorMessage}
             </p>
           )}
 

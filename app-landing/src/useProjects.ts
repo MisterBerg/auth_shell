@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { QueryCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { PutObjectCommand } from "@aws-sdk/client-s3";
-import { useAwsDdbClient, useAwsS3Client } from "module-core";
+import { useAwsDdbClient } from "module-core";
 import type { ProjectRecord } from "./types.ts";
 
 const PROJECTS_TABLE = "org-projects";
@@ -102,15 +101,16 @@ export function useSharedProjects(userId: string | undefined) {
 }
 
 // ---------------------------------------------------------------------------
-// Create project — writes config.json to S3 and a DynamoDB record
+// Create project — writes only the DynamoDB record.
+// The caller (Jeffspace) shows the module picker after this returns, then
+// writes the S3 config.json once the user has selected a root module.
 // ---------------------------------------------------------------------------
 
 export type CreateProjectArgs = {
   userId: string;
   displayName: string;
   description?: string;
-  projectsBucket: string;   // from config.meta.projectsBucket
-  registryBucket: string;   // from config.app.bucket (where bundles live)
+  projectsBucket: string;
 };
 
 export type CreatedProject = Pick<
@@ -120,18 +120,12 @@ export type CreatedProject = Pick<
 
 export function useCreateProject() {
   const getDdbClient = useAwsDdbClient();
-  const getS3Client = useAwsS3Client();
   const getDdbClientRef = useRef(getDdbClient);
-  const getS3ClientRef = useRef(getS3Client);
-  useEffect(() => {
-    getDdbClientRef.current = getDdbClient;
-    getS3ClientRef.current = getS3Client;
-  });
+  useEffect(() => { getDdbClientRef.current = getDdbClient; });
 
   return useCallback(async (args: CreateProjectArgs): Promise<CreatedProject> => {
-    const { userId, displayName, description, projectsBucket, registryBucket } = args;
+    const { userId, displayName, description, projectsBucket } = args;
 
-    // Derive a URL-safe project ID from the name + timestamp
     const slug = displayName
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
@@ -140,36 +134,6 @@ export function useCreateProject() {
     const projectId = `${slug}-${Date.now().toString(36)}`;
     const now = new Date().toISOString();
     const rootConfigPath = `projects/${projectId}/config.json`;
-
-    // New projects start with app-empty, which shows a centered + button
-    // and opens the module picker. Once the user picks a module, app-empty
-    // rewrites this config.json to point at the chosen module.
-    const initialConfig = {
-      id: projectId,
-      app: {
-        bucket: registryBucket,
-        key: "modules/app-empty/bundle.js",
-      },
-      meta: { title: displayName },
-      resources: [],
-      children: [],
-    };
-
-    const [s3, ddb] = await Promise.all([
-      getS3ClientRef.current(projectsBucket),
-      getDdbClientRef.current(),
-    ]);
-
-    try {
-      await s3.send(new PutObjectCommand({
-        Bucket: projectsBucket,
-        Key: rootConfigPath,
-        Body: JSON.stringify(initialConfig, null, 2),
-        ContentType: "application/json",
-      }));
-    } catch (err: unknown) {
-      throw new Error(`S3 write failed: ${(err as Error).message}`);
-    }
 
     const record: CreatedProject = {
       userId,
@@ -183,13 +147,11 @@ export function useCreateProject() {
       updatedAt: now,
     };
 
+    const ddb = await getDdbClientRef.current();
     try {
-      await ddb.send(new PutCommand({
-        TableName: PROJECTS_TABLE,
-        Item: record,
-      }));
+      await ddb.send(new PutCommand({ TableName: PROJECTS_TABLE, Item: record }));
     } catch (err: unknown) {
-      throw new Error(`DynamoDB write failed: ${(err as Error).message}`);
+      throw new Error(`Failed to create project: ${(err as Error).message}`);
     }
 
     return record;
