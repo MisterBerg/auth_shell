@@ -1,6 +1,6 @@
 {
   "private": true,
-  "workspaces": ["module-core", "auth-shell", "app-landing", "layout-nav", "module-template"],
+  "workspaces": ["module-core", "auth-shell", "app-landing", "layout-top-left", "module-webview", "module-template"],
   "scripts": {
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",

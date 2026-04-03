@@ -5,6 +5,7 @@ import {
   ResourceRegistryContext,
   EditModeContext,
 } from "./context.tsx";
+import { SlotContext } from "./SlotContext.tsx";
 import type { ModuleConfig, ModuleRegistryEntry, Resource } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -81,13 +82,17 @@ export function useEditMode() {
 }
 
 // ---------------------------------------------------------------------------
-// useReplaceModule
-// Replaces the root module (the one loaded from the URL's config.json) with
-// a new module. Preserves id, meta, resources, and children from the current
-// config, only swapping out app. Used for:
-//   - First-time module assignment when creating a project
-//   - Edit-mode root module swap
+// useUpdateSlotMeta
+// For use inside modules loaded by SlotContainer. Merges newMeta into the
+// slot's existing meta and persists the parent config to S3. Does NOT
+// dispatch shell:navigate — the module decides whether reload is needed.
 // ---------------------------------------------------------------------------
+
+export function useUpdateSlotMeta() {
+  const ctx = useContext(SlotContext);
+  if (!ctx) throw new Error("useUpdateSlotMeta must be used inside a <SlotContainer>");
+  return ctx.updateSlotMeta;
+}
 
 export function useReplaceModule() {
   const { getS3Client } = useAuthContext();

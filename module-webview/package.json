@@ -1,12 +1,12 @@
 {
-  "name": "layout-nav",
+  "name": "module-webview",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "jsl": {
-    "displayName": "Nav Layout",
-    "category": "layout",
-    "description": "Top bar with right slot, left sidebar navigation, and a main content pane"
+    "displayName": "Web View",
+    "category": "component",
+    "description": "Loads any URL in a full-frame iframe. Set the URL in edit mode."
   },
   "scripts": {
     "build": "tsc -b && vite build"
