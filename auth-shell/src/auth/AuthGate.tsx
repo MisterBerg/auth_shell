@@ -1,4 +1,4 @@
-import React, { useEffect, useState, Suspense, useMemo, Component, type ErrorInfo, type ReactNode } from "react";
+import React, { useEffect, useState, useRef, Suspense, useMemo, Component, type ErrorInfo, type ReactNode } from "react";
 import { loadModule } from "module-core";
 import { useConfigStore } from "../stores/configStore.ts";
 import { useAuthStore } from "../stores/authStore.ts";
@@ -64,6 +64,15 @@ export const AuthGate: React.FC = () => {
   const getS3Client = useAwsS3Client();
   const registerResources = useRegisterResources();
 
+  // Stable refs so the LazyApp useMemo doesn't fire on every render
+  // (getS3Client and registerResources are new references each render)
+  const getS3ClientRef = useRef(getS3Client);
+  const registerResourcesRef = useRef(registerResources);
+  useEffect(() => {
+    getS3ClientRef.current = getS3Client;
+    registerResourcesRef.current = registerResources;
+  });
+
   // Track the current URL location as state so navigation triggers re-render
   const [moduleLocation, setModuleLocation] = useState(getCurrentModuleLocation);
 
@@ -118,14 +127,14 @@ export const AuthGate: React.FC = () => {
       const { config: moduleConfig, Component } = await loadModule(
         bucket,
         configPath,
-        getS3Client,
-        registerResources
+        getS3ClientRef.current,
+        registerResourcesRef.current
       );
       const Bound = () => <Component config={moduleConfig as ModuleConfig} />;
       Bound.displayName = "RootModule";
       return { default: Bound };
     });
-  }, [ready, moduleLocation, getS3Client, registerResources]);
+  }, [ready, moduleLocation]);
 
   // Sign-in screen
   if (!ready || !LazyApp) {
@@ -192,9 +201,12 @@ export const AuthGate: React.FC = () => {
     );
   }
 
+  const locationKey = `${moduleLocation.bucket}/${moduleLocation.configPath}`;
+
   return (
-    <ModuleErrorBoundary>
+    <ModuleErrorBoundary key={locationKey}>
       <Suspense
+        key={locationKey}
         fallback={
           <div
             style={{

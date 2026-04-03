@@ -24,8 +24,9 @@ function loadIife(jsCode: string): Promise<Record<string, unknown>> {
             reject(new Error('Module did not assign to window.RemoteModule'));
             return;
           }
-          // Clear immediately so the next load starts clean
-          delete (window as unknown as Record<string, unknown>)["RemoteModule"];
+            // `var RemoteModule` in a classic script is non-configurable on window
+          // (cannot be deleted). Safe to skip: the IIFE queue is serialised so
+          // the next load will simply overwrite the property.
           resolve(exports);
         };
         script.onerror = () => {

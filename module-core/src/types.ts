@@ -58,6 +58,25 @@ export type ModuleBundle = {
 };
 
 // ---------------------------------------------------------------------------
+// Module registry — describes a published module available in the picker.
+// Matches the DynamoDB module-registry table's "latest" pointer records.
+// ---------------------------------------------------------------------------
+
+export type ModuleCategory = "layout" | "app" | "component";
+
+export type ModuleRegistryEntry = {
+  moduleName: string;
+  displayName?: string;
+  description?: string;
+  category?: ModuleCategory;
+  bundleBucket: string;
+  bundlePath: string;
+  ownerId?: string;
+  latestVersion?: string;
+  updatedAt?: string;
+};
+
+// ---------------------------------------------------------------------------
 // Auth types — defined here so module-core hooks can reference them without
 // depending on auth-shell's Zustand store.
 // ---------------------------------------------------------------------------

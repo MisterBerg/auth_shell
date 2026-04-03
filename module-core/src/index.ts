@@ -8,6 +8,8 @@ export type {
   ExportContext,
   AwsCredentials,
   UserProfile,
+  ModuleCategory,
+  ModuleRegistryEntry,
 } from "./types.ts";
 
 // Contexts & providers
@@ -41,3 +43,7 @@ export type { LoadedModule } from "./loadModule.ts";
 
 // Recursive slot renderer
 export { SlotContainer } from "./SlotContainer.tsx";
+
+// Module registry
+export { useModuleRegistry } from "./useModuleRegistry.ts";
+export { ModulePicker } from "./ModulePicker.tsx";

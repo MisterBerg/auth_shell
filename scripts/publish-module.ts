@@ -190,6 +190,13 @@ async function main() {
   const now = new Date().toISOString();
   const owner = process.env["HEP_PUBLISHER"] ?? `${process.env["USER"] ?? "unknown"}@local.dev`;
 
+  // Read optional jsl metadata from the module's package.json
+  const pkgPath = join(modulePath, "package.json");
+  type JslMeta = { displayName?: string; category?: string; description?: string };
+  const jsl: JslMeta = existsSync(pkgPath)
+    ? ((JSON.parse(readFileSync(pkgPath, "utf-8")) as { jsl?: JslMeta }).jsl ?? {})
+    : {};
+
   // Version record
   await ddb.send(new PutCommand({
     TableName: REGISTRY_TABLE,
@@ -199,6 +206,9 @@ async function main() {
       ownerId: owner,
       bundleBucket: registryBucket,
       bundlePath: versionedKey,
+      displayName: jsl.displayName,
+      category: jsl.category,
+      description: jsl.description,
       publishedAt: now,
     },
   }));
@@ -213,6 +223,9 @@ async function main() {
       ownerId: owner,
       bundleBucket: registryBucket,
       bundlePath: latestKey,
+      displayName: jsl.displayName,
+      category: jsl.category,
+      description: jsl.description,
       updatedAt: now,
     },
   }));

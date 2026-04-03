@@ -141,19 +141,16 @@ export function useCreateProject() {
     const now = new Date().toISOString();
     const rootConfigPath = `projects/${projectId}/config.json`;
 
-    // Minimal root config for the new project — points to no bundle yet.
-    // The shell's error boundary will surface a friendly message;
-    // edit mode will let the owner configure real modules.
+    // New projects start with app-empty, which shows a centered + button
+    // and opens the module picker. Once the user picks a module, app-empty
+    // rewrites this config.json to point at the chosen module.
     const initialConfig = {
       id: projectId,
       app: {
         bucket: registryBucket,
-        key: "modules/app-landing/bundle.js", // placeholder; replace via edit mode
+        key: "modules/app-empty/bundle.js",
       },
-      meta: {
-        title: displayName,
-        placeholder: true,
-      },
+      meta: { title: displayName },
       resources: [],
       children: [],
     };
