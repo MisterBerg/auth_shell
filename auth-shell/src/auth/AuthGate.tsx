@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef, Suspense, useMemo, Component, type ErrorInfo, type ReactNode } from "react";
 import { loadModule } from "module-core";
+import type { ModuleConfig } from "module-core";
 import { useConfigStore } from "../stores/configStore.ts";
 import { useAuthStore } from "../stores/authStore.ts";
 import { useAwsS3Client } from "module-core";
@@ -7,7 +8,7 @@ import { useRegisterResources } from "module-core";
 import { CONFIG } from "../config.ts";
 import { initAuthShell } from "./googleCognito.ts";
 import { getModuleLocationFromUrl } from "../remote/urlConfig.ts";
-import type { ModuleConfig } from "module-core";
+import { EditModeBar } from "./EditModeBar.tsx";
 
 class ModuleErrorBoundary extends Component<
   { children: ReactNode },
@@ -33,10 +34,6 @@ class ModuleErrorBoundary extends Component<
   }
 }
 
-/**
- * Reads the current URL and returns the module location.
- * Called on every render so it always reflects the live URL.
- */
 function getCurrentModuleLocation() {
   const fromUrl = getModuleLocationFromUrl();
   if (fromUrl) return { ...fromUrl, isDefault: false };
@@ -47,16 +44,6 @@ function getCurrentModuleLocation() {
   };
 }
 
-/**
- * AuthGate orchestrates the top-level load sequence:
- *
- * 1. Initialise auth (Google GIS + Cognito) on first render.
- * 2. Show sign-in UI until the user is authenticated.
- * 3. Resolve the module to load from URL params (or default).
- * 4. Navigate between modules via history.pushState — no page reloads,
- *    so the auth session is preserved in memory.
- * 5. Render the loaded component inside a Suspense boundary.
- */
 export const AuthGate: React.FC = () => {
   const { config, setConfig } = useConfigStore();
   const { isSignedIn, awsCredentialProvider, loading, error, signInWithMicrosoft } =
@@ -64,8 +51,6 @@ export const AuthGate: React.FC = () => {
   const getS3Client = useAwsS3Client();
   const registerResources = useRegisterResources();
 
-  // Stable refs so the LazyApp useMemo doesn't fire on every render
-  // (getS3Client and registerResources are new references each render)
   const getS3ClientRef = useRef(getS3Client);
   const registerResourcesRef = useRef(registerResources);
   useEffect(() => {
@@ -73,10 +58,10 @@ export const AuthGate: React.FC = () => {
     registerResourcesRef.current = registerResources;
   });
 
-  // Track the current URL location as state so navigation triggers re-render
   const [moduleLocation, setModuleLocation] = useState(getCurrentModuleLocation);
+  // Resolved root config — passed to EditModeBar so it can write root replacements
+  const [rootConfig, setRootConfig] = useState<ModuleConfig | null>(null);
 
-  // One-time shell init
   useEffect(() => {
     if (!config) {
       setConfig(CONFIG);
@@ -84,23 +69,23 @@ export const AuthGate: React.FC = () => {
     }
   }, [config, setConfig]);
 
-  // Listen for browser back/forward navigation
   useEffect(() => {
     const onPopState = () => setModuleLocation(getCurrentModuleLocation());
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
-  // Listen for in-app navigation dispatched by modules (e.g. Jeffspace opening a project)
   useEffect(() => {
-    const onNavigate = () => setModuleLocation(getCurrentModuleLocation());
+    const onNavigate = () => {
+      setModuleLocation(getCurrentModuleLocation());
+      setRootConfig(null); // clear stale config until new module resolves
+    };
     window.addEventListener("shell:navigate", onNavigate);
     return () => window.removeEventListener("shell:navigate", onNavigate);
   }, []);
 
   const ready = isSignedIn && !!awsCredentialProvider;
 
-  // Build the lazy component whenever auth becomes ready or the location changes
   const LazyApp = useMemo(() => {
     if (!ready) return null;
 
@@ -108,14 +93,10 @@ export const AuthGate: React.FC = () => {
     const useDevAlias = isDefault && import.meta.env.DEV;
 
     return React.lazy(async (): Promise<{ default: React.ComponentType }> => {
-      // Dev-mode shortcut: load app-landing directly from source instead of S3
-      // so the default landing page works without a deployed bucket.
       if (useDevAlias) {
         const { default: LandingApp } = await import("app-landing");
         const devConfig: ModuleConfig = {
           id: "app-landing-dev",
-          // Use the same local bucket names as the seed script so that
-          // isLocalBucket() routes writes to MinIO rather than real AWS.
           app: { bucket: "hep-dev-registry", key: "bundle.js" },
           meta: { projectsBucket: "hep-dev-modules" },
         };
@@ -130,6 +111,8 @@ export const AuthGate: React.FC = () => {
         getS3ClientRef.current,
         registerResourcesRef.current
       );
+      // Surface the resolved config so EditModeBar can perform root replacement
+      setRootConfig(moduleConfig);
       const Bound = () => <Component config={moduleConfig as ModuleConfig} />;
       Bound.displayName = "RootModule";
       return { default: Bound };
@@ -158,7 +141,6 @@ export const AuthGate: React.FC = () => {
           Sign in to continue.
         </p>
 
-        {/* Google button rendered by googleCognito.ts */}
         <div id="google-signin-container" style={{ marginBottom: "0.75rem" }} />
 
         <button
@@ -202,28 +184,33 @@ export const AuthGate: React.FC = () => {
   }
 
   const locationKey = `${moduleLocation.bucket}/${moduleLocation.configPath}`;
+  const showEditBar = !moduleLocation.isDefault;
 
   return (
-    <ModuleErrorBoundary key={locationKey}>
-      <Suspense
-        key={locationKey}
-        fallback={
-          <div
-            style={{
-              minHeight: "100vh",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              background: "#020617",
-              color: "#e5e7eb",
-            }}
-          >
-            Loading…
-          </div>
-        }
-      >
-        <LazyApp />
-      </Suspense>
-    </ModuleErrorBoundary>
+    <>
+      <ModuleErrorBoundary key={locationKey}>
+        <Suspense
+          key={locationKey}
+          fallback={
+            <div
+              style={{
+                minHeight: "100vh",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "#020617",
+                color: "#e5e7eb",
+              }}
+            >
+              Loading…
+            </div>
+          }
+        >
+          <LazyApp />
+        </Suspense>
+      </ModuleErrorBoundary>
+
+      {showEditBar && <EditModeBar rootConfig={rootConfig} />}
+    </>
   );
 };
