@@ -2,11 +2,6 @@
   "name": "app-landing",
   "private": true,
   "version": "0.1.0",
-  "jsl": {
-    "displayName": "Jeffspace",
-    "category": "app",
-    "description": "Organizational project launcher — lists and opens projects"
-  },
   "type": "module",
   "scripts": {
     "dev": "vite",
