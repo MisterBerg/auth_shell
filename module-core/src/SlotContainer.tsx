@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useCallback } from "react";
+import React, { useMemo, useState, useCallback, useRef } from "react";
 import type { ChildSlot, ModuleConfig } from "./types.ts";
 import { useAuthContext, useEditMode, useRegisterResources } from "./hooks.ts";
 import { loadBundle } from "./loadModule.ts";
@@ -11,10 +11,11 @@ type SlotContainerProps = {
   slot: ChildSlot;
   parentConfig: ModuleConfig;
   onSlotUpdated?: (updatedSlot: ChildSlot) => void;
+  onSlotRemoved?: () => void;
   fallback?: React.ReactNode;
 };
 
-export function SlotContainer({ slot, parentConfig, onSlotUpdated, fallback }: SlotContainerProps) {
+export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved, fallback }: SlotContainerProps) {
   const { getS3Client } = useAuthContext();
   const registerResources = useRegisterResources();
   const { editMode } = useEditMode();
@@ -29,6 +30,11 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, fallback }: S
     children: slot.children,
   };
 
+  // Keep a ref so the lazy Bound closure always reads the latest config,
+  // even though useMemo only re-runs when the bundle identity changes.
+  const slotConfigRef = useRef(slotConfig);
+  slotConfigRef.current = slotConfig;
+
   const LazyModule = useMemo(() => {
     if (slot.resources?.length) {
       registerResources(slot.resources);
@@ -40,7 +46,7 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, fallback }: S
         getS3Client,
         slot.app.exportName ?? "default"
       );
-      const Bound = () => <Component config={slotConfig} />;
+      const Bound = () => <Component config={slotConfigRef.current} />;
       Bound.displayName = `SlotModule[${slot.slotId}]`;
       return { default: Bound };
     });
@@ -127,26 +133,42 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, fallback }: S
       <SlotContext value={slotContextValue}>
         <div style={{ position: "relative", outline: "1px dashed #3b82f6", height: "100%" }}>
           {content}
-          <button
-            onClick={() => setShowPicker(true)}
-            style={{
-              position: "absolute",
-              top: 4,
-              right: 4,
-              padding: "2px 8px",
-              fontSize: "0.75rem",
-              background: "#3b82f6",
-              color: "#fff",
-              border: "none",
-              borderRadius: 4,
-              cursor: "pointer",
-              opacity: 0.85,
-              zIndex: 10,
-            }}
-            title={`Replace slot: ${slot.slotId}`}
-          >
-            ✎ {slot.slotId}
-          </button>
+          <div style={{ position: "absolute", top: 4, right: 4, display: "flex", gap: 4, zIndex: 10 }}>
+            <button
+              onClick={() => setShowPicker(true)}
+              style={{
+                padding: "2px 8px",
+                fontSize: "0.75rem",
+                background: "#3b82f6",
+                color: "#fff",
+                border: "none",
+                borderRadius: 4,
+                cursor: "pointer",
+                opacity: 0.85,
+              }}
+              title={`Replace slot: ${slot.slotId}`}
+            >
+              ✎ {slot.slotId}
+            </button>
+            {onSlotRemoved && (
+              <button
+                onClick={onSlotRemoved}
+                style={{
+                  padding: "2px 7px",
+                  fontSize: "0.75rem",
+                  background: "#7f1d1d",
+                  color: "#fca5a5",
+                  border: "none",
+                  borderRadius: 4,
+                  cursor: "pointer",
+                  opacity: 0.9,
+                }}
+                title="Remove module — returns slot to empty"
+              >
+                ✕
+              </button>
+            )}
+          </div>
           {swapError && (
             <div style={{ position: "absolute", bottom: 4, left: 4, right: 4, fontSize: "0.75rem", color: "#fca5a5", background: "#0b1120", padding: "2px 6px", borderRadius: 4 }}>
               {swapError}

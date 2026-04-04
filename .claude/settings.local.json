@@ -15,7 +15,9 @@
       "Bash(npm run:*)",
       "Bash(cp \"c:/Users/notha/projects/hardware_eval_platform/.env.local.example\" \"c:/Users/notha/projects/hardware_eval_platform/auth-shell/.env.local\")",
       "Bash(npx vite:*)",
-      "Bash(curl -sf http://localhost:5173)"
+      "Bash(curl -sf http://localhost:5173)",
+      "Bash(npm install:*)",
+      "Bash(npx tsx:*)"
     ]
   }
 }

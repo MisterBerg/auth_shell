@@ -29,7 +29,9 @@ export function useMyProjects(userId: string | undefined) {
         ddb.send(new QueryCommand({
           TableName: PROJECTS_TABLE,
           KeyConditionExpression: "userId = :uid",
-          ExpressionAttributeValues: { ":uid": userId },
+          FilterExpression: "#role = :owner",
+          ExpressionAttributeNames: { "#role": "role" },
+          ExpressionAttributeValues: { ":uid": userId, ":owner": "owner" },
         }))
       )
       .then((result) => {

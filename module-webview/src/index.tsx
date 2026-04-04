@@ -65,6 +65,11 @@ export default function WebView({ config }: ModuleProps) {
     const url = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
     setSaving(true);
     setSaveError(undefined);
+    if (!updateSlotMeta) {
+      setSaveError("Cannot save: not running inside a slot");
+      setSaving(false);
+      return;
+    }
     try {
       await updateSlotMeta({ url });
       setActiveUrl(url);

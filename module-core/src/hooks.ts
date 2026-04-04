@@ -88,10 +88,9 @@ export function useEditMode() {
 // dispatch shell:navigate — the module decides whether reload is needed.
 // ---------------------------------------------------------------------------
 
-export function useUpdateSlotMeta() {
+export function useUpdateSlotMeta(): ((newMeta: Record<string, unknown>) => Promise<void>) | null {
   const ctx = useContext(SlotContext);
-  if (!ctx) throw new Error("useUpdateSlotMeta must be used inside a <SlotContainer>");
-  return ctx.updateSlotMeta;
+  return ctx?.updateSlotMeta ?? null;
 }
 
 export function useReplaceModule() {

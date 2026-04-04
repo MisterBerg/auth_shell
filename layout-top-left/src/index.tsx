@@ -135,6 +135,15 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
     window.dispatchEvent(new Event("shell:navigate"));
   }, [children, selectedSlotId, writeConfig]);
 
+  const handleSlotRemoved = useCallback(async (slotId: string) => {
+    const updated = children.filter((c) => c.slotId !== slotId);
+    setChildren(updated);
+    if (selectedSlotId === slotId) {
+      setSelectedSlotId(updated.find((c) => !isTopBarSlot(c))?.slotId);
+    }
+    try { await writeConfig(updated); } catch { /* non-fatal */ }
+  }, [children, selectedSlotId, writeConfig]);
+
   const handleRenameNavItem = useCallback(async (slotId: string, newText: string) => {
     const updated = children.map((c) =>
       c.slotId !== slotId ? c : {
@@ -168,6 +177,7 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
               slot={topBarMainSlot}
               parentConfig={liveConfig}
               onSlotUpdated={handleSlotUpdated}
+              onSlotRemoved={() => handleSlotRemoved(topBarMainSlot.slotId)}
               fallback={<div />}
             />
           ) : (
@@ -189,6 +199,7 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
               slot={topBarRightSlot}
               parentConfig={liveConfig}
               onSlotUpdated={handleSlotUpdated}
+              onSlotRemoved={() => handleSlotRemoved(topBarRightSlot.slotId)}
               fallback={<div />}
             />
           ) : (
@@ -232,17 +243,30 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
           {addError && <p style={{ margin: "0 0.5rem 0.5rem", fontSize: "0.75rem", color: "#fca5a5" }}>{addError}</p>}
         </div>
 
-        {/* Content pane */}
+        {/* Content pane — all nav slots are mounted; only the active one is visible.
+            This keeps iframes alive across nav switches so they don't reload. */}
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: "relative" }}>
-          {selectedSlot ? (
-            <SlotContainer
-              key={selectedSlot.slotId}
-              slot={selectedSlot}
-              parentConfig={liveConfig}
-              onSlotUpdated={handleSlotUpdated}
-            />
-          ) : (
+          {navSlots.length === 0 ? (
             <EmptyContent editMode={editMode} onAdd={() => setPickerTarget({ kind: "nav" })} />
+          ) : (
+            navSlots.map((slot) => (
+              <div
+                key={slot.slotId}
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  visibility: slot.slotId === selectedSlotId ? "visible" : "hidden",
+                  pointerEvents: slot.slotId === selectedSlotId ? "auto" : "none",
+                }}
+              >
+                <SlotContainer
+                  slot={slot}
+                  parentConfig={liveConfig}
+                  onSlotUpdated={handleSlotUpdated}
+                  onSlotRemoved={() => handleSlotRemoved(slot.slotId)}
+                />
+              </div>
+            ))
           )}
         </div>
       </div>

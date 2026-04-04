@@ -41,6 +41,10 @@ export type ModuleConfig = {
   meta?: Record<string, unknown>;   // module-specific static settings (tabs, theme, etc.)
   resources?: Resource[];           // datasets this module declares
   children?: ChildSlot[];           // named child slots
+  theme?: {
+    cssKey?: string;     // S3 key for a project-level stylesheet
+    cssBucket?: string;  // S3 bucket for the stylesheet (defaults to app bucket)
+  };
 };
 
 // ---------------------------------------------------------------------------
