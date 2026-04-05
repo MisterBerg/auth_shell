@@ -72,6 +72,7 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
   );
   const [pickerTarget, setPickerTarget] = useState<PickerTarget | null>(null);
   const [addError, setAddError] = useState<string | undefined>();
+  const [isAdding, setIsAdding] = useState(false);
 
   const selectedSlot = navSlots.find((s) => s.slotId === selectedSlotId);
 
@@ -96,9 +97,10 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
   }, [config]);
 
   const handleModuleSelected = useCallback(async (entry: ModuleRegistryEntry) => {
-    if (!pickerTarget) return;
+    if (!pickerTarget || isAdding) return;
     setPickerTarget(null);
     setAddError(undefined);
+    setIsAdding(true);
 
     let newSlot: ChildSlot;
     if (pickerTarget.kind === "topbar") {
@@ -116,14 +118,31 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
     }
 
     const updated = [...children, newSlot];
+    console.log("[layout] handleModuleSelected", {
+      pickerTarget,
+      entry: { name: entry.moduleName, bucket: entry.bundleBucket, key: entry.bundlePath },
+      newSlot,
+      childrenBefore: children.map(c => ({ id: c.slotId, key: c.app?.key })),
+      updatedChildren: updated.map(c => ({ id: c.slotId, key: c.app?.key })),
+    });
     try {
       await writeConfig(updated);
     } catch (err: unknown) {
       setAddError(`Failed to save: ${(err as Error).message}`);
+      setIsAdding(false);
       return;
     }
-    window.dispatchEvent(new Event("shell:navigate"));
-  }, [pickerTarget, children, writeConfig]);
+
+    console.log("[layout] write succeeded, updating local state", {
+      newSlotId: newSlot.slotId,
+      willAutoSelect: pickerTarget.kind === "nav",
+    });
+    setChildren(updated);
+    if (pickerTarget.kind === "nav") {
+      setSelectedSlotId(newSlot.slotId);
+    }
+    setIsAdding(false);
+  }, [pickerTarget, isAdding, children, writeConfig]);
 
   const handleRemoveNavItem = useCallback(async (slotId: string) => {
     const updated = children.filter((c) => c.slotId !== slotId);
@@ -132,7 +151,6 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
       setSelectedSlotId(updated.find((c) => !isTopBarSlot(c))?.slotId);
     }
     try { await writeConfig(updated); } catch { /* non-fatal */ }
-    window.dispatchEvent(new Event("shell:navigate"));
   }, [children, selectedSlotId, writeConfig]);
 
   const handleSlotRemoved = useCallback(async (slotId: string) => {
@@ -184,7 +202,7 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
             <TopBarPlaceholder
               label="top bar module"
               editMode={editMode}
-              onClick={() => setPickerTarget({ kind: "topbar", position: "top-bar-main" })}
+              onClick={() => !isAdding && setPickerTarget({ kind: "topbar", position: "top-bar-main" })}
             />
           )}
         </div>
@@ -206,7 +224,7 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
             <TopBarPlaceholder
               label="right component"
               editMode={editMode}
-              onClick={() => setPickerTarget({ kind: "topbar", position: "top-bar-right" })}
+              onClick={() => !isAdding && setPickerTarget({ kind: "topbar", position: "top-bar-right" })}
             />
           )}
         </div>
@@ -233,10 +251,11 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
 
             {editMode && (
               <button
-                onClick={() => setPickerTarget({ kind: "nav" })}
-                style={{ display: "flex", alignItems: "center", gap: "0.5rem", padding: "0.45rem 0.75rem", marginTop: "0.25rem", borderRadius: 6, border: `1px dashed ${BORDER}`, background: "transparent", color: TEXT_MUTED, cursor: "pointer", fontSize: "0.8rem", width: "100%", textAlign: "left" }}
+                onClick={() => !isAdding && setPickerTarget({ kind: "nav" })}
+                disabled={isAdding}
+                style={{ display: "flex", alignItems: "center", gap: "0.5rem", padding: "0.45rem 0.75rem", marginTop: "0.25rem", borderRadius: 6, border: `1px dashed ${BORDER}`, background: "transparent", color: isAdding ? "#374151" : TEXT_MUTED, cursor: isAdding ? "default" : "pointer", fontSize: "0.8rem", width: "100%", textAlign: "left" }}
               >
-                + Add section
+                {isAdding ? "Saving…" : "+ Add section"}
               </button>
             )}
           </div>
@@ -249,7 +268,9 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
           {navSlots.length === 0 ? (
             <EmptyContent editMode={editMode} onAdd={() => setPickerTarget({ kind: "nav" })} />
           ) : (
-            navSlots.map((slot) => (
+            navSlots.map((slot) => {
+              console.log("[layout] rendering slot", { id: slot.slotId, key: slot.app?.key, selected: slot.slotId === selectedSlotId });
+              return (
               <div
                 key={slot.slotId}
                 style={{
@@ -266,7 +287,7 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
                   onSlotRemoved={() => handleSlotRemoved(slot.slotId)}
                 />
               </div>
-            ))
+            );})
           )}
         </div>
       </div>

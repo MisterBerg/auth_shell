@@ -1,0 +1,29 @@
+{
+  "name": "module-markdown-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "jsl": {
+    "displayName": "Markdown Viewer",
+    "category": "component",
+    "description": "Tabbed markdown documentation viewer — drag-and-drop a folder to upload a full doc tree to S3"
+  },
+  "scripts": {
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "module-core": "*",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "@aws-sdk/client-s3": "^3.943.0",
+    "react-markdown": "^9.0.3",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4"
+  }
+}

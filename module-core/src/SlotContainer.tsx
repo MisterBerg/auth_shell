@@ -30,10 +30,19 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
     children: slot.children,
   };
 
-  // Keep a ref so the lazy Bound closure always reads the latest config,
-  // even though useMemo only re-runs when the bundle identity changes.
-  const slotConfigRef = useRef(slotConfig);
-  slotConfigRef.current = slotConfig;
+  // Refs so callbacks always read the latest props without needing to be
+  // recreated. This prevents stale-closure writes when the parent hasn't
+  // re-rendered yet (e.g. immediately after a new slot is added).
+  const slotConfigRef      = useRef(slotConfig);
+  const slotRef            = useRef(slot);
+  const parentConfigRef    = useRef(parentConfig);
+  const onSlotUpdatedRef   = useRef(onSlotUpdated);
+  const onSlotRemovedRef   = useRef(onSlotRemoved);
+  slotConfigRef.current    = slotConfig;
+  slotRef.current          = slot;
+  parentConfigRef.current  = parentConfig;
+  onSlotUpdatedRef.current = onSlotUpdated;
+  onSlotRemovedRef.current = onSlotRemoved;
 
   const LazyModule = useMemo(() => {
     if (slot.resources?.length) {
@@ -53,8 +62,9 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slot.app.bucket, slot.app.key, slot.app.exportName]);
 
-  // Writes the root config (at URL params) with updated slot meta.
-  // Does not dispatch shell:navigate — caller decides.
+  // Writes updated slot meta to S3 and notifies the parent.
+  // Uses refs so it always reads the latest slot/parentConfig even if the
+  // parent hasn't re-rendered since the slot was first added.
   const updateSlotMeta = useCallback(async (newMeta: Record<string, unknown>) => {
     const params = new URLSearchParams(window.location.search);
     const configBucket = params.get("bucket");
@@ -62,14 +72,18 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
     if (!configBucket || !configPath) {
       throw new Error("Missing ?bucket= or ?config= URL params");
     }
+    const currentSlot   = slotRef.current;
+    const currentParent = parentConfigRef.current;
     const updatedSlot: ChildSlot = {
-      ...slot,
-      meta: { ...(slot.meta ?? {}), ...newMeta },
+      ...currentSlot,
+      meta: { ...(currentSlot.meta ?? {}), ...newMeta },
     };
-    const updatedChildren = (parentConfig.children ?? []).map((c) =>
-      c.slotId === slot.slotId ? updatedSlot : c
-    );
-    const updatedConfig: ModuleConfig = { ...parentConfig, children: updatedChildren };
+    const existingChildren = currentParent.children ?? [];
+    const found = existingChildren.some((c) => c.slotId === currentSlot.slotId);
+    const updatedChildren = found
+      ? existingChildren.map((c) => c.slotId === currentSlot.slotId ? updatedSlot : c)
+      : [...existingChildren, updatedSlot]; // slot not yet in parent — append it
+    const updatedConfig: ModuleConfig = { ...currentParent, children: updatedChildren };
     const s3 = await getS3Client(configBucket);
     await s3.send(new PutObjectCommand({
       Bucket: configBucket,
@@ -77,17 +91,17 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
       Body: JSON.stringify(updatedConfig, null, 2),
       ContentType: "application/json",
     }));
-    // Notify parent so it can sync its in-memory children state. Without this,
-    // the parent re-mounts this slot with stale meta (e.g. missing URL).
-    onSlotUpdated?.(updatedSlot);
-  }, [slot, parentConfig, getS3Client, onSlotUpdated]);
+    onSlotUpdatedRef.current?.(updatedSlot);
+  }, [getS3Client]); // stable — refs supply the live values
 
   const handleSwap = async (entry: ModuleRegistryEntry) => {
     setShowPicker(false);
     setSwapError(undefined);
 
+    const currentSlot   = slotRef.current;
+    const currentParent = parentConfigRef.current;
     const updatedSlot: ChildSlot = {
-      ...slot,
+      ...currentSlot,
       app: { bucket: entry.bundleBucket, key: entry.bundlePath },
     };
 
@@ -99,10 +113,11 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
       return;
     }
 
-    const updatedChildren = (parentConfig.children ?? []).map((c) =>
-      c.slotId === slot.slotId ? updatedSlot : c
+    const existingChildren = currentParent.children ?? [];
+    const updatedChildren = existingChildren.map((c) =>
+      c.slotId === currentSlot.slotId ? updatedSlot : c
     );
-    const updatedParentConfig: ModuleConfig = { ...parentConfig, children: updatedChildren };
+    const updatedParentConfig: ModuleConfig = { ...currentParent, children: updatedChildren };
     try {
       const s3 = await getS3Client(configBucket);
       await s3.send(new PutObjectCommand({
@@ -116,7 +131,8 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
       return;
     }
 
-    onSlotUpdated?.(updatedSlot);
+    onSlotUpdatedRef.current?.(updatedSlot);
+    // Bundle key changed — shell:navigate reloads the new bundle
     window.dispatchEvent(new Event("shell:navigate"));
   };
 
