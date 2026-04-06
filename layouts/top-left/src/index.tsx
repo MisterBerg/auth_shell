@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect } from "react";
 import type { ModuleProps, ChildSlot, ModuleRegistryEntry } from "module-core";
-import { useEditMode, useAwsS3Client, ModulePicker, SlotContainer } from "module-core";
+import { useEditMode, useAwsS3Client, useUpdateSlotChildren, ModulePicker, SlotContainer } from "module-core";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 
 // ---------------------------------------------------------------------------
@@ -55,10 +55,11 @@ type PickerTarget =
   | { kind: "topbar"; position: TopBarPosition };
 
 export default function LayoutTopLeft({ config }: ModuleProps) {
-  const { editMode } = useEditMode();
-  const getS3Client = useAwsS3Client();
-  const getS3ClientRef = useRef(getS3Client);
-  getS3ClientRef.current = getS3Client;
+  const { editMode }       = useEditMode();
+  const getS3Client        = useAwsS3Client();
+  const getS3ClientRef     = useRef(getS3Client);
+  const updateSlotChildren = useUpdateSlotChildren();
+  getS3ClientRef.current   = getS3Client;
 
   const [children, setChildren] = useState<ChildSlot[]>(config.children ?? []);
   useEffect(() => { setChildren(config.children ?? []); }, [config]);
@@ -83,19 +84,23 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
   }, []);
 
   const writeConfig = useCallback(async (updatedChildren: ChildSlot[]) => {
-    const params = new URLSearchParams(window.location.search);
-    const configBucket = params.get("bucket");
-    const configPath   = params.get("config");
-    if (!configBucket || !configPath) throw new Error("Missing ?bucket= or ?config= URL params");
-    const s3 = await getS3ClientRef.current(configBucket);
-    await s3.send(new PutObjectCommand({
-      Bucket: configBucket,
-      Key: configPath,
-      Body: JSON.stringify({ ...config, children: updatedChildren }, null, 2),
-      ContentType: "application/json",
-      CacheControl: "no-store",
-    }));
-  }, [config]);
+    if (updateSlotChildren) {
+      await updateSlotChildren(updatedChildren);
+    } else {
+      const params = new URLSearchParams(window.location.search);
+      const configBucket = params.get("bucket");
+      const configPath   = params.get("config");
+      if (!configBucket || !configPath) throw new Error("Missing ?bucket= or ?config= URL params");
+      const s3 = await getS3ClientRef.current(configBucket);
+      await s3.send(new PutObjectCommand({
+        Bucket: configBucket,
+        Key: configPath,
+        Body: JSON.stringify({ ...config, children: updatedChildren }, null, 2),
+        ContentType: "application/json",
+        CacheControl: "no-store",
+      }));
+    }
+  }, [updateSlotChildren, config]);
 
   const handleModuleSelected = useCallback(async (entry: ModuleRegistryEntry) => {
     if (!pickerTarget || isAdding) return;
@@ -277,7 +282,7 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
                 style={{
                   position: "absolute",
                   inset: 0,
-                  visibility: slot.slotId === selectedSlotId ? "visible" : "hidden",
+                  visibility: slot.slotId === selectedSlotId ? undefined : "hidden",
                   pointerEvents: slot.slotId === selectedSlotId ? "auto" : "none",
                 }}
               >

@@ -36,6 +36,7 @@ export {
   useRegisterResources,
   useEditMode,
   useUpdateSlotMeta,
+  useUpdateSlotChildren,
   useReplaceModule,
 } from "./hooks.ts";
 

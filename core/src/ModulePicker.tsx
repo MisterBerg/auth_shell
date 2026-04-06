@@ -1,4 +1,5 @@
 import React, { useEffect } from "react";
+import { createPortal } from "react-dom";
 import { useModuleRegistry } from "./useModuleRegistry.ts";
 import type { ModuleRegistryEntry, ModuleCategory } from "./types.ts";
 
@@ -49,7 +50,7 @@ export function ModulePicker({ onSelect, onCancel, headerOverride, errorMessage 
   const categoryOrder: (ModuleCategory | "unknown")[] = ["layout", "app", "component", "unknown"];
   const presentCategories = categoryOrder.filter((c) => grouped[c]?.length);
 
-  return (
+  return createPortal(
     // Backdrop
     <div
       onClick={(e) => { if (e.target === e.currentTarget) onCancel(); }}
@@ -157,7 +158,8 @@ export function ModulePicker({ onSelect, onCancel, headerOverride, errorMessage 
           ))}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

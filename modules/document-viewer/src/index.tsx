@@ -247,6 +247,14 @@ export default function DocumentViewer({ config }: ModuleProps) {
   }
 
   // Empty / upload state
+  if (!editMode) {
+    return (
+      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: C.bg, color: C.muted, fontSize: "0.875rem" }}>
+        No document configured.
+      </div>
+    );
+  }
+
   return (
     <div style={{ height: "100%", display: "flex", flexDirection: "column", background: C.bg }}>
       <div

@@ -93,6 +93,18 @@ export function useUpdateSlotMeta(): ((newMeta: Record<string, unknown>) => Prom
   return ctx?.updateSlotMeta ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// useUpdateSlotChildren
+// For use inside child layouts (tabs-top, tabs-left, etc.) loaded by
+// SlotContainer. Replaces the slot's children array in the parent config.
+// Returns null when there is no parent SlotContext (i.e. this IS the root).
+// ---------------------------------------------------------------------------
+
+export function useUpdateSlotChildren(): ((children: import("./types.ts").ChildSlot[]) => Promise<void>) | null {
+  const ctx = useContext(SlotContext);
+  return ctx?.updateSlotChildren ?? null;
+}
+
 export function useReplaceModule() {
   const { getS3Client } = useAuthContext();
 

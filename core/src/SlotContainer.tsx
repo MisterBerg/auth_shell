@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useCallback, useRef } from "react";
+import React, { useMemo, useState, useCallback, useRef, useContext } from "react";
 import type { ChildSlot, ModuleConfig } from "./types.ts";
 import { useAuthContext, useEditMode, useRegisterResources } from "./hooks.ts";
 import { loadBundle } from "./loadModule.ts";
@@ -19,6 +19,7 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
   const { getS3Client } = useAuthContext();
   const registerResources = useRegisterResources();
   const { editMode } = useEditMode();
+  const parentSlotCtx = useContext(SlotContext); // non-null when this SlotContainer is itself nested
   const [showPicker, setShowPicker] = useState(false);
   const [swapError, setSwapError] = useState<string | undefined>();
 
@@ -62,16 +63,37 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slot.app.bucket, slot.app.key, slot.app.exportName]);
 
-  // Writes updated slot meta to S3 and notifies the parent.
-  // Uses refs so it always reads the latest slot/parentConfig even if the
-  // parent hasn't re-rendered since the slot was first added.
-  const updateSlotMeta = useCallback(async (newMeta: Record<string, unknown>) => {
-    const params = new URLSearchParams(window.location.search);
-    const configBucket = params.get("bucket");
-    const configPath = params.get("config");
-    if (!configBucket || !configPath) {
-      throw new Error("Missing ?bucket= or ?config= URL params");
+  // Writes the updated parent config to S3, or propagates up through
+  // parentSlotCtx if this SlotContainer is itself nested inside another one.
+  const persistParentConfig = useCallback(async (
+    updatedSlot: ChildSlot,
+    updatedParentChildren: ChildSlot[],
+  ) => {
+    if (parentSlotCtx) {
+      // Nested — propagate up: ask the grandparent to update its children
+      // so the change bubbles all the way to the root S3 write.
+      await parentSlotCtx.updateSlotChildren(updatedParentChildren);
+    } else {
+      // Root — write directly to the URL-specified config.json
+      const params = new URLSearchParams(window.location.search);
+      const configBucket = params.get("bucket");
+      const configPath   = params.get("config");
+      if (!configBucket || !configPath) throw new Error("Missing ?bucket= or ?config= URL params");
+      const currentParent = parentConfigRef.current;
+      const updatedConfig: ModuleConfig = { ...currentParent, children: updatedParentChildren };
+      const s3 = await getS3Client(configBucket);
+      await s3.send(new PutObjectCommand({
+        Bucket: configBucket,
+        Key: configPath,
+        Body: JSON.stringify(updatedConfig, null, 2),
+        ContentType: "application/json",
+        CacheControl: "no-store",
+      }));
     }
+    onSlotUpdatedRef.current?.(updatedSlot);
+  }, [getS3Client, parentSlotCtx]);
+
+  const updateSlotMeta = useCallback(async (newMeta: Record<string, unknown>) => {
     const currentSlot   = slotRef.current;
     const currentParent = parentConfigRef.current;
     const updatedSlot: ChildSlot = {
@@ -82,18 +104,21 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
     const found = existingChildren.some((c) => c.slotId === currentSlot.slotId);
     const updatedChildren = found
       ? existingChildren.map((c) => c.slotId === currentSlot.slotId ? updatedSlot : c)
-      : [...existingChildren, updatedSlot]; // slot not yet in parent — append it
-    const updatedConfig: ModuleConfig = { ...currentParent, children: updatedChildren };
-    const s3 = await getS3Client(configBucket);
-    await s3.send(new PutObjectCommand({
-      Bucket: configBucket,
-      Key: configPath,
-      Body: JSON.stringify(updatedConfig, null, 2),
-      ContentType: "application/json",
-      CacheControl: "no-store",
-    }));
-    onSlotUpdatedRef.current?.(updatedSlot);
-  }, [getS3Client]); // stable — refs supply the live values
+      : [...existingChildren, updatedSlot];
+    await persistParentConfig(updatedSlot, updatedChildren);
+  }, [persistParentConfig]);
+
+  const updateSlotChildren = useCallback(async (newChildren: ChildSlot[]) => {
+    const currentSlot   = slotRef.current;
+    const currentParent = parentConfigRef.current;
+    const updatedSlot: ChildSlot = { ...currentSlot, children: newChildren };
+    const existingChildren = currentParent.children ?? [];
+    const found = existingChildren.some((c) => c.slotId === currentSlot.slotId);
+    const updatedChildren = found
+      ? existingChildren.map((c) => c.slotId === currentSlot.slotId ? updatedSlot : c)
+      : [...existingChildren, updatedSlot];
+    await persistParentConfig(updatedSlot, updatedChildren);
+  }, [persistParentConfig]);
 
   const handleSwap = async (entry: ModuleRegistryEntry) => {
     setShowPicker(false);
@@ -106,33 +131,18 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
       app: { bucket: entry.bundleBucket, key: entry.bundlePath },
     };
 
-    const params = new URLSearchParams(window.location.search);
-    const configBucket = params.get("bucket");
-    const configPath = params.get("config");
-    if (!configBucket || !configPath) {
-      setSwapError("Cannot write config: missing URL params");
-      return;
-    }
-
     const existingChildren = currentParent.children ?? [];
     const updatedChildren = existingChildren.map((c) =>
       c.slotId === currentSlot.slotId ? updatedSlot : c
     );
-    const updatedParentConfig: ModuleConfig = { ...currentParent, children: updatedChildren };
+
     try {
-      const s3 = await getS3Client(configBucket);
-      await s3.send(new PutObjectCommand({
-        Bucket: configBucket,
-        Key: configPath,
-        Body: JSON.stringify(updatedParentConfig, null, 2),
-        ContentType: "application/json",
-      }));
+      await persistParentConfig(updatedSlot, updatedChildren);
     } catch (err: unknown) {
       setSwapError(`Failed to save: ${(err as Error).message}`);
       return;
     }
 
-    onSlotUpdatedRef.current?.(updatedSlot);
     // Bundle key changed — shell:navigate reloads the new bundle
     window.dispatchEvent(new Event("shell:navigate"));
   };
@@ -143,7 +153,7 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
     </React.Suspense>
   );
 
-  const slotContextValue = { slotId: slot.slotId, updateSlotMeta };
+  const slotContextValue = { slotId: slot.slotId, updateSlotMeta, updateSlotChildren };
 
   if (editMode) {
     return (
