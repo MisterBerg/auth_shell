@@ -792,6 +792,19 @@ export default function DocumentationViewer({ config }: ModuleProps) {
     );
   }, [auth, contents, currentDocId, manifest, rootTitle]);
 
+  const copyCurrentPageLink = useCallback(async () => {
+    if (!currentDoc) return;
+    const markdownLink = `[${currentDoc.title}](#doc:${currentDoc.id})`;
+    try {
+      await navigator.clipboard.writeText(markdownLink);
+      setStatusMessage("Link copied");
+      setSaveState("saved");
+    } catch (copyError: unknown) {
+      setStatusMessage((copyError as Error).message || "Failed to copy link");
+      setSaveState("error");
+    }
+  }, [currentDoc]);
+
   if (loading) {
     return <div style={centeredStyle()}>Loading documentation...</div>;
   }
@@ -900,9 +913,19 @@ export default function DocumentationViewer({ config }: ModuleProps) {
 
         <div style={{ padding: "0.7rem 0.9rem", borderBottom: `1px solid ${COLORS.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
           <div>
-            <div style={{ fontSize: "1rem", fontWeight: 600 }}>{currentDoc.title}</div>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.65rem", flexWrap: "wrap" }}>
+              <div style={{ fontSize: "1rem", fontWeight: 600 }}>{currentDoc.title}</div>
+              {editMode && (
+                <button
+                  onClick={() => void copyCurrentPageLink()}
+                  style={{ background: "none", border: `1px solid ${COLORS.border}`, color: COLORS.muted, cursor: "pointer", fontSize: "0.75rem", padding: "0.25rem 0.55rem", borderRadius: 6 }}
+                >
+                  Copy Link
+                </button>
+              )}
+            </div>
             <div style={{ marginTop: "0.2rem", fontSize: "0.75rem", color: COLORS.muted, fontFamily: "monospace" }}>
-              doc://{currentDoc.id} · {currentDoc.relativePath}
+              doc://{currentDoc.id} ? {currentDoc.relativePath}
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>

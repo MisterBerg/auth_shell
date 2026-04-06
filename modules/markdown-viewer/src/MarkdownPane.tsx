@@ -49,9 +49,39 @@ interface RenderCtx {
   currentKey: string;
   getS3Client: (bucket?: string) => Promise<S3Client>;
   onNavigate: (key: string) => void;
+  onNavigateHash: (hash: string) => void;
 }
 
 const RenderCtx = createContext<RenderCtx | null>(null);
+
+function slugifyHeading(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-");
+}
+
+function getNodeText(node: React.ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(getNodeText).join("");
+  if (React.isValidElement<{ children?: React.ReactNode }>(node)) {
+    return getNodeText(node.props.children);
+  }
+  return "";
+}
+
+function Heading({
+  level,
+  children,
+}: {
+  level: "h1" | "h2" | "h3" | "h4";
+  children?: React.ReactNode;
+}) {
+  const Tag = level;
+  const id = slugifyHeading(getNodeText(children ?? ""));
+  return <Tag id={id || undefined}>{children}</Tag>;
+}
 
 // ---------------------------------------------------------------------------
 // Async image — fetches from S3 and creates a blob URL
@@ -103,12 +133,33 @@ function MarkdownLink({ href, children }: { href?: string; children?: React.Reac
   if (isExternal(href)) {
     return <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: "#60a5fa" }}>{children}</a>;
   }
-  if (ctx && isMarkdownPath(href)) {
-    const key = resolveS3Key(ctx.currentKey, href.split("#")[0]);
+  if (ctx && href.startsWith("#")) {
     return (
       <a
         href="#"
-        onClick={(e) => { e.preventDefault(); if (key) ctx.onNavigate(key); }}
+        onClick={(e) => {
+          e.preventDefault();
+          ctx.onNavigateHash(href.slice(1));
+        }}
+        style={{ color: "#60a5fa", cursor: "pointer" }}
+      >
+        {children}
+      </a>
+    );
+  }
+  if (ctx && isMarkdownPath(href)) {
+    const [pathPart, hashPart] = href.split("#");
+    const key = resolveS3Key(ctx.currentKey, pathPart);
+    return (
+      <a
+        href="#"
+        onClick={(e) => {
+          e.preventDefault();
+          if (key) ctx.onNavigate(key);
+          if (hashPart) {
+            window.setTimeout(() => ctx.onNavigateHash(hashPart), 0);
+          }
+        }}
         style={{ color: "#60a5fa", cursor: "pointer" }}
       >
         {children}
@@ -180,6 +231,7 @@ function ensureStyles(targetDoc: Document = document) {
   el.id = STYLE_ID;
   el.textContent = MD_CSS;
   targetDoc.head.appendChild(el);
+  (window as unknown as Record<string, unknown>)["__hepMdCss"] = MD_CSS;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,11 +294,24 @@ export function MarkdownPane({ tab, getS3Client, onContentLoaded }: MarkdownPane
     containerRef.current?.scrollTo(0, 0);
   }, []);
 
+  const handleNavigateHash = useCallback((hash: string) => {
+    if (!hash) return;
+    const cssEscape = (globalThis as typeof globalThis & {
+      CSS?: { escape?: (value: string) => string };
+    }).CSS?.escape;
+    const escaped = cssEscape
+      ? cssEscape(hash)
+      : hash.replace(/["\\.#:[\]]/g, "\\$&");
+    const target = containerRef.current?.querySelector<HTMLElement>(`#${escaped}`);
+    target?.scrollIntoView({ block: "start" });
+  }, []);
+
   const ctx: RenderCtx = {
     bucket: tab.bucket,
     currentKey,
     getS3Client,
     onNavigate: handleNavigate,
+    onNavigateHash: handleNavigateHash,
   };
 
   return (
@@ -269,6 +334,10 @@ export function MarkdownPane({ tab, getS3Client, onContentLoaded }: MarkdownPane
               components={{
                 a:   (p) => <MarkdownLink href={p.href}>{p.children}</MarkdownLink>,
                 img: (p) => <S3Image src={p.src} alt={p.alt} />,
+                h1:  (p) => <Heading level="h1">{p.children}</Heading>,
+                h2:  (p) => <Heading level="h2">{p.children}</Heading>,
+                h3:  (p) => <Heading level="h3">{p.children}</Heading>,
+                h4:  (p) => <Heading level="h4">{p.children}</Heading>,
               }}
             >
               {content}
