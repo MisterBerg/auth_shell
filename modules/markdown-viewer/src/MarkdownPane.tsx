@@ -115,6 +115,34 @@ function MarkdownLink({ href, children }: { href?: string; children?: React.Reac
       </a>
     );
   }
+  // Non-markdown local file (PDF, images, etc.) — fetch from S3 and open as blob URL
+  if (ctx) {
+    const key = resolveS3Key(ctx.currentKey, href.split("#")[0]);
+    if (key) {
+      return (
+        <a
+          href="#"
+          onClick={async (e) => {
+            e.preventDefault();
+            const cacheKey = `${ctx.bucket}:${key}`;
+            let blobUrl = blobCache.get(cacheKey);
+            if (!blobUrl) {
+              const s3 = await ctx.getS3Client(ctx.bucket);
+              const r = await s3.send(new GetObjectCommand({ Bucket: ctx.bucket, Key: key }));
+              const bytes = await r.Body!.transformToByteArray();
+              const blob = new Blob([bytes.buffer as ArrayBuffer]);
+              blobUrl = URL.createObjectURL(blob);
+              blobCache.set(cacheKey, blobUrl);
+            }
+            window.open(blobUrl, "_blank");
+          }}
+          style={{ color: "#60a5fa", cursor: "pointer" }}
+        >
+          {children}
+        </a>
+      );
+    }
+  }
   return <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: "#60a5fa" }}>{children}</a>;
 }
 

@@ -1,0 +1,27 @@
+{
+  "name": "module-document-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "jsl": {
+    "displayName": "Document Viewer",
+    "category": "component",
+    "description": "Upload and view PDF documents stored in S3."
+  },
+  "scripts": {
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "module-core": "*",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4"
+  }
+}

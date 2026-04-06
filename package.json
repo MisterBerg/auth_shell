@@ -1,6 +1,6 @@
 {
   "private": true,
-  "workspaces": ["core", "apps/shell", "apps/landing", "layouts/top-left", "modules/webview", "modules/oauth-badge", "modules/template", "modules/markdown-viewer"],
+  "workspaces": ["core", "apps/shell", "apps/landing", "layouts/top-left", "modules/webview", "modules/oauth-badge", "modules/template", "modules/markdown-viewer", "modules/document-viewer"],
   "scripts": {
     "reset": "tsx scripts/reset-local.ts",
     "compose:up": "podman compose up -d",
