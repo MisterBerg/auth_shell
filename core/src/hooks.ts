@@ -116,6 +116,7 @@ export function useReplaceModule() {
       Key: configPath,
       Body: JSON.stringify(newConfig, null, 2),
       ContentType: "application/json",
+      CacheControl: "no-store",
     }));
 
     window.dispatchEvent(new Event("shell:navigate"));

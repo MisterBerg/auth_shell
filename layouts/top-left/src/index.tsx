@@ -93,6 +93,7 @@ export default function LayoutTopLeft({ config }: ModuleProps) {
       Key: configPath,
       Body: JSON.stringify({ ...config, children: updatedChildren }, null, 2),
       ContentType: "application/json",
+      CacheControl: "no-store",
     }));
   }, [config]);
 

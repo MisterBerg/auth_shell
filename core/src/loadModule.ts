@@ -93,7 +93,7 @@ export async function loadModule(
   // Step 1: fetch config
   const configS3 = await getS3Client(configBucket);
   const configResp = await configS3.send(
-    new GetObjectCommand({ Bucket: configBucket, Key: configPath })
+    new GetObjectCommand({ Bucket: configBucket, Key: configPath, ResponseCacheControl: "no-store" })
   );
   const configJson = await configResp.Body!.transformToString("utf-8");
   const config: ModuleConfig = JSON.parse(configJson) as ModuleConfig;

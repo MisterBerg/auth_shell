@@ -90,6 +90,7 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
       Key: configPath,
       Body: JSON.stringify(updatedConfig, null, 2),
       ContentType: "application/json",
+      CacheControl: "no-store",
     }));
     onSlotUpdatedRef.current?.(updatedSlot);
   }, [getS3Client]); // stable — refs supply the live values
