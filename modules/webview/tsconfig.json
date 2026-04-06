@@ -12,7 +12,7 @@
     "strict": true,
     "skipLibCheck": true,
     "paths": {
-      "module-core": ["../module-core/src/index.ts"]
+      "module-core": ["../../core/src/index.ts"]
     }
   },
   "include": ["src"]

@@ -17,7 +17,7 @@
  *   5. Publish all modules    — build and publish every module to the local registry
  */
 
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import { readFileSync, existsSync } from "fs";
 import { resolve, join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -96,6 +96,38 @@ async function waitForService(label: string, url: string, maxMs = 90_000) {
 }
 
 // ---------------------------------------------------------------------------
+// Dev server management
+// ---------------------------------------------------------------------------
+
+const DEV_PORT = 5173;
+
+function killPort(port: number) {
+  try {
+    // Windows: find PID via netstat, kill it
+    const out = execSync(`netstat -ano | findstr :${port}`, { stdio: "pipe" }).toString();
+    const pids = new Set(
+      out.split("\n")
+        .map((l) => l.trim().split(/\s+/).pop())
+        .filter((p): p is string => !!p && /^\d+$/.test(p) && p !== "0")
+    );
+    for (const pid of pids) {
+      try { execSync(`taskkill /F /PID ${pid}`, { stdio: "pipe" }); } catch { /* already gone */ }
+    }
+  } catch { /* nothing on the port */ }
+}
+
+function startDevServer() {
+  const shellDir = join(ROOT, "apps", "shell");
+  const child = spawn("npm", ["run", "dev"], {
+    cwd: shellDir,
+    detached: true,
+    stdio: "ignore",
+    shell: true,
+  });
+  child.unref();
+}
+
+// ---------------------------------------------------------------------------
 // Module discovery
 // ---------------------------------------------------------------------------
 
@@ -123,7 +155,7 @@ function publishableModules(): string[] {
 
 async function main() {
   const { developer, noCompose } = parseArgs();
-  const TOTAL = noCompose ? 4 : 5;
+  const TOTAL = noCompose ? 5 : 6;
   let step = 0;
 
   console.log("\n╔══════════════════════════════════════════════════════════╗");
@@ -161,20 +193,26 @@ async function main() {
     run(`npx tsx scripts/publish-module.ts --local --module=${mod}`);
   }
 
+  // 6. Restart dev server
+  heading(++step, TOTAL, "Restart dev server");
+  console.log(`  Stopping anything on port ${DEV_PORT}…`);
+  killPort(DEV_PORT);
+  await new Promise((r) => setTimeout(r, 500)); // brief pause so port is free
+  console.log("  Starting apps/shell dev server in background…");
+  startDevServer();
+
   // Done
   const projectUrl =
-    `http://localhost:5173/?bucket=${MODULES_BUCKET}&config=projects/${developer}-dev/config.json`;
+    `http://localhost:${DEV_PORT}/?bucket=${MODULES_BUCKET}&config=projects/${developer}-dev/config.json`;
 
   console.log("\n╔══════════════════════════════════════════════════════════╗");
   console.log("║  ✓  Reset complete                                       ║");
   console.log("╚══════════════════════════════════════════════════════════╝");
   console.log(`
-  Start the dev server (if not already running):
-
-    cd auth-shell && npm run dev
-
-  Then open:
+  Dev server starting at:
     ${projectUrl}
+
+  (Give it a few seconds to compile on first launch.)
 `);
 }
 

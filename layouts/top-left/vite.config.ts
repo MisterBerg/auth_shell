@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      "module-core": path.resolve(__dirname, "../module-core/src/index.ts"),
+      "module-core": path.resolve(__dirname, "../../core/src/index.ts"),
     },
   },
   build: {

@@ -102,7 +102,7 @@ async function resolveVersion(
   }
 
   // Fall back to package.json version
-  const pkgPath = join(ROOT, moduleName, "package.json");
+  const pkgPath = join(resolveModulePath(moduleName), "package.json");
   if (existsSync(pkgPath)) {
     const pkg = JSON.parse(readFileSync(pkgPath, "utf-8")) as { version?: string };
     if (pkg.version) return pkg.version;
@@ -115,16 +115,35 @@ async function resolveVersion(
 // Main
 // ---------------------------------------------------------------------------
 
+function resolveModulePath(nameOrPath: string): string {
+  // 1. Direct path (e.g. "layouts/top-left" or legacy "layout-top-left")
+  const direct = join(ROOT, nameOrPath);
+  if (existsSync(direct)) return direct;
+
+  // 2. Scan workspaces — match by workspace dir basename or package "name"
+  const rootPkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8")) as { workspaces?: string[] };
+  for (const ws of rootPkg.workspaces ?? []) {
+    const wsPath = join(ROOT, ws);
+    if (ws === nameOrPath || ws.endsWith(`/${nameOrPath}`)) return wsPath;
+    try {
+      const pkg = JSON.parse(readFileSync(join(wsPath, "package.json"), "utf-8")) as { name?: string };
+      if (pkg.name === nameOrPath) return wsPath;
+    } catch { /* skip */ }
+  }
+
+  console.error(`Module not found: ${nameOrPath}`);
+  process.exit(1);
+}
+
 async function main() {
   const { moduleName, local, versionOverride } = parseArgs();
 
-  const modulePath = join(ROOT, moduleName);
-  if (!existsSync(modulePath)) {
-    console.error(`Module directory not found: ${modulePath}`);
-    process.exit(1);
-  }
+  const modulePath = resolveModulePath(moduleName);
+  // Always use the npm package name for S3 keys and registry entries
+  const pkg = JSON.parse(readFileSync(join(modulePath, "package.json"), "utf-8")) as { name: string };
+  const canonicalName = pkg.name;
 
-  console.log(`\nPublishing module: ${moduleName}`);
+  console.log(`\nPublishing module: ${canonicalName}`);
   console.log(`Environment:       ${local ? "local (Docker)" : "real AWS"}\n`);
 
   // AWS clients
@@ -159,12 +178,12 @@ async function main() {
   }
 
   // Step 2: version
-  const version = await resolveVersion(ddb, moduleName, versionOverride);
+  const version = await resolveVersion(ddb, canonicalName, versionOverride);
   console.log(`\nVersion: ${version}`);
 
   // Step 3: upload
   const bundleContent = readFileSync(bundlePath);
-  const s3Prefix = `modules/${moduleName}`;
+  const s3Prefix = `modules/${canonicalName}`;
 
   // Versioned copy
   const versionedKey = `${s3Prefix}/bundle.v${version}.js`;
@@ -201,7 +220,7 @@ async function main() {
   await ddb.send(new PutCommand({
     TableName: REGISTRY_TABLE,
     Item: {
-      moduleName,
+      moduleName: canonicalName,
       version,
       ownerId: owner,
       bundleBucket: registryBucket,
@@ -230,11 +249,11 @@ async function main() {
     },
   }));
 
-  console.log(`  ✓ registry record written (${moduleName}@${version})`);
+  console.log(`  ✓ registry record written (${canonicalName}@${version})`);
 
   console.log(`
 Done!
-  Module:  ${moduleName}@${version}
+  Module:  ${canonicalName}@${version}
   Bundle:  s3://${registryBucket}/${latestKey}
   Config:  create a config.json pointing to bucket="${registryBucket}" key="${latestKey}"
 `);
