@@ -34,6 +34,7 @@ export default function LayoutTabsLeft({ config }: ModuleProps) {
   const getS3Client        = useAwsS3Client();
   const getS3ClientRef     = useRef(getS3Client);
   const updateSlotChildren = useUpdateSlotChildren();
+  const isRootLayout       = !updateSlotChildren;
   getS3ClientRef.current   = getS3Client;
 
   const [slots, setSlots] = useState<ChildSlot[]>(config.children ?? []);
@@ -122,7 +123,14 @@ export default function LayoutTabsLeft({ config }: ModuleProps) {
   const liveConfig = { ...config, children: slots };
 
   return (
-    <div style={{ display: "flex", height: "100%", background: C.bg, fontFamily: "system-ui, -apple-system, sans-serif" }}>
+    <div
+      style={{
+        display: "flex",
+        height: isRootLayout ? "100vh" : "100%",
+        background: C.bg,
+        fontFamily: "system-ui, -apple-system, sans-serif",
+      }}
+    >
 
       {/* ── Left tab list ── */}
       <div style={{ width: 200, flexShrink: 0, background: C.bgSidebar, borderRight: `1px solid ${C.border}`, display: "flex", flexDirection: "column", overflowY: "auto" }}>
