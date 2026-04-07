@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { useModuleRegistry } from "./useModuleRegistry.ts";
 import type { ModuleRegistryEntry, ModuleCategory } from "./types.ts";

@@ -32,7 +32,6 @@ import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dyn
 // ---------------------------------------------------------------------------
 
 const ROOT = resolve(__dirname, "..");
-const REGISTRY_TABLE = "module-registry";
 
 // Local Docker endpoints
 const LOCAL = {
@@ -41,12 +40,14 @@ const LOCAL = {
   region: "us-east-1",
   credentials: { accessKeyId: "minioadmin", secretAccessKey: "minioadmin" },
   registryBucket: "hep-dev-registry",
+  registryTable: "module-registry",
 };
 
 // Real AWS — reads from environment / AWS credential chain
 const REMOTE = {
   region: process.env["AWS_REGION"] ?? "us-east-2",
-  registryBucket: process.env["HEP_REGISTRY_BUCKET"] ?? "",
+  registryBucket: process.env["HEP_REGISTRY_BUCKET"] ?? "jeffspace-registry",
+  registryTable: process.env["HEP_REGISTRY_TABLE"] ?? "jeffspace-module-registry",
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +87,7 @@ function bumpPatch(version: string): string {
 
 async function resolveVersion(
   ddb: DynamoDBDocumentClient,
+  table: string,
   moduleName: string,
   override?: string
 ): Promise<string> {
@@ -93,7 +95,7 @@ async function resolveVersion(
 
   // Check if a latest version exists in the registry
   const existing = await ddb.send(new GetCommand({
-    TableName: REGISTRY_TABLE,
+    TableName: table,
     Key: { moduleName, version: "latest" },
   }));
 
@@ -162,6 +164,7 @@ async function main() {
   });
 
   const registryBucket = local ? LOCAL.registryBucket : REMOTE.registryBucket;
+  const registryTable  = local ? LOCAL.registryTable  : REMOTE.registryTable;
   if (!registryBucket) {
     console.error("HEP_REGISTRY_BUCKET env var required for real AWS publish");
     process.exit(1);
@@ -178,7 +181,7 @@ async function main() {
   }
 
   // Step 2: version
-  const version = await resolveVersion(ddb, canonicalName, versionOverride);
+  const version = await resolveVersion(ddb, registryTable, canonicalName, versionOverride);
   console.log(`\nVersion: ${version}`);
 
   // Step 3: upload
@@ -218,7 +221,7 @@ async function main() {
 
   // Version record
   await ddb.send(new PutCommand({
-    TableName: REGISTRY_TABLE,
+    TableName: registryTable,
     Item: {
       moduleName: canonicalName,
       version,
@@ -234,7 +237,7 @@ async function main() {
 
   // Latest pointer record
   await ddb.send(new PutCommand({
-    TableName: REGISTRY_TABLE,
+    TableName: registryTable,
     Item: {
       moduleName,
       version: "latest",

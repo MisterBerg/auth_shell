@@ -1,9 +1,7 @@
 import { useEffect, useState } from "react";
 import { ScanCommand } from "@aws-sdk/lib-dynamodb";
-import { useAwsDdbClient } from "./hooks.ts";
+import { useAwsDdbClient, useTableNames } from "./hooks.ts";
 import type { ModuleRegistryEntry } from "./types.ts";
-
-const REGISTRY_TABLE = "module-registry";
 
 /**
  * Queries the module registry for all published modules (latest versions only).
@@ -11,6 +9,7 @@ const REGISTRY_TABLE = "module-registry";
  */
 export function useModuleRegistry() {
   const getDdbClient = useAwsDdbClient();
+  const { registry: registryTable } = useTableNames();
 
   const [entries, setEntries] = useState<ModuleRegistryEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -24,7 +23,7 @@ export function useModuleRegistry() {
     getDdbClient()
       .then((ddb) =>
         ddb.send(new ScanCommand({
-          TableName: REGISTRY_TABLE,
+          TableName: registryTable,
           // Only fetch the "latest" pointer records — one per module
           FilterExpression: "#v = :latest",
           ExpressionAttributeNames: { "#v": "version" },

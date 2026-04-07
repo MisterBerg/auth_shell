@@ -1,5 +1,4 @@
 import { fromCognitoIdentityPool } from "@aws-sdk/credential-providers";
-import { CognitoIdentityClient } from "@aws-sdk/client-cognito-identity";
 import type { AppConfig } from "../config";
 import {
   useAuthStore,
@@ -48,10 +47,8 @@ function makeAwsCredentialProviderFromGoogle(
   config: AppConfig,
   googleToken: string
 ): () => Promise<AwsCredentials> {
-  const cognitoClient = new CognitoIdentityClient({ region: config.region });
-
   const baseProvider = fromCognitoIdentityPool({
-    clientConfig: { region: config.region, client: cognitoClient },
+    clientConfig: { region: config.region },
     identityPoolId: config.identityPoolId,
     logins: {
       [GOOGLE_PROVIDER]: googleToken,

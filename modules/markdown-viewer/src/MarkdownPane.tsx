@@ -40,6 +40,24 @@ export function isMarkdownPath(href: string): boolean {
 
 const blobCache = new Map<string, string>();
 
+function mimeFromKey(key: string): string {
+  const ext = key.split("?")[0].split(".").pop()?.toLowerCase() ?? "";
+  const map: Record<string, string> = {
+    pdf:  "application/pdf",
+    png:  "image/png",
+    jpg:  "image/jpeg",
+    jpeg: "image/jpeg",
+    gif:  "image/gif",
+    webp: "image/webp",
+    svg:  "image/svg+xml",
+    mp4:  "video/mp4",
+    webm: "video/webm",
+    mp3:  "audio/mpeg",
+    wav:  "audio/wav",
+  };
+  return map[ext] ?? "application/octet-stream";
+}
+
 // ---------------------------------------------------------------------------
 // Context passed to react-markdown custom renderers
 // ---------------------------------------------------------------------------
@@ -107,7 +125,7 @@ function S3Image({ src, alt }: { src?: string; alt?: string }) {
       .then((r) => r.Body!.transformToByteArray())
       .then((bytes) => {
         if (cancelled) return;
-        const blob = new Blob([bytes.buffer as ArrayBuffer]);
+        const blob = new Blob([bytes.buffer as ArrayBuffer], { type: mimeFromKey(key) });
         const blobUrl = URL.createObjectURL(blob);
         blobCache.set(cacheKey, blobUrl);
         setUrl(blobUrl);
@@ -181,7 +199,7 @@ function MarkdownLink({ href, children }: { href?: string; children?: React.Reac
               const s3 = await ctx.getS3Client(ctx.bucket);
               const r = await s3.send(new GetObjectCommand({ Bucket: ctx.bucket, Key: key }));
               const bytes = await r.Body!.transformToByteArray();
-              const blob = new Blob([bytes.buffer as ArrayBuffer]);
+              const blob = new Blob([bytes.buffer as ArrayBuffer], { type: mimeFromKey(key) });
               blobUrl = URL.createObjectURL(blob);
               blobCache.set(cacheKey, blobUrl);
             }

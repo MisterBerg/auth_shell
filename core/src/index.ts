@@ -26,6 +26,7 @@ export type { AuthContextValue, ResourceRegistryValue, EditModeContextValue } fr
 // Hooks
 export {
   useAuthContext,
+  useTableNames,
   useAwsCredentials,
   useAwsS3Client,
   useAwsDdbClient,

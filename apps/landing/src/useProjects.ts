@@ -1,9 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { QueryCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { useAwsDdbClient } from "module-core";
+import { useAwsDdbClient, useTableNames } from "module-core";
 import type { ProjectRecord } from "./types.ts";
-
-const PROJECTS_TABLE = "org-projects";
 
 // ---------------------------------------------------------------------------
 // My Projects — query by userId PK, sort in memory by updatedAt desc
@@ -13,6 +11,7 @@ export function useMyProjects(userId: string | undefined) {
   const getDdbClient = useAwsDdbClient();
   const getDdbClientRef = useRef(getDdbClient);
   useEffect(() => { getDdbClientRef.current = getDdbClient; });
+  const { projects: projectsTable } = useTableNames();
 
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [loading, setLoading] = useState(false);
@@ -27,7 +26,7 @@ export function useMyProjects(userId: string | undefined) {
     getDdbClientRef.current()
       .then((ddb) =>
         ddb.send(new QueryCommand({
-          TableName: PROJECTS_TABLE,
+          TableName: projectsTable,
           KeyConditionExpression: "userId = :uid",
           FilterExpression: "#role = :owner",
           ExpressionAttributeNames: { "#role": "role" },
@@ -49,7 +48,7 @@ export function useMyProjects(userId: string | undefined) {
       });
 
     return () => { cancelled = true; };
-  }, [userId]);
+  }, [userId, projectsTable]);
 
   useEffect(() => { return load(); }, [load]);
 
@@ -64,6 +63,7 @@ export function useSharedProjects(userId: string | undefined) {
   const getDdbClient = useAwsDdbClient();
   const getDdbClientRef = useRef(getDdbClient);
   useEffect(() => { getDdbClientRef.current = getDdbClient; });
+  const { projects: projectsTable } = useTableNames();
 
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [loading, setLoading] = useState(false);
@@ -78,7 +78,7 @@ export function useSharedProjects(userId: string | undefined) {
     getDdbClientRef.current()
       .then((ddb) =>
         ddb.send(new QueryCommand({
-          TableName: PROJECTS_TABLE,
+          TableName: projectsTable,
           IndexName: "sharedWithUserId-updatedAt-index",
           KeyConditionExpression: "sharedWithUserId = :uid",
           ExpressionAttributeValues: { ":uid": userId },
@@ -97,7 +97,7 @@ export function useSharedProjects(userId: string | undefined) {
       });
 
     return () => { cancelled = true; };
-  }, [userId]);
+  }, [userId, projectsTable]);
 
   return { projects, loading, error };
 }
@@ -124,6 +124,7 @@ export function useCreateProject() {
   const getDdbClient = useAwsDdbClient();
   const getDdbClientRef = useRef(getDdbClient);
   useEffect(() => { getDdbClientRef.current = getDdbClient; });
+  const { projects: projectsTable } = useTableNames();
 
   return useCallback(async (args: CreateProjectArgs): Promise<CreatedProject> => {
     const { userId, displayName, description, projectsBucket } = args;
@@ -151,11 +152,11 @@ export function useCreateProject() {
 
     const ddb = await getDdbClientRef.current();
     try {
-      await ddb.send(new PutCommand({ TableName: PROJECTS_TABLE, Item: record }));
+      await ddb.send(new PutCommand({ TableName: projectsTable, Item: record }));
     } catch (err: unknown) {
       throw new Error(`Failed to create project: ${(err as Error).message}`);
     }
 
     return record;
-  }, []);
+  }, [projectsTable]);
 }

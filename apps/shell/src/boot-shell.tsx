@@ -7,6 +7,7 @@ import type { AuthContextValue } from "module-core";
 import { AuthGate } from "./auth/AuthGate.tsx";
 import { useAuthStore } from "./stores/authStore.ts";
 import { getAwsClients } from "./aws/awsClients.ts";
+import { CONFIG } from "./config.ts";
 
 // Expose globals synchronously so IIFE module bundles can reference them
 // before any module script executes. Each name matches the `globals` map
@@ -28,6 +29,7 @@ function ShellAuthProvider({ children }: { children: React.ReactNode }) {
     signOut,
     getS3Client,
     getDdbClient: getDdbDocClient,
+    tables: CONFIG.tables,
   };
 
   return <AuthProvider {...authValue}>{children}</AuthProvider>;

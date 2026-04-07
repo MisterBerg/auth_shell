@@ -65,19 +65,53 @@ function run(cmd: string, cwd?: string) {
   execSync(cmd, { cwd: cwd ?? ROOT, stdio: "inherit" });
 }
 
-// Locate the compose binary. Tries the PATH first, then the known Podman
-// install location on Windows so this works even in shells where PATH hasn't
-// been refreshed yet.
-function composeCmd(): string {
+// Locate the podman binary. Tries PATH first, then the known Windows install path.
+function podmanBin(): string {
   for (const candidate of ["podman", "C:\\Program Files\\RedHat\\Podman\\podman.exe"]) {
     try {
-      execSync(`"${candidate}" compose version`, { stdio: "pipe" });
-      return `"${candidate}" compose`;
+      execSync(`"${candidate}" --version`, { stdio: "pipe" });
+      return candidate;
     } catch { /* try next */ }
   }
   throw new Error(
     "podman not found. Make sure Podman Desktop is installed and podman.exe is on PATH."
   );
+}
+
+// Ensure the podman machine is running. If a machine exists but is stopped, start it.
+function ensurePodmanMachine(bin: string) {
+  let lsOut = "";
+  try {
+    lsOut = execSync(`"${bin}" machine ls --format json`, { stdio: "pipe" }).toString();
+  } catch {
+    // podman machine commands not supported (Linux native — no VM needed)
+    return;
+  }
+
+  let machines: { Name: string; LastUp: string; Running: boolean }[] = [];
+  try { machines = JSON.parse(lsOut); } catch { return; }
+  if (machines.length === 0) return;
+
+  const running = machines.some((m) => m.Running);
+  if (running) return;
+
+  console.log("  Podman machine is stopped — starting it…");
+  execSync(`"${bin}" machine start`, { stdio: "inherit" });
+  console.log();
+}
+
+// Locate the compose binary and return the full command prefix.
+function composeCmd(): string {
+  const bin = podmanBin();
+  ensurePodmanMachine(bin);
+  try {
+    execSync(`"${bin}" compose version`, { stdio: "pipe" });
+    return `"${bin}" compose`;
+  } catch {
+    throw new Error(
+      "podman compose not found. Install podman-compose (e.g. npm i -g podman-compose or brew install podman-compose)."
+    );
+  }
 }
 
 async function waitForService(label: string, url: string, maxMs = 90_000) {

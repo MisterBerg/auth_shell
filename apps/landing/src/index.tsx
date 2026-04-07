@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef } from "react";
 import type { ModuleProps, ModuleRegistryEntry } from "module-core";
 import { useUserProfile, useAwsS3Client, ModulePicker } from "module-core";
 import { PutObjectCommand } from "@aws-sdk/client-s3";

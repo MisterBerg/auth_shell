@@ -7,14 +7,22 @@
     "compose:down": "podman compose down",
     "seed": "tsx scripts/seed-local.ts",
     "publish:local": "tsx scripts/publish-module.ts --local",
-    "publish": "tsx scripts/publish-module.ts"
+    "publish": "tsx scripts/publish-module.ts",
+    "publish:all": "tsx scripts/publish-all.ts",
+    "publish:all:local": "tsx scripts/publish-all.ts --local",
+    "provision": "tsx scripts/provision-aws.ts",
+    "deploy:shell": "tsx scripts/deploy-shell.ts"
   },
   "devDependencies": {
     "tsx": "^4.19.4"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudfront": "^3.943.0",
+    "@aws-sdk/client-cognito-identity": "^3.943.0",
     "@aws-sdk/client-dynamodb": "^3.943.0",
+    "@aws-sdk/client-iam": "^3.943.0",
     "@aws-sdk/client-s3": "^3.943.0",
+    "@aws-sdk/client-sts": "^3.943.0",
     "@aws-sdk/credential-providers": "^3.943.0",
     "@aws-sdk/lib-dynamodb": "^3.943.0"
   }

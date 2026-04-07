@@ -1,6 +1,5 @@
 // src/stores/authStore.ts
 import { create } from "zustand";
-import type { AppConfig } from "../config";
 
 export type AwsCredentials = {
   accessKeyId: string;

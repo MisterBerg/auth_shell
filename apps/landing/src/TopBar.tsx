@@ -1,4 +1,4 @@
-import React from "react";
+
 import type { UserProfile } from "module-core";
 
 type TopBarProps = {

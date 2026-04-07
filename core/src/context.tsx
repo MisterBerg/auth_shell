@@ -18,6 +18,11 @@ export type AuthContextValue = {
   signOut: () => void;
   getS3Client: (bucket?: string) => Promise<S3Client>;
   getDdbClient: () => Promise<DynamoDBDocumentClient>;
+  /** DynamoDB table names for this deployment. Defaults to local dev names. */
+  tables?: {
+    registry?: string;  // module registry table (default: "module-registry")
+    projects?: string;  // org projects table   (default: "org-projects")
+  };
 };
 
 export const AuthContext = createContext<AuthContextValue | null>(null);

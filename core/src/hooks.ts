@@ -18,6 +18,14 @@ export function useAuthContext() {
   return ctx;
 }
 
+export function useTableNames() {
+  const ctx = useContext(AuthContext);
+  return {
+    registry: ctx?.tables?.registry ?? "module-registry",
+    projects: ctx?.tables?.projects ?? "org-projects",
+  };
+}
+
 /** Returns the async AWS credential provider function. */
 export function useAwsCredentials() {
   return useAuthContext().awsCredentialProvider;
