@@ -7,14 +7,19 @@ import {
   useEditMode,
   useUpdateSlotMeta,
 } from "module-core";
+import { GetObjectCommand } from "@aws-sdk/client-s3";
 import type { S3Client } from "@aws-sdk/client-s3";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   assignPaths,
   createLinkedPage,
+  copyObjectIfExists,
   deleteObjectIfExists,
+  extractMediaRelativePaths,
   getDocKey,
+  getMediaKey,
+  getRelativePath,
   getStorageConfig,
   insertDocAtCursor,
   loadDocumentationState,
@@ -25,9 +30,11 @@ import {
   rewriteDocLinksForExport,
   type ContentMap,
   type DocumentationManifest,
+  type StorageConfig,
   type LinkAction,
   type MoveDirection,
   wrapSelection,
+  writeBinaryObject,
   writeTextObject,
 } from "./model.ts";
 
@@ -45,6 +52,49 @@ const COLORS = {
   error: "#fca5a5",
   selected: "#11233a",
 };
+
+const mediaBlobCache = new Map<string, string>();
+
+function safeMediaName(file: File): string {
+  const dot = file.name.lastIndexOf(".");
+  const base = (dot > 0 ? file.name.slice(0, dot) : file.name)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 44) || "media";
+  const ext = dot > 0 ? file.name.slice(dot).toLowerCase().replace(/[^.a-z0-9]/g, "") : "";
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${base}${ext}`;
+}
+
+function contentTypeForPath(path: string): string {
+  const ext = path.split(/[?#]/)[0].toLowerCase().split(".").pop() ?? "";
+  const types: Record<string, string> = {
+    apng: "image/apng",
+    avif: "image/avif",
+    gif: "image/gif",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    svg: "image/svg+xml",
+    webp: "image/webp",
+    mp4: "video/mp4",
+    webm: "video/webm",
+    mov: "video/quicktime",
+    mp3: "audio/mpeg",
+    m4a: "audio/mp4",
+    ogg: "audio/ogg",
+    wav: "audio/wav",
+    pdf: "application/pdf",
+  };
+  return types[ext] ?? "application/octet-stream";
+}
+
+function mediaKind(path: string, contentType = contentTypeForPath(path)): "image" | "video" | "audio" | "file" {
+  if (contentType.startsWith("image/")) return "image";
+  if (contentType.startsWith("video/")) return "video";
+  if (contentType.startsWith("audio/")) return "audio";
+  return "file";
+}
 
 function useDebouncedEffect(
   effect: () => void | (() => void),
@@ -161,20 +211,126 @@ function findLinkedDocId(
   return match?.id ?? null;
 }
 
+function resolveMediaRelativePath(
+  manifest: DocumentationManifest,
+  currentDocId: string,
+  href: string | undefined
+): string | null {
+  if (!href || isExternalHref(href)) return null;
+  const currentDoc = manifest.docs[currentDocId];
+  if (!currentDoc) return null;
+  const resolvedPath = resolveRelativeHref(currentDoc.relativePath, href);
+  if (!resolvedPath?.startsWith("media/")) return null;
+  return resolvedPath.slice("media/".length);
+}
+
+function DocumentationMedia({
+  href,
+  alt,
+  manifest,
+  currentDocId,
+  storage,
+}: {
+  href?: string;
+  alt?: string;
+  manifest: DocumentationManifest;
+  currentDocId: string;
+  storage: StorageConfig;
+}) {
+  const getS3Client = useAwsS3Client();
+  const [url, setUrl] = useState<string | "loading" | "error">("loading");
+  const mediaRelativePath = resolveMediaRelativePath(manifest, currentDocId, href);
+
+  useEffect(() => {
+    if (!mediaRelativePath) {
+      setUrl("error");
+      return;
+    }
+
+    const key = getMediaKey(storage, mediaRelativePath);
+    const cacheKey = `${storage.bucket}:${key}`;
+    const cached = mediaBlobCache.get(cacheKey);
+    if (cached) {
+      setUrl(cached);
+      return;
+    }
+
+    let cancelled = false;
+    getS3Client(storage.bucket)
+      .then((s3) => s3.send(new GetObjectCommand({ Bucket: storage.bucket, Key: key })))
+      .then((response) => response.Body!.transformToByteArray())
+      .then((bytes) => {
+        if (cancelled) return;
+        const blob = new Blob([bytes.buffer as ArrayBuffer], {
+          type: contentTypeForPath(mediaRelativePath),
+        });
+        const blobUrl = URL.createObjectURL(blob);
+        mediaBlobCache.set(cacheKey, blobUrl);
+        setUrl(blobUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setUrl("error");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [getS3Client, mediaRelativePath, storage]);
+
+  if (!mediaRelativePath) return null;
+  if (url === "loading") {
+    return <em style={{ color: COLORS.muted, fontSize: "0.85em" }}>[{alt ?? mediaRelativePath} loading...]</em>;
+  }
+  if (url === "error") {
+    return <em style={{ color: COLORS.muted, fontSize: "0.85em" }}>[{alt ?? mediaRelativePath} unavailable]</em>;
+  }
+
+  const kind = mediaKind(mediaRelativePath);
+  if (kind === "image") {
+    return <img src={url} alt={alt ?? ""} style={{ maxWidth: "100%", borderRadius: 8 }} />;
+  }
+  if (kind === "video") {
+    return <video src={url} controls style={{ maxWidth: "100%", borderRadius: 8 }} />;
+  }
+  if (kind === "audio") {
+    return <audio src={url} controls style={{ width: "100%" }} />;
+  }
+
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer" style={{ color: COLORS.accent }}>
+      {alt || mediaRelativePath.split("/").pop() || "Open media"}
+    </a>
+  );
+}
+
 function DocumentationLink({
   href,
   children,
   manifest,
   currentDocId,
   onNavigateDoc,
+  storage,
 }: {
   href?: string;
   children?: React.ReactNode;
   manifest: DocumentationManifest;
   currentDocId: string;
   onNavigateDoc: (docId: string) => void;
+  storage: StorageConfig;
 }) {
   if (!href) return <>{children}</>;
+
+  if (resolveMediaRelativePath(manifest, currentDocId, href)) {
+    return (
+      <DocumentationMedia
+        href={href}
+        alt={typeof children === "string" ? children : undefined}
+        manifest={manifest}
+        currentDocId={currentDocId}
+        storage={storage}
+      />
+    );
+  }
 
   const linkedDocId = findLinkedDocId(manifest, currentDocId, href);
   if (isExternalHref(href)) {
@@ -208,11 +364,13 @@ function DocumentationBody({
   currentDocId,
   currentContent,
   onNavigateDoc,
+  storage,
 }: {
   manifest: DocumentationManifest;
   currentDocId: string;
   currentContent: string;
   onNavigateDoc: (docId: string) => void;
+  storage: StorageConfig;
 }) {
   const renderContent = currentContent.replace(/\]\(doc:\/\/([a-z0-9-]+)\)/gi, "](#doc:$1)");
 
@@ -227,9 +385,19 @@ function DocumentationBody({
               manifest={manifest}
               currentDocId={currentDocId}
               onNavigateDoc={onNavigateDoc}
+              storage={storage}
             >
               {props.children}
             </DocumentationLink>
+          ),
+          img: (props) => (
+            <DocumentationMedia
+              href={props.src}
+              alt={props.alt}
+              manifest={manifest}
+              currentDocId={currentDocId}
+              storage={storage}
+            />
           ),
           code: ({ className, children, ...props }) => {
             const inline = !className;
@@ -261,11 +429,13 @@ function DocumentationPopout({
   initialContents,
   initialDocId,
   label,
+  storage,
 }: {
   initialManifest: DocumentationManifest;
   initialContents: ContentMap;
   initialDocId: string;
   label: string;
+  storage: StorageConfig;
 }) {
   const [currentDocId, setCurrentDocId] = useState(initialDocId);
   const currentDoc = initialManifest.docs[currentDocId] ?? initialManifest.docs[initialManifest.rootDocId];
@@ -334,6 +504,7 @@ function DocumentationPopout({
             currentDocId={currentDoc.id}
             currentContent={currentContent}
             onNavigateDoc={setCurrentDocId}
+            storage={storage}
           />
         </div>
       </section>
@@ -368,6 +539,7 @@ export default function DocumentationViewer({ config }: ModuleProps) {
   const [labelDraft, setLabelDraft] = useState(rootTitle);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const mediaInputRef = useRef<HTMLInputElement>(null);
   const loadedRef = useRef(false);
   const prevEditModeRef = useRef(editMode);
   const manifestRef = useRef<DocumentationManifest | null>(null);
@@ -620,6 +792,67 @@ export default function DocumentationViewer({ config }: ModuleProps) {
     [currentContent, updateCurrentContent]
   );
 
+  const uploadMediaFiles = useCallback(
+    async (files: File[]) => {
+      if (!currentDoc || files.length === 0) return;
+      const s3 = await getS3Client(storage.bucket);
+      const inserted: string[] = [];
+
+      setSaveState("saving");
+      setStatusMessage(`Uploading ${files.length} media file${files.length === 1 ? "" : "s"}...`);
+
+      try {
+        for (const file of files) {
+          const filename = safeMediaName(file);
+          const key = getMediaKey(storage, filename);
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          await writeBinaryObject(
+            s3,
+            storage.bucket,
+            key,
+            bytes,
+            file.type || contentTypeForPath(file.name)
+          );
+
+          const mediaDocPath = `media/${filename}`;
+          const href = getRelativePath(currentDoc.relativePath, mediaDocPath);
+          const label = file.name.replace(/\.[^.]+$/, "") || filename;
+          inserted.push(
+            mediaKind(file.name, file.type || contentTypeForPath(file.name)) === "file"
+              ? `[${file.name}](${href})`
+              : `![${label}](${href})`
+          );
+        }
+
+        const textarea = textareaRef.current;
+        const selectionStart = textarea?.selectionStart ?? currentContent.length;
+        const selectionEnd = textarea?.selectionEnd ?? currentContent.length;
+        const insertion = `\n\n${inserted.join("\n\n")}\n\n`;
+        const result = insertDocAtCursor(
+          currentContent,
+          selectionStart,
+          selectionEnd,
+          insertion
+        );
+        updateCurrentContent(result.nextValue);
+        setSaveState("saved");
+        setStatusMessage(`Uploaded ${files.length} media file${files.length === 1 ? "" : "s"}`);
+
+        window.requestAnimationFrame(() => {
+          textareaRef.current?.focus();
+          textareaRef.current?.setSelectionRange(
+            result.nextSelectionStart,
+            result.nextSelectionEnd
+          );
+        });
+      } catch (uploadError: unknown) {
+        setSaveState("error");
+        setStatusMessage((uploadError as Error).message);
+      }
+    },
+    [currentContent, currentDoc, getS3Client, storage, updateCurrentContent]
+  );
+
   const createLinkedDocument = useCallback(
     async (action: LinkAction) => {
       if (!manifest || !currentDocId) return;
@@ -786,11 +1019,12 @@ export default function DocumentationViewer({ config }: ModuleProps) {
             initialContents: contents,
             initialDocId: currentDocId || manifest.rootDocId,
             label: rootTitle,
+            storage,
           }),
         },
       )
     );
-  }, [auth, contents, currentDocId, manifest, rootTitle]);
+  }, [auth, contents, currentDocId, manifest, rootTitle, storage]);
 
   const copyCurrentPageLink = useCallback(async () => {
     if (!currentDoc) return;
@@ -901,6 +1135,18 @@ export default function DocumentationViewer({ config }: ModuleProps) {
               <ToolbarButton onClick={() => insertBlock("## Heading\n")} label="Heading" />
               <ToolbarButton onClick={() => insertBlock("- List item\n")} label="Bullet" />
               <ToolbarButton onClick={() => insertBlock("\n```ts\ncode\n```\n")} label="Code Block" />
+              <ToolbarButton onClick={() => mediaInputRef.current?.click()} label="Media" />
+              <input
+                ref={mediaInputRef}
+                type="file"
+                multiple
+                onChange={(event) => {
+                  const files = Array.from(event.currentTarget.files ?? []);
+                  event.currentTarget.value = "";
+                  void uploadMediaFiles(files);
+                }}
+                style={{ display: "none" }}
+              />
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", flexWrap: "wrap" }}>
@@ -950,6 +1196,23 @@ export default function DocumentationViewer({ config }: ModuleProps) {
                 ref={textareaRef}
                 value={currentContent}
                 onChange={(event) => updateCurrentContent(event.target.value)}
+                onPaste={(event) => {
+                  const files = Array.from(event.clipboardData.files);
+                  if (files.length === 0) return;
+                  event.preventDefault();
+                  void uploadMediaFiles(files);
+                }}
+                onDrop={(event) => {
+                  const files = Array.from(event.dataTransfer.files);
+                  if (files.length === 0) return;
+                  event.preventDefault();
+                  void uploadMediaFiles(files);
+                }}
+                onDragOver={(event) => {
+                  if (event.dataTransfer.types.includes("Files")) {
+                    event.preventDefault();
+                  }
+                }}
                 spellCheck={false}
                 style={{
                   flex: 1,
@@ -974,6 +1237,7 @@ export default function DocumentationViewer({ config }: ModuleProps) {
               currentDocId={currentDocId}
               currentContent={currentContent}
               onNavigateDoc={setCurrentDocId}
+              storage={storage}
             />
           </div>
         </div>
@@ -994,6 +1258,16 @@ export async function onExport(ctx: ExportContext): Promise<void> {
 
   const manifest = assignPaths(JSON.parse(manifestText) as DocumentationManifest);
   const exportBase = `${ctx.projectPrefix}${ctx.config.id}/export/docs`;
+  const mediaPrefix = pagesPrefix.endsWith("/pages")
+    ? `${pagesPrefix.slice(0, -"/pages".length)}/media`
+    : `${pagesPrefix.split("/").slice(0, -1).join("/")}/media`;
+  const storage: StorageConfig = {
+    bucket: storageBucket,
+    manifestKey,
+    pagesPrefix,
+    mediaPrefix,
+  };
+  const copiedMedia = new Set<string>();
 
   for (const doc of Object.values(manifest.docs)) {
     const sourceKey = `${pagesPrefix}/${doc.relativePath}`;
@@ -1001,6 +1275,28 @@ export async function onExport(ctx: ExportContext): Promise<void> {
       (await readOptionalTextObject(ctx.s3Client as S3Client, storageBucket, sourceKey)) ??
       `# ${doc.title}\n\n`;
     const exportedMarkdown = rewriteDocLinksForExport(markdown, manifest, doc.id);
+
+    for (const href of extractMediaRelativePaths(exportedMarkdown)) {
+      const resolvedPath = resolveRelativeHref(doc.relativePath, href);
+      if (!resolvedPath?.startsWith("media/")) continue;
+
+      const mediaRelativePath = resolvedPath.slice("media/".length);
+      if (copiedMedia.has(mediaRelativePath)) continue;
+
+      try {
+        await copyObjectIfExists(
+          ctx.s3Client as S3Client,
+          storageBucket,
+          getMediaKey(storage, mediaRelativePath),
+          `${exportBase}/media/${mediaRelativePath}`,
+          contentTypeForPath(mediaRelativePath)
+        );
+        copiedMedia.add(mediaRelativePath);
+      } catch {
+        // Keep documentation export resilient when a referenced media file is missing.
+      }
+    }
+
     await writeTextObject(
       ctx.s3Client as S3Client,
       storageBucket,

@@ -10,6 +10,7 @@ export type StorageConfig = {
   bucket: string;
   manifestKey: string;
   pagesPrefix: string;
+  mediaPrefix: string;
 };
 
 export type DocRecord = {
@@ -62,6 +63,16 @@ export function getDocKey(storage: StorageConfig, relativePath: string): string 
   return `${storage.pagesPrefix}/${relativePath}`;
 }
 
+export function getMediaKey(storage: StorageConfig, relativePath: string): string {
+  return `${storage.mediaPrefix}/${relativePath}`;
+}
+
+function deriveMediaPrefix(pagesPrefix: string): string {
+  return pagesPrefix.endsWith("/pages")
+    ? `${pagesPrefix.slice(0, -"/pages".length)}/media`
+    : `${dirname(pagesPrefix)}/media`;
+}
+
 export function getStorageConfig(config: {
   id: string;
   app: { bucket: string };
@@ -77,7 +88,12 @@ export function getStorageConfig(config: {
   const pagesPrefixFromMeta = config.meta?.["pagesPrefix"] as string | undefined;
 
   if (manifestKeyFromMeta && pagesPrefixFromMeta) {
-    return { bucket, manifestKey: manifestKeyFromMeta, pagesPrefix: pagesPrefixFromMeta };
+    return {
+      bucket,
+      manifestKey: manifestKeyFromMeta,
+      pagesPrefix: pagesPrefixFromMeta,
+      mediaPrefix: deriveMediaPrefix(pagesPrefixFromMeta),
+    };
   }
 
   const configPath = params.get("config") ?? "";
@@ -90,6 +106,7 @@ export function getStorageConfig(config: {
     bucket,
     manifestKey: `${basePrefix}/manifest.json`,
     pagesPrefix: `${basePrefix}/pages`,
+    mediaPrefix: `${basePrefix}/media`,
   };
 }
 
@@ -374,6 +391,40 @@ export function rewriteDocLinksForExport(
   });
 }
 
+export function getRelativePath(fromRelativePath: string, toRelativePath: string): string {
+  const fromParts = dirname(fromRelativePath).split("/").filter(Boolean);
+  const toParts = toRelativePath.split("/").filter(Boolean);
+
+  while (fromParts.length > 0 && toParts.length > 0 && fromParts[0] === toParts[0]) {
+    fromParts.shift();
+    toParts.shift();
+  }
+
+  const relative = `${"../".repeat(fromParts.length)}${toParts.join("/")}`;
+  return relative || "./";
+}
+
+export function extractMediaRelativePaths(markdown: string): string[] {
+  const refs = new Set<string>();
+  const patterns = [
+    /!?\[[^\]]*]\(([^)\s"']+)/g,
+    /^\s*\[[^\]]+]:\s*([^\s"'<>\n]+)/gm,
+    /<(?:img|video|audio|source)[^>]+src=["']([^"']+)["']/gi,
+  ];
+
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(markdown)) !== null) {
+      const href = match[1]?.split(/[?#]/)[0];
+      if (href && !/^(https?:|mailto:|data:|#|doc:\/\/)/i.test(href)) {
+        refs.add(href);
+      }
+    }
+  }
+
+  return [...refs];
+}
+
 export async function readTextObject(s3: S3Client, bucket: string, key: string): Promise<string> {
   const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   return response.Body!.transformToString("utf-8");
@@ -425,6 +476,36 @@ export async function writeTextObject(
       CacheControl: "no-store",
     })
   );
+}
+
+export async function writeBinaryObject(
+  s3: S3Client,
+  bucket: string,
+  key: string,
+  body: Uint8Array,
+  contentType: string
+): Promise<void> {
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: body,
+      ContentType: contentType || "application/octet-stream",
+      CacheControl: "no-store",
+    })
+  );
+}
+
+export async function copyObjectIfExists(
+  s3: S3Client,
+  bucket: string,
+  sourceKey: string,
+  targetKey: string,
+  contentType: string
+): Promise<void> {
+  const source = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: sourceKey }));
+  const bytes = await source.Body!.transformToByteArray();
+  await writeBinaryObject(s3, bucket, targetKey, bytes, contentType);
 }
 
 export async function deleteObjectIfExists(s3: S3Client, bucket: string, key: string): Promise<void> {
