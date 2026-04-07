@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import type { CSSProperties } from "react";
 import type { MouseEvent } from "react";
 import type { ModuleProps } from "module-core";
@@ -189,7 +190,7 @@ export default function LinksModule({ config }: ModuleProps) {
       ) : (
         <span style={{ color: "#64748b", fontSize: "0.82rem" }}>No links configured</span>
       )}
-      {editMode && editingIndex !== null && overlayPosition && (
+      {editMode && editingIndex !== null && overlayPosition && createPortal(
         <LinkEditor
           draftLink={draftLink}
           disabled={saving}
@@ -201,7 +202,8 @@ export default function LinksModule({ config }: ModuleProps) {
             setEditingIndex(null);
             setOverlayPosition(null);
           }}
-        />
+        />,
+        document.body
       )}
     </div>
   );
