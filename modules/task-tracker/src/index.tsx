@@ -57,16 +57,21 @@ const STATUSES: TaskStatus[] = ["open", "in-progress", "blocked", "done", "archi
 const PRIORITIES: TaskPriority[] = ["low", "normal", "high", "urgent"];
 
 const C = {
-  bg: "#07111f",
-  panel: "#0b1728",
-  panel2: "#102035",
-  border: "#20324c",
-  text: "#e7edf7",
-  muted: "#7f8da3",
-  accent: "#22a6b3",
-  accent2: "#f59e0b",
-  danger: "#f87171",
-  ok: "#86efac",
+  bg: "var(--hep-bg, var(--color-bg, #080f1c))",
+  panel: "var(--hep-surface, var(--color-surface, #0b1525))",
+  panel2: "var(--hep-surface-raised, var(--color-surface-raised, #0d1a2e))",
+  input: "var(--hep-input-bg, #0a1525)",
+  border: "var(--hep-border, var(--color-border, #1a2a42))",
+  text: "var(--hep-text, var(--color-text, #e5e7eb))",
+  muted: "var(--hep-muted, var(--color-muted, #6b7280))",
+  accent: "var(--hep-accent, var(--color-primary, #3b82f6))",
+  accentText: "var(--hep-accent-text, var(--color-primary-contrast, #ffffff))",
+  warning: "var(--hep-warning, #f59e0b)",
+  accent2: "var(--hep-warning, #f59e0b)",
+  danger: "var(--hep-danger, #ef4444)",
+  ok: "var(--hep-success, #22c55e)",
+  archived: "var(--hep-surface-subtle, #08111d)",
+  header: "linear-gradient(135deg, var(--hep-bg, var(--color-bg, #080f1c)), var(--hep-surface-raised, var(--color-surface-raised, #0d1a2e)))",
 };
 
 function nowIso(): string {
@@ -365,8 +370,8 @@ export default function TaskTracker({ config }: ModuleProps) {
   if (loading) return <Centered>Loading tasks...</Centered>;
 
   return (
-    <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column", background: C.bg, color: C.text, fontFamily: "Aptos, Segoe UI, sans-serif" }}>
-      <header style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap", background: "linear-gradient(135deg,#07111f,#0f2035)" }}>
+    <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column", background: C.bg, color: C.text, fontFamily: "system-ui, -apple-system, sans-serif" }}>
+      <header style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap", background: C.header }}>
         <div>
           <div style={{ fontSize: "0.72rem", color: C.accent, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 700 }}>Task Tracker</div>
           <h2 style={{ margin: "0.15rem 0 0", fontSize: "1.25rem" }}>{(config.meta?.["title"] as string | undefined) ?? "Project Tasks"}</h2>
@@ -545,7 +550,7 @@ function Centered({ children }: { children: React.ReactNode }) {
 }
 
 function priorityColor(priority: TaskPriority): string {
-  return priority === "urgent" ? "#ef4444" : priority === "high" ? "#f59e0b" : priority === "low" ? "#64748b" : C.accent;
+  return priority === "urgent" ? C.danger : priority === "high" ? C.warning : priority === "low" ? C.muted : C.accent;
 }
 
 function statusColor(status: TaskStatus): string {
@@ -553,11 +558,11 @@ function statusColor(status: TaskStatus): string {
 }
 
 function taskRowStyle(task: TaskRecord): React.CSSProperties {
-  return { width: "100%", display: "flex", alignItems: "center", gap: "0.75rem", padding: "0.85rem", border: `1px solid ${C.border}`, borderRadius: 14, background: task.status === "archived" ? "#08111d" : C.panel, color: C.text, cursor: "pointer" };
+  return { width: "100%", display: "flex", alignItems: "center", gap: "0.75rem", padding: "0.85rem", border: `1px solid ${C.border}`, borderRadius: 10, background: task.status === "archived" ? C.archived : C.panel, color: C.text, cursor: "pointer", fontFamily: "inherit" };
 }
 
 function inputStyle(): React.CSSProperties {
-  return { width: "100%", boxSizing: "border-box", background: "#07111f", border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, padding: "0.5rem 0.65rem", outline: "none", font: "inherit" };
+  return { width: "100%", boxSizing: "border-box", background: C.input, border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, padding: "0.5rem 0.65rem", outline: "none", font: "inherit" };
 }
 
 function textAreaStyle(): React.CSSProperties {
@@ -569,15 +574,15 @@ function labelStyle(): React.CSSProperties {
 }
 
 function primaryButton(): React.CSSProperties {
-  return { border: "none", borderRadius: 9, background: C.accent, color: "#021015", padding: "0.55rem 0.85rem", cursor: "pointer", fontWeight: 800 };
+  return { border: `1px solid ${C.accent}`, borderRadius: 6, background: C.accent, color: C.accentText, padding: "0.5rem 0.85rem", cursor: "pointer", fontWeight: 600, fontFamily: "inherit" };
 }
 
 function ghostButton(): React.CSSProperties {
-  return { border: `1px solid ${C.border}`, borderRadius: 9, background: "transparent", color: C.text, padding: "0.5rem 0.75rem", cursor: "pointer" };
+  return { border: `1px solid ${C.border}`, borderRadius: 6, background: "transparent", color: C.text, padding: "0.5rem 0.75rem", cursor: "pointer", fontFamily: "inherit" };
 }
 
 function dangerButton(): React.CSSProperties {
-  return { ...ghostButton(), borderColor: "#7f1d1d", color: C.danger };
+  return { ...ghostButton(), borderColor: C.danger, color: C.danger };
 }
 
 function miniButton(color = C.text): React.CSSProperties {
