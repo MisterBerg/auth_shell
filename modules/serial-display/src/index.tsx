@@ -36,6 +36,89 @@ function describePort(port: SerialPortInfo): string {
   return vendor || product ? `${vendor ?? "????"}:${product ?? "????"}` : "unknown usb";
 }
 
+function portSuffix(port: SerialPortInfo): string {
+  const parts = port.id.split("-");
+  if (parts.length >= 3) {
+    return parts[1] ?? port.id.slice(-6);
+  }
+  return port.id.slice(0, 8);
+}
+
+function portGroupBase(port: SerialPortInfo): string {
+  return `${port.usbVendorId?.toString(16).padStart(4, "0") ?? "????"}:${port.usbProductId?.toString(16).padStart(4, "0") ?? "????"}`;
+}
+
+function toAlpha(index: number): string {
+  let value = index;
+  let result = "";
+  do {
+    result = String.fromCharCode(65 + (value % 26)) + result;
+    value = Math.floor(value / 26) - 1;
+  } while (value >= 0);
+  return result;
+}
+
+type PortDisplayInfo = {
+  portId: SerialPortId;
+  aliasKey: string;
+  defaultLabel: string;
+  detailLabel: string;
+};
+
+function buildPortDisplayMap(ports: SerialPortInfo[]): Record<string, PortDisplayInfo> {
+  const grouped = new Map<string, SerialPortInfo[]>();
+  for (const port of ports) {
+    const key = portGroupBase(port);
+    const group = grouped.get(key) ?? [];
+    group.push(port);
+    grouped.set(key, group);
+  }
+
+  const result: Record<string, PortDisplayInfo> = {};
+  let deviceIndex = 1;
+  for (const [, group] of grouped) {
+    group.sort((a, b) => a.id.localeCompare(b.id));
+    const isMultiPort = group.length > 1;
+    group.forEach((port, index) => {
+      const suffix = isMultiPort ? `-${toAlpha(index)}` : "";
+      const defaultLabel = `${deviceIndex}${suffix}`;
+      result[port.id] = {
+        portId: port.id,
+        aliasKey: `${portGroupBase(port)}#${index + 1}`,
+        defaultLabel,
+        detailLabel: `${defaultLabel} | ${describePort(port)} | id ${portSuffix(port)}`,
+      };
+    });
+    deviceIndex += 1;
+  }
+
+  return result;
+}
+
+function getLocalAliasStorageKey(config: ModuleProps["config"]): string {
+  const params = new URLSearchParams(window.location.search);
+  const bucket = params.get("bucket") ?? "local";
+  const configPath = params.get("config") ?? "config";
+  return `hep:serial-display:aliases:${bucket}:${configPath}:${config.id}`;
+}
+
+function readLocalAliases(config: ModuleProps["config"]): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(getLocalAliasStorageKey(config));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, string>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeLocalAliases(config: ModuleProps["config"], aliases: Record<string, string>): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(getLocalAliasStorageKey(config), JSON.stringify(aliases));
+}
+
 function selectedBaud(config: ModuleProps["config"]): number {
   const value = Number(config.meta?.["baudRate"] ?? 115200);
   return Number.isFinite(value) && value > 0 ? value : 115200;
@@ -58,16 +141,61 @@ export default function SerialDisplay({ config }: ModuleProps) {
   const [autoScroll, setAutoScroll] = useState(true);
   const [isBusy, setIsBusy] = useState(false);
   const [statusText, setStatusText] = useState("Ready.");
+  const [isEditingLabel, setIsEditingLabel] = useState(false);
   const terminalHostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const labelInputRef = useRef<HTMLInputElement>(null);
+  const sessionBuffersRef = useRef<Record<string, string>>({});
+  const selectedPortIdRef = useRef<SerialPortId | null>(null);
+  const [aliasMap, setAliasMap] = useState<Record<string, string>>(() => readLocalAliases(config));
+  const displayMap = useMemo(() => buildPortDisplayMap(ports), [ports]);
 
   const selectedPort =
     ports.find((port) => port.id === selectedPortId) ?? null;
+  const selectedDisplay = selectedPort ? displayMap[selectedPort.id] : undefined;
   const canWrite =
     !!selectedPort &&
     selectedPort.state === "open" &&
     selectedPort.claimedBy === claimantId;
+
+  const renderSelectedSession = useCallback(() => {
+    const terminal = terminalRef.current;
+    const currentPortId = selectedPortIdRef.current;
+    if (!terminal) return;
+    terminal.reset();
+    if (!currentPortId) {
+      terminal.writeln("\x1b[90mSelect a port to view its session.\x1b[0m");
+      return;
+    }
+    const transcript = sessionBuffersRef.current[currentPortId] ?? "";
+    if (transcript) {
+      terminal.write(transcript);
+    } else {
+      terminal.writeln("\x1b[90mNo session output for this port yet.\x1b[0m");
+    }
+    if (autoScroll) {
+      terminal.scrollToBottom();
+    }
+  }, [autoScroll]);
+
+  const appendToSession = useCallback((portId: SerialPortId, text: string) => {
+    const existing = sessionBuffersRef.current[portId] ?? "";
+    const next = `${existing}${text}`;
+    sessionBuffersRef.current[portId] =
+      next.length > 250000 ? next.slice(next.length - 250000) : next;
+
+    if (selectedPortIdRef.current === portId) {
+      terminalRef.current?.write(text);
+      if (autoScroll) {
+        terminalRef.current?.scrollToBottom();
+      }
+    }
+  }, [autoScroll]);
+
+  useEffect(() => {
+    selectedPortIdRef.current = selectedPortId;
+  }, [selectedPortId]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -107,7 +235,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
     fitAddon.fit();
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
-    terminal.writeln("\x1b[90mSerial terminal ready.\x1b[0m");
+    renderSelectedSession();
 
     const resizeObserver = new ResizeObserver(() => {
       fitAddon.fit();
@@ -124,7 +252,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
       terminalRef.current = null;
       fitAddonRef.current = null;
     };
-  }, []);
+  }, [renderSelectedSession]);
 
   useEffect(() => {
     const unsubscribe = runtime.subscribePorts((next: SerialPortInfo[]) => {
@@ -139,42 +267,67 @@ export default function SerialDisplay({ config }: ModuleProps) {
   }, [runtime]);
 
   useEffect(() => {
+    if (isEditingLabel) return;
     if (!selectedPort) {
       setLabelDraft("");
       return;
     }
-    setLabelDraft(selectedPort.label);
-  }, [selectedPort?.id, selectedPort?.label]);
+    const alias = selectedDisplay ? aliasMap[selectedDisplay.aliasKey] : "";
+    setLabelDraft(alias || selectedDisplay?.defaultLabel || "");
+  }, [aliasMap, isEditingLabel, selectedDisplay, selectedPort?.id]);
 
   useEffect(() => {
-    if (!selectedPortId) return;
+    for (const port of ports) {
+      const display = displayMap[port.id];
+      if (!display) continue;
+      const alias = aliasMap[display.aliasKey];
+      const nextLabel = alias || display.defaultLabel;
+      if (port.label !== nextLabel) {
+        runtime.setPortLabel(port.id, nextLabel);
+      }
+    }
+  }, [aliasMap, displayMap, ports, runtime]);
+
+  useEffect(() => {
+    const unsubscribers: Array<() => void> = [];
+
+    for (const port of ports) {
+      unsubscribers.push(runtime.subscribeText(port.id, (text) => {
+        appendToSession(port.id, text);
+      }));
+      unsubscribers.push(runtime.subscribeEvents(port.id, (event) => {
+        if (event.type === "error") {
+          appendToSession(event.port.id, `\r\n\x1b[31m${event.port.label}: ${event.error.message}\x1b[0m\r\n`);
+          if (selectedPortIdRef.current === event.port.id) {
+            setStatusText(`${event.port.label}: ${event.error.message}`);
+          }
+          return;
+        }
+        if (selectedPortIdRef.current !== event.port.id) return;
+        if (event.type === "claimed") {
+          setStatusText(`${event.port.label} claimed by ${event.claimant}`);
+          return;
+        }
+        if (event.type === "released") {
+          setStatusText(`${event.port.label} released by ${event.claimant}`);
+          return;
+        }
+        setStatusText(`${event.port.label} is now ${event.port.state}`);
+      }));
+    }
+
+    return () => {
+      for (const unsubscribe of unsubscribers) unsubscribe();
+    };
+  }, [appendToSession, ports, runtime]);
+
+  useEffect(() => {
     const terminal = terminalRef.current;
-    const unsubscribeText = runtime.subscribeText(selectedPortId, (text) => {
-      terminal?.write(text);
-      if (autoScroll) {
-        terminal?.scrollToBottom();
-      }
-    });
-    const unsubscribeEvents = runtime.subscribeEvents(selectedPortId, (event) => {
-      if (event.type === "error") {
-        setStatusText(`${event.port.label}: ${event.error.message}`);
-        terminal?.writeln(`\r\n\x1b[31m${event.port.label}: ${event.error.message}\x1b[0m`);
-        return;
-      }
-      if (event.type === "claimed") {
-        setStatusText(`${event.port.label} claimed by ${event.claimant}`);
-        return;
-      }
-      if (event.type === "released") {
-        setStatusText(`${event.port.label} released by ${event.claimant}`);
-        return;
-      }
-      setStatusText(`${event.port.label} is now ${event.port.state}`);
-    });
+    if (!terminal || !selectedPortId) return;
 
     let disposed = false;
     let pendingWrite = Promise.resolve();
-    const terminalInput = terminal?.onData((data) => {
+    const terminalInput = terminal.onData((data) => {
       if (!canWrite || disposed) return;
       pendingWrite = pendingWrite
         .then(() => runtime.write(selectedPortId, encodeText(data), claimantId))
@@ -186,19 +339,23 @@ export default function SerialDisplay({ config }: ModuleProps) {
 
     return () => {
       disposed = true;
-      unsubscribeText();
-      unsubscribeEvents();
-      terminalInput?.dispose();
+      terminalInput.dispose();
     };
-  }, [autoScroll, canWrite, claimantId, runtime, selectedPortId]);
+  }, [canWrite, claimantId, runtime, selectedPortId]);
+
+  useEffect(() => {
+    renderSelectedSession();
+  }, [renderSelectedSession, selectedPortId]);
 
   useEffect(() => {
     return () => {
-      if (selectedPortId) {
-        void runtime.releasePort(selectedPortId, claimantId).catch(() => undefined);
+      for (const port of runtime.listPorts()) {
+        if (port.claimedBy === claimantId) {
+          void runtime.releasePort(port.id, claimantId).catch(() => undefined);
+        }
       }
     };
-  }, [claimantId, runtime, selectedPortId]);
+  }, [claimantId, runtime]);
 
   const refreshPorts = useCallback(async () => {
     setIsBusy(true);
@@ -219,7 +376,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
       if (port) {
         setSelectedPortId(port.id);
         setStatusText(`Granted access to ${port.label}.`);
-        terminalRef.current?.writeln(`\x1b[90mGranted access to ${port.label}.\x1b[0m`);
+        appendToSession(port.id, `\x1b[90mGranted access to ${port.label}.\x1b[0m\r\n`);
       }
     } catch (error: unknown) {
       setStatusText((error as Error).message);
@@ -236,6 +393,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
       await runtime.claimPort(selectedPortId, claimantId, options);
       await runtime.openPort(selectedPortId, options, claimantId);
       setStatusText(`Opened ${selectedPort?.label ?? selectedPortId} at ${baudRate}. Click the terminal to type.`);
+      appendToSession(selectedPortId, `\x1b[90mOpened ${selectedPort?.label ?? selectedPortId} at ${baudRate}.\x1b[0m\r\n`);
       terminalRef.current?.focus();
       fitAddonRef.current?.fit();
     } catch (error: unknown) {
@@ -252,6 +410,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
       await runtime.closePort(selectedPortId, claimantId);
       await runtime.releasePort(selectedPortId, claimantId);
       setStatusText(`Closed ${selectedPort?.label ?? selectedPortId}.`);
+      appendToSession(selectedPortId, `\r\n\x1b[90mClosed ${selectedPort?.label ?? selectedPortId}.\x1b[0m\r\n`);
     } catch (error: unknown) {
       setStatusText((error as Error).message);
     } finally {
@@ -261,9 +420,27 @@ export default function SerialDisplay({ config }: ModuleProps) {
 
   const saveLabel = useCallback(() => {
     if (!selectedPortId) return;
-    runtime.setPortLabel(selectedPortId, labelDraft);
-    setStatusText(`Renamed port to "${labelDraft.trim() || "default label"}".`);
-  }, [labelDraft, runtime, selectedPortId]);
+    const display = displayMap[selectedPortId];
+    if (!display) return;
+    const trimmed = labelDraft.trim();
+    const nextAliases = { ...aliasMap };
+
+    if (!trimmed || trimmed === display.defaultLabel) {
+      delete nextAliases[display.aliasKey];
+      runtime.setPortLabel(selectedPortId, display.defaultLabel);
+      setAliasMap(nextAliases);
+      writeLocalAliases(config, nextAliases);
+      setStatusText(`Cleared custom label for ${display.defaultLabel}.`);
+      setLabelDraft(display.defaultLabel);
+    } else {
+      nextAliases[display.aliasKey] = trimmed;
+      runtime.setPortLabel(selectedPortId, trimmed);
+      setAliasMap(nextAliases);
+      writeLocalAliases(config, nextAliases);
+      setStatusText(`Renamed port to "${trimmed}".`);
+      setLabelDraft(trimmed);
+    }
+  }, [aliasMap, config, displayMap, labelDraft, runtime, selectedPortId]);
 
   const sendCommand = useCallback(async () => {
     if (!selectedPortId || !command.trim()) return;
@@ -275,6 +452,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
     try {
       await runtime.write(selectedPortId, encodeText(payload), claimantId);
       setStatusText(`Sent ${payload.replace(/\r/g, "\\r").replace(/\n/g, "\\n")}`);
+      appendToSession(selectedPortId, payload);
       setCommand("");
       terminalRef.current?.focus();
     } catch (error: unknown) {
@@ -286,11 +464,11 @@ export default function SerialDisplay({ config }: ModuleProps) {
 
   const clearTerminal = useCallback(() => {
     const terminal = terminalRef.current;
-    if (!terminal) return;
-    terminal.reset();
-    terminal.writeln("\x1b[90mTerminal cleared.\x1b[0m");
+    if (!terminal || !selectedPortId) return;
+    sessionBuffersRef.current[selectedPortId] = "";
+    renderSelectedSession();
     setStatusText("Terminal cleared.");
-  }, []);
+  }, [renderSelectedSession, selectedPortId]);
 
   if (!runtime.isSupported()) {
     return (
@@ -320,6 +498,9 @@ export default function SerialDisplay({ config }: ModuleProps) {
             ports.map((port) => {
               const selected = port.id === selectedPortId;
               const claimedByOther = !!port.claimedBy && port.claimedBy !== claimantId;
+              const display = displayMap[port.id];
+              const alias = display ? aliasMap[display.aliasKey] : "";
+              const displayName = alias || display?.defaultLabel || port.id;
               return (
                 <button
                   key={port.id}
@@ -337,10 +518,12 @@ export default function SerialDisplay({ config }: ModuleProps) {
                   }}
                 >
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.5rem" }}>
-                    <strong style={{ fontSize: "0.86rem" }}>{port.label}</strong>
+                    <strong style={{ fontSize: "0.86rem" }}>{displayName}</strong>
                     <StatusBadge port={port} claimantId={claimantId} />
                   </div>
-                  <div style={{ marginTop: "0.28rem", color: C.muted, fontSize: "0.75rem" }}>{describePort(port)}</div>
+                  <div style={{ marginTop: "0.28rem", color: C.muted, fontSize: "0.75rem" }}>
+                    {display?.detailLabel ?? `${describePort(port)} | id ${portSuffix(port)}`}
+                  </div>
                   {claimedByOther ? (
                     <div style={{ marginTop: "0.28rem", color: C.warning, fontSize: "0.74rem" }}>Owned by {port.claimedBy}</div>
                   ) : null}
@@ -356,9 +539,22 @@ export default function SerialDisplay({ config }: ModuleProps) {
           <label style={labelStyle()}>
             Port Label
             <input
+              ref={labelInputRef}
               value={labelDraft}
               onChange={(event) => setLabelDraft(event.target.value)}
-              onBlur={saveLabel}
+              onFocus={() => setIsEditingLabel(true)}
+              onBlur={() => {
+                setIsEditingLabel(false);
+                saveLabel();
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  setIsEditingLabel(false);
+                  saveLabel();
+                  labelInputRef.current?.blur();
+                }
+              }}
               style={inputStyle()}
               disabled={!selectedPort}
             />
@@ -443,7 +639,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
         <div style={{ padding: "0.45rem 1rem", borderTop: `1px solid ${C.border}`, fontSize: "0.76rem", color: C.muted, display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem", background: C.panel2 }}>
           <span>
             {selectedPort
-              ? `${selectedPort.label} | ${describePort(selectedPort)} | ${statusText}`
+              ? `${(selectedDisplay ? aliasMap[selectedDisplay.aliasKey] || selectedDisplay.defaultLabel : selectedPort.label)} | ${describePort(selectedPort)} | ${statusText}`
               : "Select a granted port to begin"}
           </span>
           <label style={{ display: "flex", alignItems: "center", gap: "0.4rem", cursor: "pointer" }}>

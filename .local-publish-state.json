@@ -10,6 +10,6 @@
     "modules/document-viewer": "6b63b184156cbdfeba686896617ea3b4400d05c55d3e0a9dbfb04ef6d8e66cfa",
     "modules/documentation-viewer": "4ee7e7754af3805f4876b7281bc853b57966521b63f9c0202429600554333504",
     "modules/links": "100569eaf49326f808e3a052886af181506e8ff86152f3ecd2f26917dfecff82",
-    "modules/serial-display": "5fcfb0df4bfac6638676d0e5dca48c4450724ec7bdffae00fa883e5da52ecf17"
+    "modules/serial-display": "89688faf5322b4fc5428431a17f0ab239687de371fbb8f624624ef54e368c68c"
   }
 }
