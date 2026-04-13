@@ -27,6 +27,8 @@ type PortEntry = {
   reader?: ReturnType<NonNullable<NativeSerialPort["readable"]>["getReader"]>;
   decoder?: TextDecoder;
   readLoop?: Promise<void>;
+  recoveryTimer?: ReturnType<typeof setTimeout>;
+  recoveryAttempts: number;
   generation: number;
   rawListeners: Set<SerialRawListener>;
   textListeners: Set<SerialTextListener>;
@@ -105,6 +107,14 @@ function emitEvent(entry: PortEntry, event: Parameters<SerialPortEventListener>[
   for (const listener of entry.eventListeners) listener(event);
 }
 
+function clearRecovery(entry: PortEntry): void {
+  if (entry.recoveryTimer) {
+    clearTimeout(entry.recoveryTimer);
+    entry.recoveryTimer = undefined;
+  }
+  entry.recoveryAttempts = 0;
+}
+
 function ensureEntry(state: RuntimeState, port: NativeSerialPort): PortEntry {
   let id = state.idsByPort.get(port);
   if (!id) {
@@ -125,6 +135,7 @@ function ensureEntry(state: RuntimeState, port: NativeSerialPort): PortEntry {
     label: createPortLabel(id, port),
     state: "closed",
     granted: true,
+    recoveryAttempts: 0,
     generation: 0,
     lastSeenAt: nowIso(),
     rawListeners: new Set(),
@@ -153,7 +164,20 @@ async function stopReader(entry: PortEntry): Promise<void> {
   entry.readLoop = undefined;
 }
 
-function startReadLoop(state: RuntimeState, entry: PortEntry): void {
+async function forceClosePort(entry: PortEntry): Promise<void> {
+  await stopReader(entry);
+  try {
+    await entry.port.close();
+  } catch {
+    // ignore close failures during recovery
+  }
+}
+
+function startReadLoop(
+  state: RuntimeState,
+  entry: PortEntry,
+  scheduleRecovery: (entry: PortEntry) => void
+): void {
   if (!entry.port.readable || entry.readLoop) return;
   const reader = entry.port.readable.getReader();
   const decoder = new TextDecoder();
@@ -184,7 +208,10 @@ function startReadLoop(state: RuntimeState, entry: PortEntry): void {
           for (const listener of entry.textListeners) listener(text, snapshot);
         }
       }
-      if (entry.state === "open") setState(entry, "disconnected");
+      if (entry.state === "open") {
+        setState(entry, "disconnected");
+        scheduleRecovery(entry);
+      }
       emitEvent(entry, { type: "state", port: cloneInfo(entry) });
       emitPorts(state);
     } catch (error: unknown) {
@@ -196,6 +223,7 @@ function startReadLoop(state: RuntimeState, entry: PortEntry): void {
         error: error instanceof Error ? error : new Error(message),
       });
       emitPorts(state);
+      scheduleRecovery(entry);
     } finally {
       try {
         reader.releaseLock();
@@ -207,6 +235,11 @@ function startReadLoop(state: RuntimeState, entry: PortEntry): void {
       if (entry.readLoop) entry.readLoop = undefined;
     }
   })();
+}
+
+function isAlreadyOpenError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /already open/i.test(message);
 }
 
 export function createSerialRuntime(): SerialRuntime {
@@ -226,6 +259,50 @@ export function createSerialRuntime(): SerialRuntime {
     return [...state.portsById.values()].map(cloneInfo);
   };
 
+  const scheduleRecovery = (entry: PortEntry): void => {
+    if (!entry.claimedBy || !entry.lastOpenOptions || entry.recoveryTimer) return;
+
+    const attempt = entry.recoveryAttempts + 1;
+    const delayMs = Math.min(5000, 400 * 2 ** Math.min(attempt - 1, 4));
+    entry.recoveryAttempts = attempt;
+
+    entry.recoveryTimer = setTimeout(() => {
+      entry.recoveryTimer = undefined;
+      void (async () => {
+        try {
+          setState(entry, "opening");
+          emitEvent(entry, { type: "state", port: cloneInfo(entry) });
+          emitPorts(state);
+          await forceClosePort(entry);
+          await entry.port.open(entry.lastOpenOptions!);
+          setState(entry, "open");
+          clearRecovery(entry);
+          startReadLoop(state, entry, scheduleRecovery);
+          emitEvent(entry, { type: "state", port: cloneInfo(entry) });
+          emitPorts(state);
+        } catch (error: unknown) {
+          if (isAlreadyOpenError(error)) {
+            setState(entry, "open");
+            clearRecovery(entry);
+            startReadLoop(state, entry, scheduleRecovery);
+            emitEvent(entry, { type: "state", port: cloneInfo(entry) });
+            emitPorts(state);
+            return;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          setState(entry, "error", message);
+          emitEvent(entry, {
+            type: "error",
+            port: cloneInfo(entry),
+            error: error instanceof Error ? error : new Error(message),
+          });
+          emitPorts(state);
+          scheduleRecovery(entry);
+        }
+      })();
+    }, delayMs);
+  };
+
   if (nativeSerial) {
     const handleConnect = () => {
       void refreshPorts();
@@ -239,6 +316,7 @@ export function createSerialRuntime(): SerialRuntime {
           if (entry) {
             setState(entry, "disconnected");
             emitEvent(entry, { type: "state", port: cloneInfo(entry) });
+            scheduleRecovery(entry);
           }
         }
       }
@@ -278,6 +356,7 @@ export function createSerialRuntime(): SerialRuntime {
           `Serial port "${entry.label}" is already claimed by "${entry.claimedBy}".`
         );
       }
+      clearRecovery(entry);
       entry.claimedBy = claimant;
       if (options) entry.lastOpenOptions = options;
       entry.lastSeenAt = nowIso();
@@ -292,6 +371,7 @@ export function createSerialRuntime(): SerialRuntime {
           `Serial port "${entry.label}" is claimed by "${entry.claimedBy}", not "${claimant}".`
         );
       }
+      clearRecovery(entry);
       if (entry.state === "open") {
         await this.closePort(portId, claimant);
       }
@@ -304,22 +384,38 @@ export function createSerialRuntime(): SerialRuntime {
     async openPort(portId, options, claimant) {
       const entry = assertPortExists(state, portId);
       assertOwnership(entry, claimant);
+      clearRecovery(entry);
       if (entry.state === "open") {
         entry.lastOpenOptions = options;
         emitPorts(state);
         return;
       }
       if (entry.state === "opening") return;
+      if (entry.state === "error" || entry.state === "disconnected" || entry.state === "closing") {
+        await forceClosePort(entry);
+        setState(entry, "closed");
+        emitPorts(state);
+      }
       setState(entry, "opening");
       emitPorts(state);
       try {
         await entry.port.open(options);
         entry.lastOpenOptions = options;
         setState(entry, "open");
-        startReadLoop(state, entry);
+        clearRecovery(entry);
+        startReadLoop(state, entry, scheduleRecovery);
         emitEvent(entry, { type: "state", port: cloneInfo(entry) });
         emitPorts(state);
       } catch (error: unknown) {
+        if (isAlreadyOpenError(error)) {
+          entry.lastOpenOptions = options;
+          setState(entry, "open");
+          clearRecovery(entry);
+          startReadLoop(state, entry, scheduleRecovery);
+          emitEvent(entry, { type: "state", port: cloneInfo(entry) });
+          emitPorts(state);
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         setState(entry, "error", message);
         emitEvent(entry, {
@@ -328,6 +424,7 @@ export function createSerialRuntime(): SerialRuntime {
           error: error instanceof Error ? error : new Error(message),
         });
         emitPorts(state);
+        scheduleRecovery(entry);
         throw error;
       }
     },
@@ -335,6 +432,7 @@ export function createSerialRuntime(): SerialRuntime {
     async closePort(portId, claimant) {
       const entry = assertPortExists(state, portId);
       assertOwnership(entry, claimant);
+      clearRecovery(entry);
       if (entry.state !== "open" && entry.state !== "error" && entry.state !== "disconnected") {
         setState(entry, "closed");
         emitPorts(state);

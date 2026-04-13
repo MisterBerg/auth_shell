@@ -315,7 +315,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
         if (event.type === "error") {
           appendToSession(event.port.id, `\r\n\x1b[31m${event.port.label}: ${event.error.message}\x1b[0m\r\n`);
           if (selectedPortIdRef.current === event.port.id) {
-            setStatusText(`${event.port.label}: ${event.error.message}`);
+            setStatusText(`${event.port.label}: ${event.error.message} (attempting recovery)`);
           }
           return;
         }
@@ -407,6 +407,9 @@ export default function SerialDisplay({ config }: ModuleProps) {
     try {
       const options: SerialOpenOptions = { baudRate, dataBits: 8, stopBits: 1, parity: "none", flowControl: "none" };
       await runtime.claimPort(selectedPortId, claimantId, options);
+      if (selectedPort?.state === "error" || selectedPort?.state === "disconnected") {
+        await runtime.closePort(selectedPortId, claimantId).catch(() => undefined);
+      }
       await runtime.openPort(selectedPortId, options, claimantId);
       setStatusText(`Opened ${selectedPort?.label ?? selectedPortId} at ${baudRate}. Click the terminal to type.`);
       appendToSession(selectedPortId, `\x1b[90mOpened ${selectedPort?.label ?? selectedPortId} at ${baudRate}.\x1b[0m\r\n`);
@@ -599,10 +602,18 @@ export default function SerialDisplay({ config }: ModuleProps) {
               {selectedPort?.state ?? "none"}
             </div>
           </label>
-          <button onClick={() => void connectPort()} disabled={!selectedPort || isBusy || selectedPort.state === "open"} style={primaryButton()}>
+          <button
+            onClick={() => void connectPort()}
+            disabled={!selectedPort || isBusy || selectedPort.state === "open"}
+            style={!selectedPort || isBusy || selectedPort.state === "open" ? disabledButtonStyle() : primaryButton()}
+          >
             Connect
           </button>
-          <button onClick={() => void disconnectPort()} disabled={!selectedPort || isBusy || selectedPort.state !== "open"} style={ghostButton()}>
+          <button
+            onClick={() => void disconnectPort()}
+            disabled={!selectedPort || isBusy || selectedPort.state !== "open"}
+            style={!selectedPort || isBusy || selectedPort.state !== "open" ? disabledButtonStyle() : ghostButton()}
+          >
             Disconnect
           </button>
         </div>
@@ -785,5 +796,13 @@ function ghostButton(): React.CSSProperties {
     padding: "0.52rem 0.85rem",
     cursor: "pointer",
     fontFamily: "inherit",
+  };
+}
+
+function disabledButtonStyle(): React.CSSProperties {
+  return {
+    ...ghostButton(),
+    opacity: 0.45,
+    cursor: "not-allowed",
   };
 }
