@@ -1,0 +1,15 @@
+{
+  "workspaces": {
+    "layouts/top-left": "9a4faf04aaf425211fe30b14605b7ea3ca1768fadd1e9096a08f97835f3ca407",
+    "layouts/tabs-top": "7bfa72fd77862c293544eb0996a5a5e134ebed7ae504354b50d5b9318bf7c804",
+    "layouts/tabs-left": "7b556b6efa87ec4ddde8b2037930b658df923f2fce2839106ac3689d445847d3",
+    "layouts/left-right-columns": "6c1f0a83e74c06a6ceb83b00a0b10f807971bb7646ae15a2d6cbfff5d5aea294",
+    "modules/webview": "4e074ae4415b05be79d6dcceb5bd514e72a00534f91238336b6777d6c4bbc79a",
+    "modules/oauth-badge": "ffe868660172a33c27f863486ce79566a05a67b49ff819353c2a6b417102f497",
+    "modules/markdown-viewer": "5dafbcc1cc94c1e480426cc95fbb28f916e97481ee735fed3767ed0f727253fa",
+    "modules/document-viewer": "6b63b184156cbdfeba686896617ea3b4400d05c55d3e0a9dbfb04ef6d8e66cfa",
+    "modules/documentation-viewer": "4ee7e7754af3805f4876b7281bc853b57966521b63f9c0202429600554333504",
+    "modules/links": "100569eaf49326f808e3a052886af181506e8ff86152f3ecd2f26917dfecff82",
+    "modules/serial-display": "5fcfb0df4bfac6638676d0e5dca48c4450724ec7bdffae00fa883e5da52ecf17"
+  }
+}
