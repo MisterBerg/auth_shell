@@ -65,6 +65,11 @@ type PortDisplayInfo = {
   detailLabel: string;
 };
 
+type LocalSerialSettings = {
+  aliases?: Record<string, string>;
+  baudRates?: Record<string, number>;
+};
+
 function buildPortDisplayMap(ports: SerialPortInfo[]): Record<string, PortDisplayInfo> {
   const grouped = new Map<string, SerialPortInfo[]>();
   for (const port of ports) {
@@ -77,7 +82,6 @@ function buildPortDisplayMap(ports: SerialPortInfo[]): Record<string, PortDispla
   const result: Record<string, PortDisplayInfo> = {};
   let deviceIndex = 1;
   for (const [, group] of grouped) {
-    group.sort((a, b) => a.id.localeCompare(b.id));
     const isMultiPort = group.length > 1;
     group.forEach((port, index) => {
       const suffix = isMultiPort ? `-${toAlpha(index)}` : "";
@@ -95,28 +99,28 @@ function buildPortDisplayMap(ports: SerialPortInfo[]): Record<string, PortDispla
   return result;
 }
 
-function getLocalAliasStorageKey(config: ModuleProps["config"]): string {
+function getLocalSettingsStorageKey(config: ModuleProps["config"]): string {
   const params = new URLSearchParams(window.location.search);
   const bucket = params.get("bucket") ?? "local";
   const configPath = params.get("config") ?? "config";
-  return `hep:serial-display:aliases:${bucket}:${configPath}:${config.id}`;
+  return `hep:serial-display:settings:${bucket}:${configPath}:${config.id}`;
 }
 
-function readLocalAliases(config: ModuleProps["config"]): Record<string, string> {
+function readLocalSettings(config: ModuleProps["config"]): LocalSerialSettings {
   if (typeof window === "undefined") return {};
   try {
-    const raw = window.localStorage.getItem(getLocalAliasStorageKey(config));
+    const raw = window.localStorage.getItem(getLocalSettingsStorageKey(config));
     if (!raw) return {};
-    const parsed = JSON.parse(raw) as Record<string, string>;
+    const parsed = JSON.parse(raw) as LocalSerialSettings;
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
     return {};
   }
 }
 
-function writeLocalAliases(config: ModuleProps["config"], aliases: Record<string, string>): void {
+function writeLocalSettings(config: ModuleProps["config"], settings: LocalSerialSettings): void {
   if (typeof window === "undefined") return;
-  window.localStorage.setItem(getLocalAliasStorageKey(config), JSON.stringify(aliases));
+  window.localStorage.setItem(getLocalSettingsStorageKey(config), JSON.stringify(settings));
 }
 
 function selectedBaud(config: ModuleProps["config"]): number {
@@ -131,6 +135,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
     () => `${config.id}:${user?.email ?? "anonymous"}`,
     [config.id, user?.email]
   );
+  const initialLocalSettings = useMemo(() => readLocalSettings(config), [config]);
 
   const [ports, setPorts] = useState<SerialPortInfo[]>(() => runtime.listPorts());
   const [selectedPortId, setSelectedPortId] = useState<SerialPortId | null>(null);
@@ -148,7 +153,8 @@ export default function SerialDisplay({ config }: ModuleProps) {
   const labelInputRef = useRef<HTMLInputElement>(null);
   const sessionBuffersRef = useRef<Record<string, string>>({});
   const selectedPortIdRef = useRef<SerialPortId | null>(null);
-  const [aliasMap, setAliasMap] = useState<Record<string, string>>(() => readLocalAliases(config));
+  const [aliasMap, setAliasMap] = useState<Record<string, string>>(initialLocalSettings.aliases ?? {});
+  const [baudMap, setBaudMap] = useState<Record<string, number>>(initialLocalSettings.baudRates ?? {});
   const displayMap = useMemo(() => buildPortDisplayMap(ports), [ports]);
 
   const selectedPort =
@@ -196,6 +202,16 @@ export default function SerialDisplay({ config }: ModuleProps) {
   useEffect(() => {
     selectedPortIdRef.current = selectedPortId;
   }, [selectedPortId]);
+
+  useEffect(() => {
+    if (!selectedPortId) {
+      setBaudRate(selectedBaud(config));
+      return;
+    }
+    const display = displayMap[selectedPortId];
+    const persistedBaud = display ? baudMap[display.aliasKey] : undefined;
+    setBaudRate(persistedBaud ?? selectedBaud(config));
+  }, [baudMap, config, displayMap, selectedPortId]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -429,18 +445,28 @@ export default function SerialDisplay({ config }: ModuleProps) {
       delete nextAliases[display.aliasKey];
       runtime.setPortLabel(selectedPortId, display.defaultLabel);
       setAliasMap(nextAliases);
-      writeLocalAliases(config, nextAliases);
+      writeLocalSettings(config, { aliases: nextAliases, baudRates: baudMap });
       setStatusText(`Cleared custom label for ${display.defaultLabel}.`);
       setLabelDraft(display.defaultLabel);
     } else {
       nextAliases[display.aliasKey] = trimmed;
       runtime.setPortLabel(selectedPortId, trimmed);
       setAliasMap(nextAliases);
-      writeLocalAliases(config, nextAliases);
+      writeLocalSettings(config, { aliases: nextAliases, baudRates: baudMap });
       setStatusText(`Renamed port to "${trimmed}".`);
       setLabelDraft(trimmed);
     }
-  }, [aliasMap, config, displayMap, labelDraft, runtime, selectedPortId]);
+  }, [aliasMap, baudMap, config, displayMap, labelDraft, runtime, selectedPortId]);
+
+  const handleBaudRateChange = useCallback((nextBaud: number) => {
+    setBaudRate(nextBaud);
+    if (!selectedPortId) return;
+    const display = displayMap[selectedPortId];
+    if (!display) return;
+    const nextBaudMap = { ...baudMap, [display.aliasKey]: nextBaud };
+    setBaudMap(nextBaudMap);
+    writeLocalSettings(config, { aliases: aliasMap, baudRates: nextBaudMap });
+  }, [aliasMap, baudMap, config, displayMap, selectedPortId]);
 
   const sendCommand = useCallback(async () => {
     if (!selectedPortId || !command.trim()) return;
@@ -561,7 +587,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
           </label>
           <label style={labelStyle()}>
             Baud
-            <select value={String(baudRate)} onChange={(event) => setBaudRate(Number(event.target.value))} style={inputStyle()} disabled={!selectedPort}>
+            <select value={String(baudRate)} onChange={(event) => handleBaudRateChange(Number(event.target.value))} style={inputStyle()} disabled={!selectedPort}>
               {BAUD_PRESETS.map((preset) => (
                 <option key={preset} value={preset}>{preset}</option>
               ))}
