@@ -19,6 +19,7 @@ type BoardPad = {
   size?: { x: number; y: number };
   shape?: string;
   layer?: string;
+  rotation?: number;
 };
 type BoardEdge = { id: string; start: Point; end: Point };
 
@@ -170,6 +171,15 @@ function transformPoint(local: Point, origin: Point, degrees: number): Point {
   return { x: origin.x + rotated.x, y: origin.y + rotated.y };
 }
 
+function normalizeDegrees(value: number): number {
+  const normalized = value % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+}
+
+function transformRotation(localDegrees: number, moduleDegrees: number): number {
+  return normalizeDegrees(localDegrees + moduleDegrees);
+}
+
 function readProperty(footprint: SExpr[], property: string): string | undefined {
   const prop = children(footprint, "property").find((item) => stringAt(item, 1) === property);
   if (prop) return stringAt(prop, 2);
@@ -254,7 +264,9 @@ function exportBoard(pcbPath: string): BoardArtifact {
       const net = netNameFrom(netLookup, child(pad, "net"));
       if (!net) continue;
 
-      const localAt = pointFrom(child(pad, "at")) ?? { x: 0, y: 0 };
+      const padAt = child(pad, "at");
+      const localAt = pointFrom(padAt) ?? { x: 0, y: 0 };
+      const localRotation = numberAt(padAt, 3) ?? 0;
       const absoluteAt = transformPoint(localAt, origin, rotation);
       const size = child(pad, "size");
       pads.push({
@@ -272,6 +284,7 @@ function exportBoard(pcbPath: string): BoardArtifact {
         },
         shape: stringAt(pad, 3),
         layer: firstCopperLayer(child(pad, "layers")),
+        rotation: transformRotation(localRotation, rotation),
       });
     }
   }

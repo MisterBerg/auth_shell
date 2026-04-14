@@ -42,6 +42,7 @@ type BoardPad = {
   size?: { x: number; y: number };
   shape?: string;
   layer?: string;
+  rotation?: number;
 };
 
 type BoardEdge = {
@@ -77,6 +78,21 @@ type Bounds = {
   maxY: number;
 };
 
+type Viewport = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type LayerViewMode = "all" | "exterior" | "top" | "bottom";
+
+type DragState = {
+  startX: number;
+  startY: number;
+  originCenter: BoardPoint;
+};
+
 const C = {
   bg: "#080f1c",
   panel: "#0b1525",
@@ -87,6 +103,7 @@ const C = {
   faint: "#334155",
   accent: "#38bdf8",
   highlight: "#facc15",
+  componentPad: "#22c55e",
   track: "#2563eb",
   bottomTrack: "#dc2626",
   pad: "#94a3b8",
@@ -144,11 +161,20 @@ function boundsFor(board: BoardArtifact): Bounds {
   };
 }
 
-function viewBoxFor(bounds: Bounds): string {
+function baseViewportFor(bounds: Bounds): Viewport {
   const width = Math.max(bounds.maxX - bounds.minX, 10);
   const height = Math.max(bounds.maxY - bounds.minY, 10);
   const pad = Math.max(width, height) * 0.08;
-  return `${bounds.minX - pad} ${bounds.minY - pad} ${width + pad * 2} ${height + pad * 2}`;
+  return {
+    x: bounds.minX - pad,
+    y: bounds.minY - pad,
+    width: width + pad * 2,
+    height: height + pad * 2,
+  };
+}
+
+function viewBoxFor(viewport: Viewport): string {
+  return `${viewport.x} ${viewport.y} ${viewport.width} ${viewport.height}`;
 }
 
 function colorForTrack(layer: string, active: boolean): string {
@@ -176,6 +202,48 @@ function formatPad(pad: BoardPad): string {
   return `${pad.ref}.${pad.pad}${pin}`;
 }
 
+function padAccessMode(pad: BoardPad): "top" | "bottom" | "through" | "unknown" {
+  if (pad.layer === "*.Cu") return "through";
+  if (pad.layer === "F.Cu") return "top";
+  if (pad.layer === "B.Cu") return "bottom";
+  return "unknown";
+}
+
+function trackVisible(layer: string, mode: LayerViewMode): boolean {
+  if (mode === "all") return true;
+  if (mode === "exterior") return layer === "F.Cu" || layer === "B.Cu";
+  if (mode === "top") return layer === "F.Cu";
+  return layer === "B.Cu";
+}
+
+function padVisible(pad: BoardPad, mode: LayerViewMode): boolean {
+  const access = padAccessMode(pad);
+  if (mode === "all" || mode === "exterior") return access !== "unknown";
+  if (mode === "top") return access === "top" || access === "through";
+  return access === "bottom" || access === "through";
+}
+
+function padAccessLabel(pad: BoardPad): string {
+  const access = padAccessMode(pad);
+  if (access === "through") return "top + bottom";
+  if (access === "top") return "top side";
+  if (access === "bottom") return "bottom side";
+  return "unknown side";
+}
+
+function clampViewportCenter(center: BoardPoint, baseViewport: Viewport, zoom: number): BoardPoint {
+  const width = baseViewport.width / zoom;
+  const height = baseViewport.height / zoom;
+  const minX = baseViewport.x + width / 2;
+  const maxX = baseViewport.x + baseViewport.width - width / 2;
+  const minY = baseViewport.y + height / 2;
+  const maxY = baseViewport.y + baseViewport.height - height / 2;
+  return {
+    x: Math.min(maxX, Math.max(minX, center.x)),
+    y: Math.min(maxY, Math.max(minY, center.y)),
+  };
+}
+
 export default function KiCadBoardViewer({ config }: ModuleProps) {
   const { editMode } = useEditMode();
   const updateSlotMeta = useUpdateSlotMeta();
@@ -186,6 +254,8 @@ export default function KiCadBoardViewer({ config }: ModuleProps) {
   const [boardMeta, setBoardMeta] = useState<BoardMeta | undefined>(savedMeta?.board);
   const [board, setBoard] = useState<BoardArtifact | undefined>();
   const [selectedNet, setSelectedNet] = useState<string | null>(null);
+  const [focusedPadId, setFocusedPadId] = useState<string | null>(null);
+  const [layerMode, setLayerMode] = useState<LayerViewMode>("all");
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -214,6 +284,7 @@ export default function KiCadBoardViewer({ config }: ModuleProps) {
         const parsed = validateArtifact(JSON.parse(text));
         setBoard(parsed);
         setSelectedNet((current) => current && sortedNetNames(parsed).includes(current) ? current : null);
+        setFocusedPadId(null);
         setLoading(false);
       })
       .catch((loadError: unknown) => {
@@ -258,6 +329,7 @@ export default function KiCadBoardViewer({ config }: ModuleProps) {
       setBoardMeta(nextMeta);
       setBoard(parsed);
       setSelectedNet(null);
+      setFocusedPadId(null);
       if (updateSlotMeta) await updateSlotMeta({ board: nextMeta });
     } catch (uploadError: unknown) {
       setError((uploadError as Error).message);
@@ -329,10 +401,14 @@ export default function KiCadBoardViewer({ config }: ModuleProps) {
       board={board}
       filename={boardMeta?.filename}
       selectedNet={selectedNet}
+      focusedPadId={focusedPadId}
+      layerMode={layerMode}
       query={query}
       editMode={editMode}
       error={error}
       onSelectNet={setSelectedNet}
+      onFocusPad={setFocusedPadId}
+      onLayerModeChange={setLayerMode}
       onQueryChange={setQuery}
       onReplace={() => fileInputRef.current?.click()}
     >
@@ -345,26 +421,43 @@ function BoardExplorer({
   board,
   filename,
   selectedNet,
+  focusedPadId,
+  layerMode,
   query,
   editMode,
   error,
   children,
   onSelectNet,
+  onFocusPad,
+  onLayerModeChange,
   onQueryChange,
   onReplace,
 }: {
   board: BoardArtifact;
   filename?: string;
   selectedNet: string | null;
+  focusedPadId: string | null;
+  layerMode: LayerViewMode;
   query: string;
   editMode: boolean;
   error?: string;
   children: React.ReactNode;
   onSelectNet: (net: string | null) => void;
+  onFocusPad: (padId: string | null) => void;
+  onLayerModeChange: (mode: LayerViewMode) => void;
   onQueryChange: (query: string) => void;
   onReplace: () => void;
 }) {
   const bounds = useMemo(() => boundsFor(board), [board]);
+  const baseViewport = useMemo(() => baseViewportFor(bounds), [bounds]);
+  const boardPaneRef = useRef<HTMLDivElement>(null);
+  const dragStateRef = useRef<DragState | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [viewportCenter, setViewportCenter] = useState<BoardPoint>({
+    x: baseViewport.x + baseViewport.width / 2,
+    y: baseViewport.y + baseViewport.height / 2,
+  });
   const netNames = useMemo(() => sortedNetNames(board), [board]);
   const filteredNets = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -372,16 +465,121 @@ function BoardExplorer({
       ? netNames.filter((net) => net.toLowerCase().includes(normalized))
       : netNames;
   }, [netNames, query]);
-  const selectedPads = useMemo(
-    () => selectedNet ? board.pads.filter((pad) => pad.net === selectedNet) : [],
-    [board.pads, selectedNet]
+  const selectedPads = useMemo(() => {
+    if (!selectedNet) return [];
+    return board.pads
+      .filter((pad) => pad.net === selectedNet && padVisible(pad, layerMode))
+      .sort((a, b) => a.ref.localeCompare(b.ref) || a.pad.localeCompare(b.pad));
+  }, [board.pads, layerMode, selectedNet]);
+  const visibleTrackCount = useMemo(
+    () => selectedNet ? board.tracks.filter((track) => track.net === selectedNet && trackVisible(track.layer, layerMode)).length : 0,
+    [board.tracks, layerMode, selectedNet]
   );
+  const visibleViaCount = useMemo(
+    () => selectedNet ? board.vias.filter((via) => via.net === selectedNet).length : 0,
+    [board.vias, selectedNet]
+  );
+  const visibleLayers = useMemo(() => {
+    if (!selectedNet) return [] as string[];
+    return [...new Set(
+      board.tracks
+        .filter((track) => track.net === selectedNet && trackVisible(track.layer, layerMode))
+        .map((track) => track.layer)
+    )].sort();
+  }, [board.tracks, layerMode, selectedNet]);
   const selectedTrackCount = selectedNet
     ? board.tracks.filter((track) => track.net === selectedNet).length
     : 0;
   const selectedViaCount = selectedNet
     ? board.vias.filter((via) => via.net === selectedNet).length
     : 0;
+
+  useEffect(() => {
+    setZoom(1);
+    setViewportCenter({
+      x: baseViewport.x + baseViewport.width / 2,
+      y: baseViewport.y + baseViewport.height / 2,
+    });
+  }, [baseViewport.x, baseViewport.y, baseViewport.width, baseViewport.height]);
+
+  useEffect(() => {
+    if (!focusedPadId) return;
+    const pad = board.pads.find((item) => item.id === focusedPadId);
+    if (!pad) return;
+
+    setViewportCenter(clampViewportCenter(pad.at, baseViewport, zoom));
+  }, [baseViewport, board.pads, focusedPadId, zoom]);
+
+  useEffect(() => {
+    setViewportCenter((current) => clampViewportCenter(current, baseViewport, zoom));
+  }, [baseViewport, zoom]);
+
+  const adjustZoom = useCallback((delta: number) => {
+    setZoom((current) => {
+      const next = Math.min(18, Math.max(1, Number((current * delta).toFixed(4))));
+      return next;
+    });
+  }, []);
+
+  const resetView = useCallback(() => {
+    setZoom(1);
+    setViewportCenter({
+      x: baseViewport.x + baseViewport.width / 2,
+      y: baseViewport.y + baseViewport.height / 2,
+    });
+  }, [baseViewport]);
+
+  const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const factor = event.deltaY > 0 ? 1 / 1.12 : 1.12;
+    setZoom((current) => {
+      const next = Math.min(18, Math.max(1, Number((current * factor).toFixed(4))));
+      return next;
+    });
+  }, []);
+
+  const handlePointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    dragStateRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      originCenter: viewportCenter,
+    };
+    setIsPanning(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }, [viewportCenter]);
+
+  const endDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    dragStateRef.current = null;
+    setIsPanning(false);
+  }, []);
+
+  const handlePointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragStateRef.current;
+    const element = boardPaneRef.current;
+    if (!drag || !element) return;
+
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    const unitsPerPixelX = (baseViewport.width / zoom) / Math.max(element.clientWidth, 1);
+    const unitsPerPixelY = (baseViewport.height / zoom) / Math.max(element.clientHeight, 1);
+
+    setViewportCenter(clampViewportCenter({
+      x: drag.originCenter.x - dx * unitsPerPixelX,
+      y: drag.originCenter.y - dy * unitsPerPixelY,
+    }, baseViewport, zoom));
+  }, [baseViewport, zoom]);
+
+  const viewport: Viewport = {
+    x: viewportCenter.x - baseViewport.width / zoom / 2,
+    y: viewportCenter.y - baseViewport.height / zoom / 2,
+    width: baseViewport.width / zoom,
+    height: baseViewport.height / zoom,
+  };
 
   return (
     <div style={{ height: "100%", minHeight: 0, display: "flex", background: C.bg, color: C.text, fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
@@ -442,20 +640,51 @@ function BoardExplorer({
           </div>
           {selectedNet && (
             <div style={{ fontSize: "0.78rem", color: C.muted }}>
-              {selectedTrackCount} tracks, {selectedViaCount} vias, {selectedPads.length} pads
+              {visibleTrackCount}/{selectedTrackCount} tracks, {visibleViaCount}/{selectedViaCount} vias, {selectedPads.length} visible pads
             </div>
           )}
+          <div style={{ display: "flex", alignItems: "center", gap: "0.35rem" }}>
+            <button type="button" onClick={() => adjustZoom(1 / 1.25)} style={zoomButtonStyle}>-</button>
+            <div style={{ minWidth: 60, textAlign: "center", fontSize: "0.76rem", color: C.muted }}>
+              {Math.round(zoom * 100)}%
+            </div>
+            <button type="button" onClick={() => adjustZoom(1.25)} style={zoomButtonStyle}>+</button>
+            <button type="button" onClick={resetView} style={zoomButtonStyle}>Reset</button>
+          </div>
           <div style={{ marginLeft: "auto", fontSize: "0.72rem", color: C.faint }}>
             Coordinates in {board.units}
           </div>
         </div>
 
         <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
-          <div style={{ flex: 1, minWidth: 0, minHeight: 0, background: "#020617" }}>
-            <BoardSvg board={board} selectedNet={selectedNet} bounds={bounds} onSelectNet={onSelectNet} />
+          <div
+            ref={boardPaneRef}
+            onWheel={handleWheel}
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+            style={{ flex: 1, minWidth: 0, minHeight: 0, background: "#020617", touchAction: "none", cursor: isPanning ? "grabbing" : "grab" }}
+          >
+            <BoardSvg
+              board={board}
+              selectedNet={selectedNet}
+              focusedPadId={focusedPadId}
+              layerMode={layerMode}
+              viewport={viewport}
+              onSelectNet={onSelectNet}
+            />
           </div>
           <section style={{ width: 330, flexShrink: 0, borderLeft: `1px solid ${C.border}`, background: C.panel, overflowY: "auto" }}>
-            <NetDetails net={selectedNet} pads={selectedPads} board={board} />
+            <NetDetails
+              net={selectedNet}
+              pads={selectedPads}
+              trackCount={visibleTrackCount}
+              layers={visibleLayers}
+              layerMode={layerMode}
+              onFocusPad={onFocusPad}
+              onLayerModeChange={onLayerModeChange}
+            />
           </section>
         </div>
       </main>
@@ -467,16 +696,23 @@ function BoardExplorer({
 function BoardSvg({
   board,
   selectedNet,
-  bounds,
+  focusedPadId,
+  layerMode,
+  viewport,
   onSelectNet,
 }: {
   board: BoardArtifact;
   selectedNet: string | null;
-  bounds: Bounds;
+  focusedPadId: string | null;
+  layerMode: LayerViewMode;
+  viewport: Viewport;
   onSelectNet: (net: string) => void;
 }) {
+  const focusedPad = focusedPadId ? board.pads.find((pad) => pad.id === focusedPadId) : undefined;
+  const focusedRef = focusedPad?.ref;
+
   return (
-    <svg viewBox={viewBoxFor(bounds)} style={{ width: "100%", height: "100%", display: "block" }}>
+    <svg viewBox={viewBoxFor(viewport)} style={{ width: "100%", height: "100%", display: "block" }}>
       <g>
         {(board.edges ?? []).map((edge) => (
           <line
@@ -493,7 +729,7 @@ function BoardSvg({
         ))}
       </g>
       <g>
-        {board.tracks.map((track) => {
+        {board.tracks.filter((track) => trackVisible(track.layer, layerMode)).map((track) => {
           const active = selectedNet === track.net;
           return (
             <line
@@ -533,8 +769,11 @@ function BoardSvg({
         })}
       </g>
       <g>
-        {board.pads.map((pad) => {
+        {board.pads.filter((pad) => padVisible(pad, layerMode)).map((pad) => {
           const active = selectedNet === pad.net;
+          const focused = focusedPadId === pad.id;
+          const sameComponent = !!focusedRef && pad.ref === focusedRef;
+          const componentSibling = sameComponent && !focused;
           const sx = Math.max(pad.size?.x ?? 0.8, 0.36);
           const sy = Math.max(pad.size?.y ?? 0.8, 0.36);
           return (
@@ -545,10 +784,11 @@ function BoardSvg({
               width={sx}
               height={sy}
               rx={Math.min(sx, sy) * 0.22}
-              fill={active ? C.highlight : C.pad}
-              stroke={active ? "#fef3c7" : "#0f172a"}
-              strokeWidth={active ? 0.12 : 0.06}
+              fill={focused || active ? C.highlight : componentSibling ? C.componentPad : C.pad}
+              stroke={focused ? C.accent : componentSibling ? "#86efac" : active ? "#fef3c7" : "#0f172a"}
+              strokeWidth={focused ? 0.2 : componentSibling ? 0.12 : active ? 0.12 : 0.06}
               opacity={selectedNet && !active ? 0.18 : 0.9}
+              transform={pad.rotation ? `rotate(${pad.rotation} ${pad.at.x} ${pad.at.y})` : undefined}
               onClick={() => onSelectNet(pad.net)}
               style={{ cursor: "pointer" }}
             />
@@ -562,26 +802,37 @@ function BoardSvg({
 function NetDetails({
   net,
   pads,
-  board,
+  trackCount,
+  layers,
+  layerMode,
+  onFocusPad,
+  onLayerModeChange,
 }: {
   net: string | null;
   pads: BoardPad[];
-  board: BoardArtifact;
+  trackCount: number;
+  layers: string[];
+  layerMode: LayerViewMode;
+  onFocusPad: (padId: string | null) => void;
+  onLayerModeChange: (mode: LayerViewMode) => void;
 }) {
   if (!net) {
     return (
-      <div style={{ padding: "1rem", color: C.muted, fontSize: "0.84rem", lineHeight: 1.6 }}>
-        Select a net from the list or click a trace, via, or pad on the board to inspect the connected pads and components.
+      <div style={{ padding: "1rem", display: "flex", flexDirection: "column", gap: "1rem" }}>
+        <LayerModePanel mode={layerMode} onChange={onLayerModeChange} />
+        <div style={{ color: C.muted, fontSize: "0.84rem", lineHeight: 1.6 }}>
+          Select a net from the list or click a trace, via, or pad on the board to inspect connected pads and measurement points on the visible board side.
+        </div>
       </div>
     );
   }
 
-  const tracks = board.tracks.filter((track) => track.net === net);
-  const layers = [...new Set(tracks.map((track) => track.layer))].sort();
   const refs = [...new Set(pads.map((pad) => pad.ref))].sort();
 
   return (
     <div style={{ padding: "1rem", display: "flex", flexDirection: "column", gap: "1rem" }}>
+      <LayerModePanel mode={layerMode} onChange={onLayerModeChange} />
+
       <div>
         <div style={{ fontSize: "0.74rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.1em" }}>Net</div>
         <div style={{ marginTop: "0.35rem", color: C.highlight, fontSize: "1rem", fontWeight: 800, overflowWrap: "anywhere" }}>{net}</div>
@@ -590,25 +841,25 @@ function NetDetails({
       <div style={detailGridStyle}>
         <Metric label="Components" value={String(refs.length)} />
         <Metric label="Pads" value={String(pads.length)} />
-        <Metric label="Tracks" value={String(tracks.length)} />
+        <Metric label="Tracks" value={String(trackCount)} />
         <Metric label="Layers" value={layers.join(", ") || "-"} />
       </div>
 
       <div>
-        <div style={sectionLabelStyle}>Connected Pads</div>
+        <div style={sectionLabelStyle}>Measurement Pads</div>
         <div style={{ display: "flex", flexDirection: "column", gap: "0.45rem" }}>
           {pads.length === 0 ? (
-            <div style={{ color: C.muted, fontSize: "0.8rem" }}>No pads found for this net.</div>
+            <div style={{ color: C.muted, fontSize: "0.8rem" }}>No visible pads found for this net on the selected side.</div>
           ) : pads.map((pad) => (
-            <div key={pad.id} style={padCardStyle}>
+            <button key={pad.id} type="button" onClick={() => onFocusPad(pad.id)} style={padCardButtonStyle}>
               <div style={{ display: "flex", alignItems: "baseline", gap: "0.4rem" }}>
                 <span style={{ color: C.text, fontWeight: 800 }}>{pad.ref}.{pad.pad}</span>
                 {pad.pinFunction && <span style={{ color: C.accent, fontSize: "0.76rem" }}>{pad.pinFunction}</span>}
               </div>
               <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.74rem" }}>
-                {pad.value ?? pad.footprint ?? "component"} at {pad.at.x.toFixed(2)}, {pad.at.y.toFixed(2)}
+                {pad.value ?? pad.footprint ?? "component"} · {padAccessLabel(pad)} · {pad.at.x.toFixed(2)}, {pad.at.y.toFixed(2)}
               </div>
-            </div>
+            </button>
           ))}
         </div>
       </div>
@@ -618,6 +869,39 @@ function NetDetails({
         <div style={{ color: C.muted, fontSize: "0.78rem", lineHeight: 1.65 }}>
           {pads.map(formatPad).join(" -> ") || "No endpoint pads detected."}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function LayerModePanel({
+  mode,
+  onChange,
+}: {
+  mode: LayerViewMode;
+  onChange: (mode: LayerViewMode) => void;
+}) {
+  const options: Array<{ id: LayerViewMode; label: string }> = [
+    { id: "all", label: "All" },
+    { id: "exterior", label: "Exterior" },
+    { id: "top", label: "Top" },
+    { id: "bottom", label: "Bottom" },
+  ];
+
+  return (
+    <div>
+      <div style={sectionLabelStyle}>Visible Copper</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.45rem" }}>
+        {options.map((option) => (
+          <button
+            key={option.id}
+            type="button"
+            onClick={() => onChange(option.id)}
+            style={layerModeButtonStyle(mode === option.id)}
+          >
+            {option.label}
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -725,4 +1009,37 @@ const padCardStyle: CSSProperties = {
   border: `1px solid ${C.border}`,
   borderRadius: 8,
   padding: "0.65rem 0.7rem",
+};
+
+const padCardButtonStyle: CSSProperties = {
+  ...padCardStyle,
+  width: "100%",
+  textAlign: "left",
+  cursor: "pointer",
+  appearance: "none",
+  color: C.text,
+};
+
+function layerModeButtonStyle(active: boolean): CSSProperties {
+  return {
+    border: `1px solid ${active ? "#155e75" : C.border}`,
+    borderRadius: 8,
+    background: active ? "#0f2c3b" : "#08111f",
+    color: active ? C.accent : C.text,
+    cursor: "pointer",
+    padding: "0.5rem 0.65rem",
+    fontSize: "0.76rem",
+    fontWeight: active ? 800 : 600,
+  };
+}
+
+const zoomButtonStyle: CSSProperties = {
+  border: `1px solid ${C.border}`,
+  borderRadius: 7,
+  background: "#08111f",
+  color: C.text,
+  cursor: "pointer",
+  padding: "0.32rem 0.55rem",
+  fontSize: "0.76rem",
+  lineHeight: 1,
 };
