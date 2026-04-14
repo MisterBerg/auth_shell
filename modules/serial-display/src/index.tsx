@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { MutableRefObject } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import xtermCss from "@xterm/xterm/css/xterm.css?inline";
@@ -99,6 +100,56 @@ function buildPortDisplayMap(ports: SerialPortInfo[]): Record<string, PortDispla
   return result;
 }
 
+function buildStablePortDisplayMap(
+  ports: SerialPortInfo[],
+  groupOrderRef: MutableRefObject<string[]>,
+  groupAssignmentsRef: MutableRefObject<Record<string, string[]>>
+): Record<string, PortDisplayInfo> {
+  const grouped = new Map<string, SerialPortInfo[]>();
+  for (const port of ports) {
+    const key = portGroupBase(port);
+    const group = grouped.get(key) ?? [];
+    group.push(port);
+    grouped.set(key, group);
+  }
+
+  const result: Record<string, PortDisplayInfo> = {};
+  const knownGroups = groupOrderRef.current.filter((groupKey) => grouped.has(groupKey));
+  for (const groupKey of grouped.keys()) {
+    if (!knownGroups.includes(groupKey)) knownGroups.push(groupKey);
+  }
+  groupOrderRef.current = knownGroups;
+
+  knownGroups.forEach((groupKey, groupIndex) => {
+    const group = grouped.get(groupKey);
+    if (!group) return;
+    const seenIds = groupAssignmentsRef.current[groupKey] ?? [];
+    const nextIds = [...seenIds];
+    for (const port of group) {
+      if (!nextIds.includes(port.id)) nextIds.push(port.id);
+    }
+    groupAssignmentsRef.current[groupKey] = nextIds;
+
+    const liveIds = nextIds.filter((id) => group.some((port) => port.id === id));
+    const isMultiPort = nextIds.length > 1;
+
+    liveIds.forEach((portId, index) => {
+      const port = group.find((entry) => entry.id === portId);
+      if (!port) return;
+      const suffix = isMultiPort ? `-${toAlpha(index)}` : "";
+      const defaultLabel = `${groupIndex + 1}${suffix}`;
+      result[port.id] = {
+        portId: port.id,
+        aliasKey: `${groupKey}#${index + 1}`,
+        defaultLabel,
+        detailLabel: `${defaultLabel} | ${describePort(port)} | id ${portSuffix(port)}`,
+      };
+    });
+  });
+
+  return result;
+}
+
 function getLocalSettingsStorageKey(config: ModuleProps["config"]): string {
   const params = new URLSearchParams(window.location.search);
   const bucket = params.get("bucket") ?? "local";
@@ -153,9 +204,15 @@ export default function SerialDisplay({ config }: ModuleProps) {
   const labelInputRef = useRef<HTMLInputElement>(null);
   const sessionBuffersRef = useRef<Record<string, string>>({});
   const selectedPortIdRef = useRef<SerialPortId | null>(null);
+  const isReplayingRef = useRef(false);
+  const groupOrderRef = useRef<string[]>([]);
+  const groupAssignmentsRef = useRef<Record<string, string[]>>({});
   const [aliasMap, setAliasMap] = useState<Record<string, string>>(initialLocalSettings.aliases ?? {});
   const [baudMap, setBaudMap] = useState<Record<string, number>>(initialLocalSettings.baudRates ?? {});
-  const displayMap = useMemo(() => buildPortDisplayMap(ports), [ports]);
+  const displayMap = useMemo(
+    () => buildStablePortDisplayMap(ports, groupOrderRef, groupAssignmentsRef),
+    [ports]
+  );
 
   const selectedPort =
     ports.find((port) => port.id === selectedPortId) ?? null;
@@ -169,9 +226,11 @@ export default function SerialDisplay({ config }: ModuleProps) {
     const terminal = terminalRef.current;
     const currentPortId = selectedPortIdRef.current;
     if (!terminal) return;
+    isReplayingRef.current = true;
     terminal.reset();
     if (!currentPortId) {
       terminal.writeln("\x1b[90mSelect a port to view its session.\x1b[0m");
+      isReplayingRef.current = false;
       return;
     }
     const transcript = sessionBuffersRef.current[currentPortId] ?? "";
@@ -183,6 +242,9 @@ export default function SerialDisplay({ config }: ModuleProps) {
     if (autoScroll) {
       terminal.scrollToBottom();
     }
+    setTimeout(() => {
+      isReplayingRef.current = false;
+    }, 0);
   }, [autoScroll]);
 
   const appendToSession = useCallback((portId: SerialPortId, text: string) => {
@@ -344,7 +406,7 @@ export default function SerialDisplay({ config }: ModuleProps) {
     let disposed = false;
     let pendingWrite = Promise.resolve();
     const terminalInput = terminal.onData((data) => {
-      if (!canWrite || disposed) return;
+      if (!canWrite || disposed || isReplayingRef.current) return;
       pendingWrite = pendingWrite
         .then(() => runtime.write(selectedPortId, encodeText(data), claimantId))
         .catch((error: unknown) => {
