@@ -1,10 +1,9 @@
-import React, { useState } from "react";
-import { useEditMode, useAuthContext, ModulePicker } from "module-core";
-import type { ModuleRegistryEntry, ModuleConfig } from "module-core";
-import { PutObjectCommand } from "@aws-sdk/client-s3";
+import React from "react";
+import { useEditMode } from "module-core";
+import type { ModuleConfig } from "module-core";
 
 type EditModeBarProps = {
-  /** The resolved config of the current root module. Needed for root replacement. */
+  /** Reserved for future shell-level actions. */
   rootConfig: ModuleConfig | null;
 };
 
@@ -13,112 +12,37 @@ type EditModeBarProps = {
  * module (not on the sign-in screen). Only appears when a real module is
  * loaded from S3 (i.e. URL has ?bucket=&config= params).
  *
- * - "Edit" button enters edit mode
- * - In edit mode: "Done" exits, "Replace module" swaps the entire root module
+ * - "Edit Interface" enters edit mode
+ * - "Done" exits edit mode
  *
  * All modules in the tree read editMode from EditModeContext — this is the
  * single place that writes it.
  */
 export function EditModeBar({ rootConfig }: EditModeBarProps) {
   const { editMode, setEditMode } = useEditMode();
-  const { getS3Client } = useAuthContext();
-  const [showReplacePicker, setShowReplacePicker] = useState(false);
-  const [replaceError, setReplaceError] = useState<string | undefined>();
-  const [replacing, setReplacing] = useState(false);
-
-  const handleReplaceRoot = async (entry: ModuleRegistryEntry) => {
-    if (!rootConfig) return;
-    setShowReplacePicker(false);
-    setReplaceError(undefined);
-    setReplacing(true);
-
-    const params = new URLSearchParams(window.location.search);
-    const configBucket = params.get("bucket");
-    const configPath = params.get("config");
-
-    if (!configBucket || !configPath) {
-      setReplaceError("Missing URL config params");
-      setReplacing(false);
-      return;
-    }
-
-    const newConfig: ModuleConfig = {
-      ...rootConfig,
-      app: { bucket: entry.bundleBucket, key: entry.bundlePath },
-    };
-
-    try {
-      const s3 = await getS3Client(configBucket);
-      await s3.send(new PutObjectCommand({
-        Bucket: configBucket,
-        Key: configPath,
-        Body: JSON.stringify(newConfig, null, 2),
-        ContentType: "application/json",
-      }));
-    } catch (err: unknown) {
-      setReplaceError(`Failed to save: ${(err as Error).message}`);
-      setReplacing(false);
-      return;
-    }
-
-    setEditMode(false);
-    window.dispatchEvent(new Event("shell:navigate"));
-  };
+  void rootConfig;
 
   return (
     <>
-      {/* Floating bar — bottom right, above everything */}
+      {/* Floating bar — bottom left, above everything */}
       <div
         style={{
           position: "fixed",
           bottom: 20,
-          right: 20,
+          left: 20,
           zIndex: 1000,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "flex-end",
-          gap: "0.5rem",
-          pointerEvents: "none", // let clicks pass through the gap between buttons
+          pointerEvents: "auto",
         }}
       >
-        {replaceError && (
-          <div style={{
-            pointerEvents: "auto",
-            background: "#1a0a0a",
-            border: "1px solid #7f1d1d",
-            borderRadius: 6,
-            padding: "0.4rem 0.75rem",
-            fontSize: "0.75rem",
-            color: "#fca5a5",
-            maxWidth: 260,
-            textAlign: "right",
-          }}>
-            {replaceError}
-          </div>
-        )}
-
-        <div style={{ display: "flex", gap: "0.5rem", pointerEvents: "auto" }}>
-          {editMode && (
-            <button
-              onClick={() => { setShowReplacePicker(true); setReplaceError(undefined); }}
-              disabled={replacing}
-              style={secondaryBtnStyle}
-              title="Replace the root module of this project"
-            >
-              Replace module
-            </button>
-          )}
-
-          <button
-            onClick={() => {
-              setEditMode(!editMode);
-              setReplaceError(undefined);
-            }}
-            style={editMode ? doneButtonStyle : editButtonStyle}
-          >
-            {editMode ? "Done" : "Edit"}
-          </button>
-        </div>
+        <button
+          onClick={() => {
+            setEditMode(!editMode);
+          }}
+          style={editMode ? doneButtonStyle : editButtonStyle}
+          title={editMode ? "Exit interface editing" : "Edit the project interface"}
+        >
+          {editMode ? "Done" : "Edit Interface"}
+        </button>
       </div>
 
       {/* Edit mode indicator — thin top border so you always know the mode */}
@@ -135,16 +59,6 @@ export function EditModeBar({ rootConfig }: EditModeBarProps) {
         }} />
       )}
 
-      {showReplacePicker && (
-        <ModulePicker
-          onSelect={handleReplaceRoot}
-          onCancel={() => setShowReplacePicker(false)}
-          headerOverride={{
-            title: "Replace root module",
-            subtitle: "The current layout and all its slots will be replaced",
-          }}
-        />
-      )}
     </>
   );
 }
@@ -178,10 +92,3 @@ const doneButtonStyle: React.CSSProperties = {
   color: "#fff",
 };
 
-const secondaryBtnStyle: React.CSSProperties = {
-  ...baseBtn,
-  background: "rgba(15, 25, 41, 0.85)",
-  color: "#93c5fd",
-  border: "1px solid #1e3a5f",
-  backdropFilter: "blur(4px)",
-};

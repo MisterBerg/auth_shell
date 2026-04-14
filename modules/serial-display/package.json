@@ -1,0 +1,29 @@
+{
+  "name": "module-serial-display",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "jsl": {
+    "displayName": "Serial Display",
+    "category": "component",
+    "description": "Interactive Web Serial console for discovering ports, viewing text output, and sending commands"
+  },
+  "scripts": {
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "module-core": "*",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "web-serial-runtime": "*"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4"
+  }
+}

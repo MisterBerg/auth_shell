@@ -1,11 +1,12 @@
 {
   "private": true,
-  "workspaces": ["core", "apps/shell", "apps/landing", "layouts/top-left", "layouts/tabs-top", "layouts/tabs-left", "layouts/left-right-columns", "modules/webview", "modules/oauth-badge", "modules/template", "modules/markdown-viewer", "modules/document-viewer", "modules/documentation-viewer", "modules/links", "modules/task-tracker", "modules/kicad-board-viewer"],
+  "workspaces": ["core", "apps/shell", "apps/landing", "layouts/top-left", "layouts/tabs-top", "layouts/tabs-left", "layouts/left-right-columns", "modules/webview", "modules/oauth-badge", "modules/template", "modules/markdown-viewer", "modules/document-viewer", "modules/documentation-viewer", "modules/links", "modules/task-tracker", "modules/kicad-board-viewer", "modules/serial-display", "shared/web-serial-runtime"],
   "scripts": {
     "reset": "tsx scripts/reset-local.ts",
     "compose:up": "podman compose up -d",
     "compose:down": "podman compose down",
     "seed": "tsx scripts/seed-local.ts",
+    "update-locals": "tsx scripts/update-locals.ts",
     "publish:local": "tsx scripts/publish-module.ts --local",
     "publish": "tsx scripts/publish-module.ts",
     "publish:all": "tsx scripts/publish-all.ts",
