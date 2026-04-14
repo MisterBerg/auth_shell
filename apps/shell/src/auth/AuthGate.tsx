@@ -1,66 +1,73 @@
-import React, { useEffect, useState, useRef, Suspense, useMemo, Component, type ErrorInfo, type ReactNode } from "react";
-import { loadModule } from "module-core";
+import React, { Suspense, useEffect, useMemo, Component, type ErrorInfo, type ReactNode } from "react";
+import { loadBundle } from "module-core";
 import type { ModuleConfig } from "module-core";
+import { useAwsS3Client } from "module-core";
 import { useConfigStore } from "../stores/configStore.ts";
 import { useAuthStore } from "../stores/authStore.ts";
-import { useAwsS3Client } from "module-core";
-import { useRegisterResources } from "module-core";
 import { CONFIG } from "../config.ts";
 import { initAuthShell } from "./googleCognito.ts";
-import { getModuleLocationFromUrl } from "../remote/urlConfig.ts";
-import { EditModeBar } from "./EditModeBar.tsx";
 
 class ModuleErrorBoundary extends Component<
   { children: ReactNode },
   { error: Error | null }
 > {
   state = { error: null };
-  static getDerivedStateFromError(error: Error) { return { error }; }
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error("[AuthGate] Module load failed:", error, info);
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
   }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("[AuthGate] Protected shell-core load failed:", error, info);
+  }
+
   render() {
     if (this.state.error) {
       return (
-        <div style={{ padding: "2rem", fontFamily: "monospace", color: "#fca5a5", background: "#0b1120", minHeight: "100vh" }}>
-          <strong>Failed to load module</strong>
-          <pre style={{ marginTop: "1rem", fontSize: "0.8rem", whiteSpace: "pre-wrap" }}>
+        <div
+          style={{
+            padding: "2rem",
+            fontFamily: "monospace",
+            color: "#fca5a5",
+            background: "#0b1120",
+            minHeight: "100vh",
+          }}
+        >
+          <strong>Failed to load protected shell core</strong>
+          <pre
+            style={{
+              marginTop: "1rem",
+              fontSize: "0.8rem",
+              whiteSpace: "pre-wrap",
+            }}
+          >
             {(this.state.error as Error).message}
           </pre>
         </div>
       );
     }
+
     return this.props.children;
   }
 }
 
-function getCurrentModuleLocation() {
-  const fromUrl = getModuleLocationFromUrl();
-  if (fromUrl) return { ...fromUrl, isDefault: false };
-  return {
-    bucket: CONFIG.defaultAppBucket,
-    configPath: CONFIG.defaultAppConfigPath,
-    isDefault: true,
-  };
-}
+const shellCoreConfig: ModuleConfig = {
+  id: "shell-core",
+  app: {
+    bucket: CONFIG.shellCoreBundle.bucket,
+    key: CONFIG.shellCoreBundle.key,
+  },
+  meta: {
+    defaultAppBucket: CONFIG.defaultAppBucket,
+    defaultAppConfigPath: CONFIG.defaultAppConfigPath,
+  },
+};
 
 export const AuthGate: React.FC = () => {
   const { config, setConfig } = useConfigStore();
   const { isSignedIn, awsCredentialProvider, loading, error, signInWithMicrosoft } =
     useAuthStore();
   const getS3Client = useAwsS3Client();
-  const registerResources = useRegisterResources();
-
-  const getS3ClientRef = useRef(getS3Client);
-  const registerResourcesRef = useRef(registerResources);
-  useEffect(() => {
-    getS3ClientRef.current = getS3Client;
-    registerResourcesRef.current = registerResources;
-  });
-
-  const [moduleLocation, setModuleLocation] = useState(getCurrentModuleLocation);
-  // Resolved root config — passed to EditModeBar so it can write root replacements
-  const [rootConfig, setRootConfig] = useState<ModuleConfig | null>(null);
 
   useEffect(() => {
     if (!config) {
@@ -69,58 +76,25 @@ export const AuthGate: React.FC = () => {
     }
   }, [config, setConfig]);
 
-  useEffect(() => {
-    const onPopState = () => setModuleLocation(getCurrentModuleLocation());
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
-  }, []);
-
-  useEffect(() => {
-    const onNavigate = () => {
-      setModuleLocation(getCurrentModuleLocation());
-      setRootConfig(null); // clear stale config until new module resolves
-    };
-    window.addEventListener("shell:navigate", onNavigate);
-    return () => window.removeEventListener("shell:navigate", onNavigate);
-  }, []);
-
   const ready = isSignedIn && !!awsCredentialProvider;
 
-  const LazyApp = useMemo(() => {
+  const LazyShellCore = useMemo(() => {
     if (!ready) return null;
 
-    const { bucket, configPath, isDefault } = moduleLocation;
-    const useDevAlias = isDefault && import.meta.env.DEV;
-
     return React.lazy(async (): Promise<{ default: React.ComponentType }> => {
-      if (useDevAlias) {
-        const { default: LandingApp } = await import("app-landing");
-        const devConfig: ModuleConfig = {
-          id: "app-landing-dev",
-          app: { bucket: "hep-dev-registry", key: "bundle.js" },
-          meta: { projectsBucket: "hep-dev-modules" },
-        };
-        const Bound = () => <LandingApp config={devConfig} />;
-        Bound.displayName = "RootModule[dev]";
-        return { default: Bound };
-      }
-
-      const { config: moduleConfig, Component } = await loadModule(
-        bucket,
-        configPath,
-        getS3ClientRef.current,
-        registerResourcesRef.current
+      const Component = await loadBundle(
+        CONFIG.shellCoreBundle.bucket,
+        CONFIG.shellCoreBundle.key,
+        getS3Client
       );
-      // Surface the resolved config so EditModeBar can perform root replacement
-      setRootConfig(moduleConfig);
-      const Bound = () => <Component config={moduleConfig as ModuleConfig} />;
-      Bound.displayName = "RootModule";
+
+      const Bound = () => <Component config={shellCoreConfig} />;
+      Bound.displayName = "ProtectedShellCore";
       return { default: Bound };
     });
-  }, [ready, moduleLocation]);
+  }, [getS3Client, ready]);
 
-  // Sign-in screen
-  if (!ready || !LazyApp) {
+  if (!ready || !LazyShellCore) {
     return (
       <div
         style={{
@@ -183,34 +157,26 @@ export const AuthGate: React.FC = () => {
     );
   }
 
-  const locationKey = `${moduleLocation.bucket}/${moduleLocation.configPath}`;
-  const showEditBar = !moduleLocation.isDefault;
-
   return (
-    <>
-      <ModuleErrorBoundary key={locationKey}>
-        <Suspense
-          key={locationKey}
-          fallback={
-            <div
-              style={{
-                minHeight: "100vh",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                background: "#020617",
-                color: "#e5e7eb",
-              }}
-            >
-              Loading…
-            </div>
-          }
-        >
-          <LazyApp />
-        </Suspense>
-      </ModuleErrorBoundary>
-
-      {showEditBar && <EditModeBar rootConfig={rootConfig} />}
-    </>
+    <ModuleErrorBoundary>
+      <Suspense
+        fallback={
+          <div
+            style={{
+              minHeight: "100vh",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "#020617",
+              color: "#e5e7eb",
+            }}
+          >
+            Loading protected shell…
+          </div>
+        }
+      >
+        <LazyShellCore />
+      </Suspense>
+    </ModuleErrorBoundary>
   );
 };

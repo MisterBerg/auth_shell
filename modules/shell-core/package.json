@@ -1,0 +1,26 @@
+{
+  "name": "module-shell-core",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "jsl": {
+    "displayName": "Protected Shell Core",
+    "category": "app",
+    "description": "Authenticated app orchestrator loaded only after OAuth"
+  },
+  "scripts": {
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "module-core": "*",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4"
+  }
+}
