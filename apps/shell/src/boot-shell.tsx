@@ -1,5 +1,6 @@
 import React from "react";
-import ReactDOM from "react-dom/client";
+import * as ReactDOM from "react-dom";
+import * as ReactDOMClient from "react-dom/client";
 import * as ReactJsxRuntime from "react/jsx-runtime";
 import { AuthGate } from "./auth/AuthGate.tsx";
 
@@ -14,7 +15,7 @@ win["__ReactDOM"] = ReactDOM;
 const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("Root element #root not found");
 
-ReactDOM.createRoot(rootElement).render(
+ReactDOMClient.createRoot(rootElement).render(
   <React.StrictMode>
     <AuthGate />
   </React.StrictMode>
