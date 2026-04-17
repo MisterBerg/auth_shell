@@ -8,14 +8,70 @@ import React, {
   type ErrorInfo,
   type ReactNode,
 } from "react";
+import * as moduleCore from "module-core";
 import {
+  AuthProvider,
+  EditModeProvider,
+  ResourceRegistryProvider,
   loadModule,
-  useAwsS3Client,
   useEditMode,
   useRegisterResources,
+  type AuthContextValue,
   type ModuleConfig,
-  type ModuleProps,
 } from "module-core";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import { S3Client, type S3ClientConfig } from "@aws-sdk/client-s3";
+
+declare global {
+  interface Window {
+    __ModuleCore?: unknown;
+  }
+}
+
+window.__ModuleCore = moduleCore;
+
+type UserProfile = {
+  email?: string;
+  name?: string;
+  picture?: string;
+};
+
+type AwsCredentials = {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  expiration?: Date;
+};
+
+type ShellConfig = {
+  region: string;
+  defaultAppBucket: string;
+  defaultAppConfigPath: string;
+  tables: {
+    registry: string;
+    projects: string;
+  };
+};
+
+type PublicRuntimeEnv = {
+  localBuckets: string[];
+  localS3Endpoint?: string;
+  localDdbEndpoint?: string;
+  localAccessKeyId?: string;
+  localSecretAccessKey?: string;
+  localRegion?: string;
+};
+
+type ProtectedShellCoreProps = {
+  shellConfig: ShellConfig;
+  auth: {
+    awsCredentialProvider: () => Promise<AwsCredentials>;
+    userProfile?: UserProfile;
+    signOut: () => void;
+  };
+  runtimeEnv: PublicRuntimeEnv;
+};
 
 type ModuleLocation = {
   bucket: string;
@@ -77,15 +133,167 @@ function getModuleLocationFromUrl(): ModuleLocation | null {
   return { bucket, configPath, isDefault: false };
 }
 
-function getCurrentModuleLocation(config: ModuleConfig): ModuleLocation {
+function getCurrentModuleLocation(config: ShellConfig): ModuleLocation {
   const fromUrl = getModuleLocationFromUrl();
   if (fromUrl) return fromUrl;
 
   return {
-    bucket: (config.meta?.defaultAppBucket as string | undefined) ?? config.app.bucket,
-    configPath: (config.meta?.defaultAppConfigPath as string | undefined) ?? "config.json",
+    bucket: config.defaultAppBucket,
+    configPath: config.defaultAppConfigPath,
     isDefault: true,
   };
+}
+
+function isLocalBucket(runtimeEnv: PublicRuntimeEnv, bucket?: string): boolean {
+  return Boolean(bucket) && runtimeEnv.localBuckets.includes(bucket!);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function installAutoResetOnAuthError(client: any, signOut: () => void) {
+  client.middlewareStack.addRelativeTo(
+    (next: (args: unknown) => Promise<unknown>) => async (args: unknown) => {
+      try {
+        return await next(args);
+      } catch (err: unknown) {
+        const code = (err as { name?: string; Code?: string; code?: string })?.name
+          ?? (err as { Code?: string })?.Code
+          ?? (err as { code?: string })?.code;
+
+        if (
+          code === "ExpiredTokenException" ||
+          code === "UnrecognizedClientException" ||
+          code === "InvalidIdentityTokenException" ||
+          code === "NotAuthorizedException"
+        ) {
+          console.warn("[ShellCore] Auth error — signing out", err);
+          signOut();
+        }
+        throw err;
+      }
+    },
+    {
+      relation: "after",
+      toMiddleware: "awsAuthMiddleware",
+      name: "autoResetOnAuthError",
+      override: true,
+    }
+  );
+}
+
+function createAwsClients(
+  config: ShellConfig,
+  runtimeEnv: PublicRuntimeEnv,
+  awsCredentialProvider: () => Promise<AwsCredentials>,
+  signOut: () => void
+) {
+  let remoteDdbClient: DynamoDBDocumentClient | null = null;
+  let localDdbClient: DynamoDBDocumentClient | null = null;
+  const s3ClientCache = new Map<string, S3Client>();
+
+  return {
+    getDdbDocClient: async () => {
+      const useLocal = import.meta.env.DEV && Boolean(runtimeEnv.localDdbEndpoint);
+
+      if (useLocal) {
+        if (!localDdbClient) {
+          const raw = new DynamoDBClient({
+            region: runtimeEnv.localRegion ?? "us-east-1",
+            endpoint: runtimeEnv.localDdbEndpoint,
+            credentials: runtimeEnv.localAccessKeyId
+              ? {
+                  accessKeyId: runtimeEnv.localAccessKeyId,
+                  secretAccessKey: runtimeEnv.localSecretAccessKey ?? "",
+                }
+              : { accessKeyId: "local", secretAccessKey: "local" },
+          });
+          localDdbClient = DynamoDBDocumentClient.from(raw, {
+            marshallOptions: { removeUndefinedValues: true },
+          });
+        }
+        return localDdbClient;
+      }
+
+      if (!remoteDdbClient) {
+        const raw = new DynamoDBClient({
+          region: config.region,
+          credentials: awsCredentialProvider,
+        });
+        installAutoResetOnAuthError(raw, signOut);
+        remoteDdbClient = DynamoDBDocumentClient.from(raw, {
+          marshallOptions: { removeUndefinedValues: true },
+        });
+      }
+      return remoteDdbClient;
+    },
+
+    getS3Client: async (bucket?: string) => {
+      const useLocal =
+        import.meta.env.DEV &&
+        Boolean(runtimeEnv.localS3Endpoint) &&
+        isLocalBucket(runtimeEnv, bucket);
+
+      const cacheKey = useLocal ? `local:${runtimeEnv.localS3Endpoint}` : "remote";
+      const cached = s3ClientCache.get(cacheKey);
+      if (cached) return cached;
+
+      let client: S3Client;
+
+      if (useLocal) {
+        client = new S3Client({
+          region: runtimeEnv.localRegion ?? "us-east-1",
+          endpoint: runtimeEnv.localS3Endpoint,
+          credentials: runtimeEnv.localAccessKeyId
+            ? {
+                accessKeyId: runtimeEnv.localAccessKeyId,
+                secretAccessKey: runtimeEnv.localSecretAccessKey ?? "",
+              }
+            : { accessKeyId: "local", secretAccessKey: "local" },
+          forcePathStyle: true,
+          requestChecksumCalculation: "WHEN_REQUIRED",
+          responseChecksumValidation: "WHEN_REQUIRED",
+        });
+      } else {
+        const s3Config: S3ClientConfig = {
+          region: config.region,
+          credentials: awsCredentialProvider,
+        };
+        client = new S3Client(s3Config);
+        installAutoResetOnAuthError(client, signOut);
+      }
+
+      s3ClientCache.set(cacheKey, client);
+      return client;
+    },
+  };
+}
+
+function ShellAuthProvider({
+  shellConfig,
+  auth,
+  runtimeEnv,
+  children,
+}: ProtectedShellCoreProps & { children: React.ReactNode }) {
+  const { getS3Client, getDdbDocClient } = useMemo(
+    () =>
+      createAwsClients(
+        shellConfig,
+        runtimeEnv,
+        auth.awsCredentialProvider,
+        auth.signOut
+      ),
+    [auth.awsCredentialProvider, auth.signOut, runtimeEnv, shellConfig]
+  );
+
+  const authValue: AuthContextValue = {
+    awsCredentialProvider: auth.awsCredentialProvider,
+    userProfile: auth.userProfile,
+    signOut: auth.signOut,
+    getS3Client,
+    getDdbClient: getDdbDocClient,
+    tables: shellConfig.tables,
+  };
+
+  return <AuthProvider {...authValue}>{children}</AuthProvider>;
 }
 
 function EditModeBar() {
@@ -129,8 +337,8 @@ function EditModeBar() {
   );
 }
 
-export default function ProtectedShellCore({ config }: ModuleProps) {
-  const getS3Client = useAwsS3Client();
+function ShellCoreApp({ shellConfig }: { shellConfig: ShellConfig }) {
+  const getS3Client = moduleCore.useAwsS3Client();
   const registerResources = useRegisterResources();
 
   const getS3ClientRef = useRef(getS3Client);
@@ -141,21 +349,37 @@ export default function ProtectedShellCore({ config }: ModuleProps) {
     registerResourcesRef.current = registerResources;
   });
 
-  const [moduleLocation, setModuleLocation] = useState(() => getCurrentModuleLocation(config));
+  const [moduleLocation, setModuleLocation] = useState(() =>
+    getCurrentModuleLocation(shellConfig)
+  );
 
   useEffect(() => {
-    const onPopState = () => setModuleLocation(getCurrentModuleLocation(config));
+    const onPopState = () => setModuleLocation(getCurrentModuleLocation(shellConfig));
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, [config]);
+  }, [shellConfig]);
 
   useEffect(() => {
-    const onNavigate = () => setModuleLocation(getCurrentModuleLocation(config));
+    const onNavigate = () => setModuleLocation(getCurrentModuleLocation(shellConfig));
     window.addEventListener("shell:navigate", onNavigate);
     return () => window.removeEventListener("shell:navigate", onNavigate);
-  }, [config]);
+  }, [shellConfig]);
 
   const LazyApp = useMemo(() => {
+    if (moduleLocation.isDefault && import.meta.env.DEV) {
+      return React.lazy(async (): Promise<{ default: React.ComponentType }> => {
+        const { default: LandingApp } = await import("app-landing");
+        const devConfig: ModuleConfig = {
+          id: "app-landing-dev",
+          app: { bucket: "hep-dev-registry", key: "bundle.js" },
+          meta: { projectsBucket: "hep-dev-modules" },
+        };
+        const Bound = () => <LandingApp config={devConfig} />;
+        Bound.displayName = "RootModule[dev]";
+        return { default: Bound };
+      });
+    }
+
     const { bucket, configPath } = moduleLocation;
 
     return React.lazy(async (): Promise<{ default: React.ComponentType }> => {
@@ -200,6 +424,18 @@ export default function ProtectedShellCore({ config }: ModuleProps) {
 
       {!moduleLocation.isDefault && <EditModeBar />}
     </>
+  );
+}
+
+export default function ProtectedShellCore(props: ProtectedShellCoreProps) {
+  return (
+    <ResourceRegistryProvider>
+      <EditModeProvider>
+        <ShellAuthProvider {...props}>
+          <ShellCoreApp shellConfig={props.shellConfig} />
+        </ShellAuthProvider>
+      </EditModeProvider>
+    </ResourceRegistryProvider>
   );
 }
 

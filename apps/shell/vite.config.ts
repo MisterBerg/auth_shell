@@ -13,9 +13,6 @@ export default defineConfig({
   ],
   resolve: {
     alias: {
-      // Resolve the module-core workspace package directly from source
-      // so Vite handles transpilation — no separate build step needed.
-      "module-core": path.resolve(__dirname, "../../core/src/index.ts"),
       "app-landing": path.resolve(__dirname, "../landing/src/index.tsx"),
     },
   },

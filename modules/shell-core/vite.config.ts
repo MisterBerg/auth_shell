@@ -7,6 +7,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "module-core": path.resolve(__dirname, "../../core/src/index.ts"),
+      "app-landing": path.resolve(__dirname, "../../apps/landing/src/index.tsx"),
     },
   },
   build: {
@@ -17,14 +18,13 @@ export default defineConfig({
       fileName: () => "bundle.js",
     },
     rollupOptions: {
-      external: ["react", "react/jsx-runtime", "react-dom", "module-core"],
+      external: ["react", "react/jsx-runtime", "react-dom"],
       output: {
         exports: "named",
         globals: {
           react: "__React",
           "react/jsx-runtime": "__ReactJsxRuntime",
           "react-dom": "__ReactDOM",
-          "module-core": "__ModuleCore",
         },
       },
     },
