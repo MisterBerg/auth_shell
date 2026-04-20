@@ -12,7 +12,7 @@
     "modules/links": "4171bffb3c396a2b3a65cd301a7ae3c22de5dbc5a8d7c02d94876cd380190f6f",
     "modules/serial-display": "2a6eac80abf122058c7956983cd2337a0eab99d8b65a5e4a241f9b05ef069f9b",
     "modules/task-tracker": "f9db35d55838d07e77e87a3f77dadd4871cf63a8ed769e5104809d564bdb52ae",
-    "modules/kicad-board-viewer": "a1a35f41700e6db383ca7b5b5bb6bbbeddc5a639ade5020eacde1405d0473f9d",
+    "modules/kicad-board-viewer": "b49d3fa3664a8843088da52e120ff442b1892d08c4214b8ebe4136bce69a306e",
     "modules/shell-core": "f842a6376c6e248e648db0d63aebae12f0943e3711ef4565ca4ca2c0fc72ac5b",
     "apps/landing": "43635fe382a14ded017b2d6c5c331a681f289b85b2c8e966543f35af73825e54"
   }

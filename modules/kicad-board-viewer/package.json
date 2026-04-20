@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.943.0",
+    "kicad-board-export": "*",
     "module-core": "*",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
