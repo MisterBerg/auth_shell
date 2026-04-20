@@ -6,6 +6,7 @@
   "jsl": {
     "displayName": "Markdown Viewer",
     "category": "component",
+    "pickerGroup": "Documentation",
     "description": "Tabbed markdown documentation viewer — drag-and-drop a folder to upload a full doc tree to S3"
   },
   "scripts": {

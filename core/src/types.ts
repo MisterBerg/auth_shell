@@ -74,11 +74,19 @@ export type ModuleBundle = {
 
 export type ModuleCategory = "layout" | "app" | "component";
 
+export type ModulePickerGroup =
+  | "Documentation"
+  | "Navigation"
+  | "Productivity"
+  | "Tools"
+  | "Other";
+
 export type ModuleRegistryEntry = {
   moduleName: string;
   displayName?: string;
   description?: string;
   category?: ModuleCategory;
+  pickerGroup?: ModulePickerGroup;
   pickerHidden?: boolean;
   bundleBucket: string;
   bundlePath: string;

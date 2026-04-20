@@ -6,6 +6,7 @@
   "jsl": {
     "displayName": "Web View",
     "category": "component",
+    "pickerGroup": "Navigation",
     "description": "Loads any URL in a full-frame iframe. Set the URL in edit mode."
   },
   "scripts": {

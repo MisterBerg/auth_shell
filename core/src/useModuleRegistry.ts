@@ -1,7 +1,15 @@
 import { useEffect, useState } from "react";
 import { ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { useAwsDdbClient, useTableNames } from "./hooks.ts";
-import type { ModuleRegistryEntry } from "./types.ts";
+import type { ModulePickerGroup, ModuleRegistryEntry } from "./types.ts";
+
+const GROUP_ORDER: Record<ModulePickerGroup, number> = {
+  Documentation: 0,
+  Productivity: 1,
+  Navigation: 2,
+  Tools: 3,
+  Other: 4,
+};
 
 /**
  * Queries the module registry for all published modules (latest versions only).
@@ -33,13 +41,22 @@ export function useModuleRegistry() {
       .then((result) => {
         if (cancelled) return;
         const items = ((result.Items ?? []) as ModuleRegistryEntry[])
-          .filter((entry) => !entry.pickerHidden);
-        // Sort: layouts first, then apps, then components, then uncategorized
-        const order: Record<string, number> = { layout: 0, app: 1, component: 2 };
+          .filter((entry) => !entry.pickerHidden)
+          .map((entry) => ({
+            ...entry,
+            category: entry.category === "app" ? "component" : (entry.category ?? "component"),
+            pickerGroup: entry.pickerGroup ?? "Other",
+          }));
+
         items.sort((a, b) => {
-          const ao = order[a.category ?? ""] ?? 3;
-          const bo = order[b.category ?? ""] ?? 3;
+          const ao = a.category === "layout" ? 0 : 1;
+          const bo = b.category === "layout" ? 0 : 1;
           if (ao !== bo) return ao - bo;
+          if (a.category !== "layout" && b.category !== "layout") {
+            const ag = GROUP_ORDER[a.pickerGroup ?? "Other"] ?? GROUP_ORDER.Other;
+            const bg = GROUP_ORDER[b.pickerGroup ?? "Other"] ?? GROUP_ORDER.Other;
+            if (ag !== bg) return ag - bg;
+          }
           return (a.displayName ?? a.moduleName).localeCompare(b.displayName ?? b.moduleName);
         });
         setEntries(items);

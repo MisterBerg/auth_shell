@@ -6,6 +6,7 @@
   "jsl": {
     "displayName": "User Badge",
     "category": "component",
+    "pickerGroup": "Navigation",
     "description": "User avatar with dropdown for home navigation, notifications, and project settings"
   },
   "scripts": {

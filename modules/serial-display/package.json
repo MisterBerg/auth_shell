@@ -6,6 +6,7 @@
   "jsl": {
     "displayName": "Serial Display",
     "category": "component",
+    "pickerGroup": "Tools",
     "description": "Interactive Web Serial console for discovering ports, viewing text output, and sending commands"
   },
   "scripts": {

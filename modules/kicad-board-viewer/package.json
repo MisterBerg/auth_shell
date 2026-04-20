@@ -6,6 +6,7 @@
   "jsl": {
     "displayName": "KiCad Board Viewer",
     "category": "component",
+    "pickerGroup": "Tools",
     "description": "Interactive KiCad board viewer with net highlighting, trace paths, and connected pad/component details."
   },
   "scripts": {

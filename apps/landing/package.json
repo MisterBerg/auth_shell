@@ -5,7 +5,7 @@
   "type": "module",
   "jsl": {
     "displayName": "Jeffspace",
-    "category": "app",
+    "category": "component",
     "description": "Default organizational project launcher",
     "pickerHidden": true
   },

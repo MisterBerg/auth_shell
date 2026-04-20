@@ -6,6 +6,7 @@
   "jsl": {
     "displayName": "Links",
     "category": "component",
+    "pickerGroup": "Navigation",
     "description": "Responsive row of links. In edit mode, configure each link with display text and a URL."
   },
   "scripts": {

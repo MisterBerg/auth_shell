@@ -5,7 +5,7 @@
   "type": "module",
   "jsl": {
     "displayName": "Protected Shell Core",
-    "category": "app",
+    "category": "component",
     "description": "Authenticated app orchestrator loaded only after OAuth",
     "pickerHidden": true
   },

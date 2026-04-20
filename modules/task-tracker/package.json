@@ -5,7 +5,8 @@
   "type": "module",
   "jsl": {
     "displayName": "Task Tracker",
-    "category": "app",
+    "category": "component",
+    "pickerGroup": "Productivity",
     "description": "Project task list with assignments, notes, attachments, filtering, and portable task import/export"
   },
   "scripts": {

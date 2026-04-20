@@ -6,6 +6,7 @@
   "jsl": {
     "displayName": "Document Viewer",
     "category": "component",
+    "pickerGroup": "Documentation",
     "description": "Upload and view PDF documents stored in S3."
   },
   "scripts": {

@@ -6,6 +6,7 @@
   "jsl": {
     "displayName": "Documentation Editor",
     "category": "component",
+    "pickerGroup": "Documentation",
     "description": "Manifest-backed markdown documentation editor with a page tree and exportable filesystem output."
   },
   "scripts": {

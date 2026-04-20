@@ -218,6 +218,7 @@ async function main() {
     displayName?: string;
     category?: string;
     description?: string;
+    pickerGroup?: string;
     pickerHidden?: boolean;
   };
   const jsl: JslMeta = existsSync(pkgPath)
@@ -236,6 +237,7 @@ async function main() {
       displayName: jsl.displayName,
       category: jsl.category,
       description: jsl.description,
+      pickerGroup: jsl.pickerGroup,
       pickerHidden: jsl.pickerHidden,
       publishedAt: now,
     },
@@ -254,6 +256,7 @@ async function main() {
       displayName: jsl.displayName,
       category: jsl.category,
       description: jsl.description,
+      pickerGroup: jsl.pickerGroup,
       pickerHidden: jsl.pickerHidden,
       updatedAt: now,
     },

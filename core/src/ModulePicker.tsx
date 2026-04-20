@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { useModuleRegistry } from "./useModuleRegistry.ts";
-import type { ModuleRegistryEntry, ModuleCategory } from "./types.ts";
+import type { ModulePickerGroup, ModuleRegistryEntry } from "./types.ts";
 
 type ModulePickerProps = {
   onSelect: (entry: ModuleRegistryEntry) => void;
@@ -10,18 +10,12 @@ type ModulePickerProps = {
   errorMessage?: string;
 };
 
-const CATEGORY_LABELS: Record<ModuleCategory | "unknown", string> = {
-  layout: "Layouts",
-  app: "Apps",
-  component: "Components",
-  unknown: "Other",
-};
-
-const CATEGORY_DESCRIPTIONS: Record<ModuleCategory | "unknown", string> = {
-  layout: "Organizational frames with configurable child slots",
-  app: "Self-contained full-frame applications",
-  component: "Panels and widgets designed to live inside a layout",
-  unknown: "Uncategorized modules",
+const GROUP_DESCRIPTIONS: Record<ModulePickerGroup, string> = {
+  Documentation: "Viewers and editors for project knowledge, notes, and reference material",
+  Productivity: "Task-oriented workspace components that support planning and execution",
+  Navigation: "Widgets that help users move through the project or reach external destinations",
+  Tools: "Interactive engineering and utility panels for device and project work",
+  Other: "General-purpose components that have not been grouped yet",
 };
 
 /**
@@ -39,16 +33,18 @@ export function ModulePicker({ onSelect, onCancel, headerOverride, errorMessage 
     return () => window.removeEventListener("keydown", handler);
   }, [onCancel]);
 
-  // Group entries by category
-  const grouped = entries.reduce<Record<string, ModuleRegistryEntry[]>>((acc, entry) => {
-    const cat = entry.category ?? "unknown";
-    if (!acc[cat]) acc[cat] = [];
-    acc[cat].push(entry);
+  const layouts = entries.filter((entry) => entry.category === "layout");
+  const components = entries.filter((entry) => entry.category !== "layout");
+
+  const grouped = components.reduce<Record<string, ModuleRegistryEntry[]>>((acc, entry) => {
+    const group = entry.pickerGroup ?? "Other";
+    if (!acc[group]) acc[group] = [];
+    acc[group].push(entry);
     return acc;
   }, {});
 
-  const categoryOrder: (ModuleCategory | "unknown")[] = ["layout", "app", "component", "unknown"];
-  const presentCategories = categoryOrder.filter((c) => grouped[c]?.length);
+  const groupOrder: ModulePickerGroup[] = ["Documentation", "Productivity", "Navigation", "Tools", "Other"];
+  const presentGroups = groupOrder.filter((group) => grouped[group]?.length);
 
   return createPortal(
     // Backdrop
@@ -139,18 +135,36 @@ export function ModulePicker({ onSelect, onCancel, headerOverride, errorMessage 
             </p>
           )}
 
-          {presentCategories.map((cat) => (
-            <section key={cat} style={{ marginBottom: "1.5rem" }}>
+          {layouts.length > 0 && (
+            <section style={{ marginBottom: "1.5rem" }}>
               <div style={{ marginBottom: "0.5rem" }}>
                 <h3 style={{ margin: 0, fontSize: "0.8rem", fontWeight: 600, color: "#9ca3af", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                  {CATEGORY_LABELS[cat]}
+                  Layouts
                 </h3>
                 <p style={{ margin: "0.1rem 0 0", fontSize: "0.75rem", color: "#4b5563" }}>
-                  {CATEGORY_DESCRIPTIONS[cat]}
+                  Organizational frames with configurable child slots
                 </p>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: "0.375rem" }}>
-                {grouped[cat].map((entry) => (
+                {layouts.map((entry) => (
+                  <ModuleCard key={entry.moduleName} entry={entry} onSelect={onSelect} />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {presentGroups.map((group) => (
+            <section key={group} style={{ marginBottom: "1.5rem" }}>
+              <div style={{ marginBottom: "0.5rem" }}>
+                <h3 style={{ margin: 0, fontSize: "0.8rem", fontWeight: 600, color: "#9ca3af", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                  {group}
+                </h3>
+                <p style={{ margin: "0.1rem 0 0", fontSize: "0.75rem", color: "#4b5563" }}>
+                  {GROUP_DESCRIPTIONS[group]}
+                </p>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.375rem" }}>
+                {grouped[group].map((entry) => (
                   <ModuleCard key={entry.moduleName} entry={entry} onSelect={onSelect} />
                 ))}
               </div>
