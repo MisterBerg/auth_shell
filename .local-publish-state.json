@@ -1,18 +1,19 @@
 {
   "workspaces": {
-    "layouts/top-left": "9a4faf04aaf425211fe30b14605b7ea3ca1768fadd1e9096a08f97835f3ca407",
-    "layouts/tabs-top": "7bfa72fd77862c293544eb0996a5a5e134ebed7ae504354b50d5b9318bf7c804",
-    "layouts/tabs-left": "7b556b6efa87ec4ddde8b2037930b658df923f2fce2839106ac3689d445847d3",
-    "layouts/left-right-columns": "6c1f0a83e74c06a6ceb83b00a0b10f807971bb7646ae15a2d6cbfff5d5aea294",
-    "modules/webview": "4e074ae4415b05be79d6dcceb5bd514e72a00534f91238336b6777d6c4bbc79a",
-    "modules/oauth-badge": "ffe868660172a33c27f863486ce79566a05a67b49ff819353c2a6b417102f497",
-    "modules/markdown-viewer": "5dafbcc1cc94c1e480426cc95fbb28f916e97481ee735fed3767ed0f727253fa",
-    "modules/document-viewer": "6b63b184156cbdfeba686896617ea3b4400d05c55d3e0a9dbfb04ef6d8e66cfa",
-    "modules/documentation-viewer": "4ee7e7754af3805f4876b7281bc853b57966521b63f9c0202429600554333504",
-    "modules/links": "100569eaf49326f808e3a052886af181506e8ff86152f3ecd2f26917dfecff82",
-    "modules/serial-display": "f413f36611cae494ac3f76b6008bed4fd778e9aaf85d2db01d4db58d084df58a",
-    "modules/task-tracker": "ba8e4e55dfd7a15f23bb5a69371873f7304ba18ab31794e2283f63c9c144742e",
-    "modules/kicad-board-viewer": "4c89ab2733a2a0a3462d8cf0c0e3f31ce78ee5919c14f5c6d02e0a6875f682ca",
-    "modules/shell-core": "34d83799cf2da6f43a85b452396ee9a2130bb75b8cb89d5b60d3dae24169ec2d"
+    "layouts/top-left": "fa7ac088d3af60dcfb84c14fee06a00b83375907ce49de4ff068acd0bcf31745",
+    "layouts/tabs-top": "b44be2cc74182d8b58e47fd69b12780ff49f32766184b3958a7e7731013d6905",
+    "layouts/tabs-left": "1a59d9e3ff75a70bb69191dbaec1649dce4bff9fb99269b4015282ae50e5b9fa",
+    "layouts/left-right-columns": "3d635cddf4a2ffa1078f09cc9943cebe90d2f09e578d98e7ce0ef7598d8554e3",
+    "modules/webview": "168f4657ef3fb03b0091c20c9292040f2bd6dfcc5230752de874c699fa674e25",
+    "modules/oauth-badge": "6a58ed8dc1bc16ea884ea917515cb656b422efba46b35f187100da84e087a6b1",
+    "modules/markdown-viewer": "94a00332adcf96fbae7345bb0cab2e6df7a0f2c82bb1e8be5683b2857a48ee5f",
+    "modules/document-viewer": "cc65f92e3dd1161150040628bcdba4a8381791f3dc969f9f79d10bc7cb7661dd",
+    "modules/documentation-viewer": "8c28a91da7676298bc08415d6714222fbbc256d68c68faa1721d0ccdb97b4e84",
+    "modules/links": "f7aef0d242243030b79724b2890883ab2d40089ad3de6ebd1cf03eb1759faa9e",
+    "modules/serial-display": "c17b31c7386152530388a7518e40817e76b3b533467495440f5f2ec7e7c53a28",
+    "modules/task-tracker": "91ff2af3d32d5e7d8759584fc9322ec9cb6146131a0647ea7977b0aaf284576e",
+    "modules/kicad-board-viewer": "35345ce84cb738285b9ce05b2844ae1b1f963c64600d287cf592b2168c44b21a",
+    "modules/shell-core": "9997f1309b7227a2811fdf3defc669b809cf7bc29abde37048832dc0f64d9c55",
+    "apps/landing": "9c809d2e79cf826e78088e7c5d24524bc10982a68c5f1104ffdbcba9ed3cc0d5"
   }
 }

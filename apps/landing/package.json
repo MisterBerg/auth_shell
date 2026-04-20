@@ -3,6 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "jsl": {
+    "displayName": "Jeffspace",
+    "category": "app",
+    "description": "Default organizational project launcher",
+    "pickerHidden": true
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

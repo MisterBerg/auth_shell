@@ -214,7 +214,12 @@ async function main() {
 
   // Read optional jsl metadata from the module's package.json
   const pkgPath = join(modulePath, "package.json");
-  type JslMeta = { displayName?: string; category?: string; description?: string };
+  type JslMeta = {
+    displayName?: string;
+    category?: string;
+    description?: string;
+    pickerHidden?: boolean;
+  };
   const jsl: JslMeta = existsSync(pkgPath)
     ? ((JSON.parse(readFileSync(pkgPath, "utf-8")) as { jsl?: JslMeta }).jsl ?? {})
     : {};
@@ -231,6 +236,7 @@ async function main() {
       displayName: jsl.displayName,
       category: jsl.category,
       description: jsl.description,
+      pickerHidden: jsl.pickerHidden,
       publishedAt: now,
     },
   }));
@@ -248,6 +254,7 @@ async function main() {
       displayName: jsl.displayName,
       category: jsl.category,
       description: jsl.description,
+      pickerHidden: jsl.pickerHidden,
       updatedAt: now,
     },
   }));

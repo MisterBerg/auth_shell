@@ -32,7 +32,8 @@ export function useModuleRegistry() {
       )
       .then((result) => {
         if (cancelled) return;
-        const items = (result.Items ?? []) as ModuleRegistryEntry[];
+        const items = ((result.Items ?? []) as ModuleRegistryEntry[])
+          .filter((entry) => !entry.pickerHidden);
         // Sort: layouts first, then apps, then components, then uncategorized
         const order: Record<string, number> = { layout: 0, app: 1, component: 2 };
         items.sort((a, b) => {

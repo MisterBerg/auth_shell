@@ -79,6 +79,7 @@ export type ModuleRegistryEntry = {
   displayName?: string;
   description?: string;
   category?: ModuleCategory;
+  pickerHidden?: boolean;
   bundleBucket: string;
   bundlePath: string;
   ownerId?: string;

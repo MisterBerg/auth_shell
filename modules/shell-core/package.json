@@ -6,7 +6,8 @@
   "jsl": {
     "displayName": "Protected Shell Core",
     "category": "app",
-    "description": "Authenticated app orchestrator loaded only after OAuth"
+    "description": "Authenticated app orchestrator loaded only after OAuth",
+    "pickerHidden": true
   },
   "scripts": {
     "build": "tsc -b && vite build"
