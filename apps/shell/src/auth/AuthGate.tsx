@@ -13,6 +13,7 @@ import { useAuthStore, type AwsCredentials } from "../stores/authStore.ts";
 import { initAuthShell } from "./googleCognito.ts";
 
 type PublicRuntimeEnv = {
+  isLocalDev: boolean;
   localBuckets: string[];
   localS3Endpoint?: string;
   localDdbEndpoint?: string;
@@ -82,6 +83,7 @@ class ModuleErrorBoundary extends Component<
 
 function getRuntimeEnv(): PublicRuntimeEnv {
   return {
+    isLocalDev: Boolean(import.meta.env.DEV),
     localBuckets: (
       (import.meta.env.VITE_LOCAL_BUCKETS as string | undefined) ?? ""
     )

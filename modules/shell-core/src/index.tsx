@@ -55,6 +55,7 @@ type ShellConfig = {
 };
 
 type PublicRuntimeEnv = {
+  isLocalDev: boolean;
   localBuckets: string[];
   localS3Endpoint?: string;
   localDdbEndpoint?: string;
@@ -192,7 +193,7 @@ function createAwsClients(
 
   return {
     getDdbDocClient: async () => {
-      const useLocal = import.meta.env.DEV && Boolean(runtimeEnv.localDdbEndpoint);
+      const useLocal = runtimeEnv.isLocalDev && Boolean(runtimeEnv.localDdbEndpoint);
 
       if (useLocal) {
         if (!localDdbClient) {
@@ -228,7 +229,7 @@ function createAwsClients(
 
     getS3Client: async (bucket?: string) => {
       const useLocal =
-        import.meta.env.DEV &&
+        runtimeEnv.isLocalDev &&
         Boolean(runtimeEnv.localS3Endpoint) &&
         isLocalBucket(runtimeEnv, bucket);
 
@@ -337,7 +338,13 @@ function EditModeBar() {
   );
 }
 
-function ShellCoreApp({ shellConfig }: { shellConfig: ShellConfig }) {
+function ShellCoreApp({
+  shellConfig,
+  runtimeEnv,
+}: {
+  shellConfig: ShellConfig;
+  runtimeEnv: PublicRuntimeEnv;
+}) {
   const getS3Client = moduleCore.useAwsS3Client();
   const registerResources = useRegisterResources();
 
@@ -366,7 +373,7 @@ function ShellCoreApp({ shellConfig }: { shellConfig: ShellConfig }) {
   }, [shellConfig]);
 
   const LazyApp = useMemo(() => {
-    if (moduleLocation.isDefault && import.meta.env.DEV) {
+    if (moduleLocation.isDefault && runtimeEnv.isLocalDev) {
       return React.lazy(async (): Promise<{ default: React.ComponentType }> => {
         const { default: LandingApp } = await import("app-landing");
         const devConfig: ModuleConfig = {
@@ -394,7 +401,7 @@ function ShellCoreApp({ shellConfig }: { shellConfig: ShellConfig }) {
       Bound.displayName = "RootModule";
       return { default: Bound };
     });
-  }, [moduleLocation]);
+  }, [moduleLocation, runtimeEnv.isLocalDev]);
 
   const locationKey = `${moduleLocation.bucket}/${moduleLocation.configPath}`;
 
@@ -432,7 +439,7 @@ export default function ProtectedShellCore(props: ProtectedShellCoreProps) {
     <ResourceRegistryProvider>
       <EditModeProvider>
         <ShellAuthProvider {...props}>
-          <ShellCoreApp shellConfig={props.shellConfig} />
+          <ShellCoreApp shellConfig={props.shellConfig} runtimeEnv={props.runtimeEnv} />
         </ShellAuthProvider>
       </EditModeProvider>
     </ResourceRegistryProvider>
