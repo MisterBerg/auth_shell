@@ -26,8 +26,12 @@ export const CONFIG: AppConfig = {
     bucket: import.meta.env.DEV ? "hep-dev-registry" : "jeffspace-registry",
     key: "modules/module-shell-core/bundle.js",
   },
-  defaultAppBucket: "jeffspace-modules",
-  defaultAppConfigPath: "apps/landing/config.json",
+  defaultAppBucket: import.meta.env.DEV
+    ? (import.meta.env.VITE_LOCAL_DEFAULT_APP_BUCKET as string | undefined) ?? "hep-dev-modules"
+    : "jeffspace-modules",
+  defaultAppConfigPath: import.meta.env.DEV
+    ? (import.meta.env.VITE_LOCAL_DEFAULT_APP_CONFIG as string | undefined) ?? "projects/dev-dev/config.json"
+    : "apps/landing/config.json",
   tables: {
     registry: import.meta.env.DEV ? "module-registry"      : "jeffspace-module-registry",
     projects: import.meta.env.DEV ? "org-projects"         : "jeffspace-projects",

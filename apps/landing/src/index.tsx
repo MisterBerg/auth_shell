@@ -10,6 +10,33 @@ import { useMyProjects, useSharedProjects, useCreateProject } from "./useProject
 import type { CreatedProject } from "./useProjects.ts";
 import type { ProjectRecord } from "./types.ts";
 
+const LOCAL_OWNER_KEY = "jsl:localOwnerEmail";
+
+function resolveLocalOwnerEmail(): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  if (!["localhost", "127.0.0.1"].includes(window.location.hostname)) return undefined;
+
+  try {
+    const saved = sessionStorage.getItem(LOCAL_OWNER_KEY)?.trim().toLowerCase();
+    if (saved) return saved;
+  } catch {
+    // ignore session storage access errors in dev
+  }
+
+  const params = new URLSearchParams(window.location.search);
+  const configPath = params.get("config") ?? "";
+  const match = configPath.match(/^projects\/([^/]+)-dev\/config\.json$/i);
+  if (!match) return undefined;
+
+  const ownerEmail = `${match[1].toLowerCase()}@local.dev`;
+  try {
+    sessionStorage.setItem(LOCAL_OWNER_KEY, ownerEmail);
+  } catch {
+    // ignore session storage access errors in dev
+  }
+  return ownerEmail;
+}
+
 /**
  * Jeffspace — the default organizational project launcher.
  *
@@ -23,7 +50,7 @@ export default function JeffspaceApp({ config }: ModuleProps) {
   const getS3ClientRef = useRef(getS3Client);
   getS3ClientRef.current = getS3Client;
 
-  const userId = userProfile?.email ?? "";
+  const userId = resolveLocalOwnerEmail() ?? userProfile?.email ?? "";
   const projectsBucket = (config.meta?.projectsBucket as string | undefined) ?? config.app.bucket;
 
   const { projects: myProjects, loading: myLoading, error: myError, reload: reloadMine } = useMyProjects(userId);
