@@ -3,6 +3,11 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "jsl": {
+    "displayName": "Landing App",
+    "category": "apps",
+    "description": "Project landing and launcher app"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
