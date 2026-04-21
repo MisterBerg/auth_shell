@@ -1,8 +1,9 @@
 /**
  * seed-local.ts
  *
- * Creates a developer sandbox in the local Docker environment (MinIO + DynamoDB Local).
- * Run this once after `docker compose up` to scaffold a dev project.
+ * Creates or refreshes a developer sandbox in the local Docker environment
+ * (MinIO + DynamoDB Local). This is the provisioning step used by
+ * `reset-local.ts`; `update-locals.ts` is a separate incremental publish flow.
  *
  * Usage:
  *   npx tsx scripts/seed-local.ts --developer=jeff
@@ -252,7 +253,7 @@ async function main() {
   console.log(`
 Done! Start the shell with:
 
-  cd auth-shell
+  cd apps/shell
   cp ../.env.local.example .env.local        # if not already done
   # edit .env.local — set VITE_LOCAL_BUCKETS=${MODULES_BUCKET},${REGISTRY_BUCKET}
   npm run dev

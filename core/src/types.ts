@@ -97,7 +97,7 @@ export type ModuleRegistryEntry = {
 
 // ---------------------------------------------------------------------------
 // Auth types — defined here so module-core hooks can reference them without
-// depending on auth-shell's Zustand store.
+// depending on the shell app's internal state store.
 // ---------------------------------------------------------------------------
 
 export type AwsCredentials = {

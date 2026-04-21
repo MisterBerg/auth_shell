@@ -1,6 +1,6 @@
 /**
  * Dev-only entry point. Mounts the landing app with stub context providers
- * so it can be developed and tested without the auth-shell or real AWS.
+ * so it can be developed and tested without the shell app or real AWS.
  *
  * This file is NOT included in the production bundle (vite lib mode uses
  * src/index.tsx as the entry). It is only served by `vite dev`.

@@ -36,7 +36,7 @@ If no `?bucket=&config=` params are present, the shell loads Jeffspace from a we
 
 Users may host valid modules in their own S3 buckets — IAM controls actual access. The shell does not restrict which buckets are valid sources.
 
-### Auth Shell (`auth-shell`)
+### Shell Host (`apps/shell` + `module-shell-core`)
 
 Responsibilities:
 - Authenticate the user (Google Sign-In → AWS Cognito Identity Pool → temporary AWS credentials)
@@ -435,11 +435,12 @@ export async function onExport(ctx: {
 
 | Package | Purpose | Status |
 |---|---|---|
-| `auth-shell` | Host application: auth, config resolution, module bootstrapping, SPA navigation | Working |
+| `apps/shell` | Public shell host: sign-in UI, first-stage bootstrap, protected bundle loader | Working |
+| `module-shell-core` | Authenticated runtime: contexts, AWS clients, root module navigation/loading | Working |
 | `module-core` | Shared types, `<SlotContainer>`, `loadModule()`, `ModulePicker`, `useModuleRegistry`, contexts, hooks | Working |
 | `app-landing` | Jeffspace — the default organizational project launcher | Working |
 | `module-template` | Starter template for new modules | Working |
-| `scripts/` | `seed-local.ts`, `publish-module.ts` | Working |
+| `scripts/` | `reset-local.ts`, `seed-local.ts`, `update-locals.ts`, `publish-module.ts` | Working |
 
 Planned:
 | Package | Purpose |

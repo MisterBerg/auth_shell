@@ -5,7 +5,7 @@ import type { AwsCredentials, UserProfile, Resource } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Auth context
-// Provided by auth-shell. Gives any module access to the authenticated user's
+// Provided by the shell runtime. Gives any module access to the authenticated user's
 // identity and pre-configured AWS clients without prop drilling.
 // ---------------------------------------------------------------------------
 
