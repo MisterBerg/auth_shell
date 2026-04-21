@@ -1,12 +1,12 @@
 import { useState, useCallback, useRef } from "react";
 import type { ModuleProps, ModuleRegistryEntry } from "module-core";
 import { useUserProfile, useAwsS3Client, ModulePicker } from "module-core";
-import { PutObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { TopBar } from "./TopBar.tsx";
 import { ProjectTabs } from "./ProjectTabs.tsx";
 import { ProjectDetails } from "./ProjectDetails.tsx";
 import { NewProjectDialog } from "./NewProjectDialog.tsx";
-import { useMyProjects, useSharedProjects, useCreateProject } from "./useProjects.ts";
+import { createProjectDraft, useMyProjects, useSharedProjects, useCreateProject } from "./useProjects.ts";
 import type { CreatedProject } from "./useProjects.ts";
 import type { ProjectRecord } from "./types.ts";
 
@@ -82,20 +82,20 @@ export default function JeffspaceApp({ config }: ModuleProps) {
     navigateTo(project.rootBucket, project.rootConfigPath);
   }, [navigateTo]);
 
-  // Step 1: user fills in name + description → create DDB record → show picker
+  // Step 1: user fills in name + description → prepare draft → show picker
   const handleNewProjectConfirm = useCallback(async (displayName: string, description: string) => {
-    const created = await createProject({
+    const draft = createProjectDraft({
       userId,
       displayName,
       description: description || undefined,
       projectsBucket,
     });
     setShowNewDialog(false);
-    setPendingProject(created);
+    setPendingProject(draft);
     setAssignError(undefined);
-  }, [userId, projectsBucket, createProject]);
+  }, [userId, projectsBucket]);
 
-  // Step 2: user picks a root module → write config.json → navigate
+  // Step 2: user picks a root module → write config.json → persist project → navigate
   const handleModuleSelected = useCallback(async (entry: ModuleRegistryEntry) => {
     if (!pendingProject) return;
     setAssignError(undefined);
@@ -108,6 +108,7 @@ export default function JeffspaceApp({ config }: ModuleProps) {
       children: [],
     };
 
+    let configWritten = false;
     try {
       const s3 = await getS3ClientRef.current(pendingProject.rootBucket);
       await s3.send(new PutObjectCommand({
@@ -116,23 +117,34 @@ export default function JeffspaceApp({ config }: ModuleProps) {
         Body: JSON.stringify(rootConfig, null, 2),
         ContentType: "application/json",
       }));
+      configWritten = true;
+
+      await createProject(pendingProject);
     } catch (err: unknown) {
-      setAssignError(`Failed to save project config: ${(err as Error).message}`);
+      if (configWritten) {
+        try {
+          const s3 = await getS3ClientRef.current(pendingProject.rootBucket);
+          await s3.send(new DeleteObjectCommand({
+            Bucket: pendingProject.rootBucket,
+            Key: pendingProject.rootConfigPath,
+          }));
+        } catch {
+          // Best-effort cleanup if the project record write fails after config upload.
+        }
+      }
+      setAssignError((err as Error).message);
       return;
     }
 
     reloadMine();
     setPendingProject(undefined);
     navigateTo(pendingProject.rootBucket, pendingProject.rootConfigPath);
-  }, [pendingProject, reloadMine, navigateTo]);
+  }, [createProject, pendingProject, reloadMine, navigateTo]);
 
   const handlePickerCancel = useCallback(() => {
-    // Project DDB record exists but has no config — user can retry by clicking the project
-    // if they want, or we just leave it. For now, dismiss without navigating.
     setPendingProject(undefined);
     setAssignError(undefined);
-    reloadMine();
-  }, [reloadMine]);
+  }, []);
 
   return (
     <div
@@ -184,7 +196,7 @@ export default function JeffspaceApp({ config }: ModuleProps) {
         />
       )}
 
-      {/* Step 2: module picker shown after project record is created */}
+      {/* Step 2: module picker shown while the project is still only an in-memory draft */}
       {pendingProject && (
         <ModulePicker
           onSelect={handleModuleSelected}

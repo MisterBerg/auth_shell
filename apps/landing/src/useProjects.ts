@@ -103,9 +103,8 @@ export function useSharedProjects(userId: string | undefined) {
 }
 
 // ---------------------------------------------------------------------------
-// Create project — writes only the DynamoDB record.
-// The caller (Jeffspace) shows the module picker after this returns, then
-// writes the S3 config.json once the user has selected a root module.
+// Create project record — persists a fully-prepared project only after the
+// caller has successfully written the root config.json.
 // ---------------------------------------------------------------------------
 
 export type CreateProjectArgs = {
@@ -120,43 +119,43 @@ export type CreatedProject = Pick<
   "userId" | "projectId" | "rootBucket" | "rootConfigPath" | "displayName" | "description" | "createdAt" | "updatedAt" | "role"
 >;
 
+export function createProjectDraft(args: CreateProjectArgs): CreatedProject {
+  const { userId, displayName, description, projectsBucket } = args;
+
+  const slug = displayName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 40);
+  const projectId = `${slug}-${Date.now().toString(36)}`;
+  const now = new Date().toISOString();
+  const rootConfigPath = `projects/${projectId}/config.json`;
+
+  return {
+    userId,
+    projectId,
+    role: "owner",
+    rootBucket: projectsBucket,
+    rootConfigPath,
+    displayName,
+    description,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
 export function useCreateProject() {
   const getDdbClient = useAwsDdbClient();
   const getDdbClientRef = useRef(getDdbClient);
   useEffect(() => { getDdbClientRef.current = getDdbClient; });
   const { projects: projectsTable } = useTableNames();
 
-  return useCallback(async (args: CreateProjectArgs): Promise<CreatedProject> => {
-    const { userId, displayName, description, projectsBucket } = args;
-
-    const slug = displayName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 40);
-    const projectId = `${slug}-${Date.now().toString(36)}`;
-    const now = new Date().toISOString();
-    const rootConfigPath = `projects/${projectId}/config.json`;
-
-    const record: CreatedProject = {
-      userId,
-      projectId,
-      role: "owner",
-      rootBucket: projectsBucket,
-      rootConfigPath,
-      displayName,
-      description,
-      createdAt: now,
-      updatedAt: now,
-    };
-
+  return useCallback(async (record: CreatedProject): Promise<void> => {
     const ddb = await getDdbClientRef.current();
     try {
       await ddb.send(new PutCommand({ TableName: projectsTable, Item: record }));
     } catch (err: unknown) {
       throw new Error(`Failed to create project: ${(err as Error).message}`);
     }
-
-    return record;
   }, [projectsTable]);
 }
