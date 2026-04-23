@@ -112,3 +112,31 @@ export type UserProfile = {
   name?: string;
   picture?: string;
 };
+
+// ---------------------------------------------------------------------------
+// Runtime UI navigation
+// Shared in-memory target registry for reveal/highlight interactions.
+// ---------------------------------------------------------------------------
+
+export type UiTargetKind = "layout" | "tab" | "slot" | "module" | "target";
+
+export type UiTargetRegistration = {
+  id: string;
+  kind: UiTargetKind;
+  parentId?: string;
+  label?: string;
+  reveal?: () => void | Promise<void>;
+};
+
+// ---------------------------------------------------------------------------
+// Runtime link authoring
+// In-memory only. Sources decide how to persist the authored link.
+// ---------------------------------------------------------------------------
+
+export type LinkAuthoringStep = "idle" | "select-source" | "source-selected" | "select-target" | "saving";
+
+export type LinkSourceRegistration = {
+  id: string;
+  label?: string;
+  commitLink: (targetId: string) => void | Promise<void>;
+};

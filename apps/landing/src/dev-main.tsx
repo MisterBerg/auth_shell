@@ -7,7 +7,7 @@
  */
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { AuthProvider, ResourceRegistryProvider, EditModeProvider } from "module-core";
+import { AuthProvider, ResourceRegistryProvider, EditModeProvider, UiNavigationProvider, LinkAuthoringProvider } from "module-core";
 import type { AuthContextValue, ModuleConfig } from "module-core";
 import LandingApp from "./index.tsx";
 
@@ -36,11 +36,15 @@ const mockConfig: ModuleConfig = {
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <ResourceRegistryProvider>
-      <EditModeProvider>
-        <AuthProvider {...mockAuthValue}>
-          <LandingApp config={mockConfig} />
-        </AuthProvider>
-      </EditModeProvider>
+      <UiNavigationProvider>
+        <LinkAuthoringProvider>
+          <EditModeProvider>
+            <AuthProvider {...mockAuthValue}>
+              <LandingApp config={mockConfig} />
+            </AuthProvider>
+          </EditModeProvider>
+        </LinkAuthoringProvider>
+      </UiNavigationProvider>
     </ResourceRegistryProvider>
   </React.StrictMode>
 );

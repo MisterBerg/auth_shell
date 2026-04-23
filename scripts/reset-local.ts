@@ -65,6 +65,36 @@ function run(cmd: string, cwd?: string) {
   execSync(cmd, { cwd: cwd ?? ROOT, stdio: "inherit" });
 }
 
+function installedPackageVersion(pkgName: string): string | undefined {
+  const pkgPath = join(ROOT, "node_modules", ...pkgName.split("/"), "package.json");
+  if (!existsSync(pkgPath)) return undefined;
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8")) as { version?: string };
+    return pkg.version;
+  } catch {
+    return undefined;
+  }
+}
+
+function ensurePlatformNativeTooling() {
+  if (process.platform !== "darwin" || process.arch !== "arm64") return;
+
+  const installs: string[] = [];
+  if (!existsSync(join(ROOT, "node_modules", "@rollup", "rollup-darwin-arm64"))) {
+    const version = installedPackageVersion("rollup");
+    if (version) installs.push(`@rollup/rollup-darwin-arm64@${version}`);
+  }
+  if (!existsSync(join(ROOT, "node_modules", "@esbuild", "darwin-arm64"))) {
+    const version = installedPackageVersion("esbuild");
+    if (version) installs.push(`@esbuild/darwin-arm64@${version}`);
+  }
+
+  if (installs.length === 0) return;
+
+  console.log("  Restoring platform-native optional packages…");
+  run(`npm install --no-save ${installs.join(" ")}`);
+}
+
 // Locate the podman binary. Tries PATH first, then the known Windows install path.
 function podmanBin(): string {
   for (const candidate of ["podman", "C:\\Program Files\\RedHat\\Podman\\podman.exe"]) {
@@ -199,6 +229,7 @@ async function main() {
   // 1. Install dependencies
   heading(++step, TOTAL, "Install workspace dependencies");
   run("npm install");
+  ensurePlatformNativeTooling();
 
   // 2. Restart containers
   if (!noCompose) {

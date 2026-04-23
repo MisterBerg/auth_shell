@@ -1,6 +1,17 @@
 import React, { useState, useCallback, useRef, useEffect } from "react";
 import type { ModuleProps, ChildSlot, ModuleRegistryEntry } from "module-core";
-import { useEditMode, useAwsS3Client, useUpdateSlotChildren, ModulePicker, SlotContainer } from "module-core";
+import {
+  useEditMode,
+  useAwsS3Client,
+  useUpdateSlotChildren,
+  useParentUiTargetId,
+  useRegisterUiTarget,
+  useIsTargetHighlighted,
+  useLinkAuthoring,
+  useLinkAuthoringStep,
+  ModulePicker,
+  SlotContainer,
+} from "module-core";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 
 // ---------------------------------------------------------------------------
@@ -9,6 +20,14 @@ import { PutObjectCommand } from "@aws-sdk/client-s3";
 
 function getTabName(slot: ChildSlot): string {
   return (slot.meta as { tabName?: string } | undefined)?.tabName ?? slot.slotId;
+}
+
+function getLayoutTargetId(parentTargetId: string | undefined, configId: string): string {
+  return `${parentTargetId ?? "root"}:layout:${configId}`;
+}
+
+function getTabTargetId(layoutTargetId: string, slotId: string): string {
+  return `${layoutTargetId}:tab:${slotId}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -34,8 +53,10 @@ export default function LayoutTabsTop({ config }: ModuleProps) {
   const getS3Client        = useAwsS3Client();
   const getS3ClientRef     = useRef(getS3Client);
   const updateSlotChildren = useUpdateSlotChildren(); // null when this is the root layout
+  const parentTargetId     = useParentUiTargetId();
   const isRootLayout       = !updateSlotChildren;
   getS3ClientRef.current   = getS3Client;
+  const layoutTargetId     = getLayoutTargetId(parentTargetId, config.id);
 
   const [slots, setSlots] = useState<ChildSlot[]>(config.children ?? []);
   useEffect(() => { setSlots(config.children ?? []); }, [config]);
@@ -125,6 +146,13 @@ export default function LayoutTabsTop({ config }: ModuleProps) {
 
   const liveConfig = { ...config, children: slots };
 
+  useRegisterUiTarget({
+    id: layoutTargetId,
+    kind: "layout",
+    parentId: parentTargetId,
+    label: config.id,
+  });
+
   return (
     <div
       style={{
@@ -140,60 +168,34 @@ export default function LayoutTabsTop({ config }: ModuleProps) {
       <div style={{ display: "flex", alignItems: "stretch", background: C.bgBar, borderBottom: `1px solid ${C.border}`, height: 38, flexShrink: 0, overflowX: "auto" }}>
 
         {slots.map((slot) => {
+          const tabTargetId = getTabTargetId(layoutTargetId, slot.slotId);
           const isActive = slot.slotId === activeId;
           return (
-            <div
+            <TabChip
               key={slot.slotId}
-              onClick={() => { if (editingId !== slot.slotId) { setActiveId(slot.slotId); setEverActive((prev) => new Set([...prev, slot.slotId])); } }}
-              style={{
-                display: "flex", alignItems: "center", gap: "0.4rem",
-                padding: "0 0.75rem", flexShrink: 0, minWidth: 0, maxWidth: 200,
-                background: isActive ? C.tabActive : "transparent",
-                borderRight: `1px solid ${C.border}`,
-                borderBottom: isActive ? `2px solid ${C.accent}` : "2px solid transparent",
-                cursor: "pointer", userSelect: "none",
+              slot={slot}
+              targetId={tabTargetId}
+              editMode={editMode}
+              isActive={isActive}
+              isEditing={editingId === slot.slotId}
+              renameInputRef={renameInputRef}
+              draft={draft}
+              setDraft={setDraft}
+              onActivate={() => {
+                if (editingId !== slot.slotId) {
+                  setActiveId(slot.slotId);
+                  setEverActive((prev) => new Set([...prev, slot.slotId]));
+                }
               }}
-            >
-              {editingId === slot.slotId ? (
-                <input
-                  ref={renameInputRef}
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onBlur={() => commitRename(slot.slotId)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter")  { e.preventDefault(); commitRename(slot.slotId); }
-                    if (e.key === "Escape") setEditingId(null);
-                  }}
-                  onClick={(e) => e.stopPropagation()}
-                  autoFocus
-                  style={{ width: 100, background: "#0a1525", border: `1px solid ${C.accent}`, borderRadius: 3, color: C.text, fontSize: "0.78rem", padding: "2px 5px", outline: "none", fontFamily: "inherit" }}
-                />
-              ) : (
-                <span
-                  onDoubleClick={(e) => {
-                    if (!editMode) return;
-                    e.stopPropagation();
-                    setEditingId(slot.slotId);
-                    setDraft(getTabName(slot));
-                    setTimeout(() => renameInputRef.current?.select(), 30);
-                  }}
-                  title={editMode ? "Double-click to rename" : getTabName(slot)}
-                  style={{ fontSize: "0.8rem", color: isActive ? C.text : C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}
-                >
-                  {getTabName(slot)}
-                </span>
-              )}
-
-              {editMode && (
-                <button
-                  onClick={(e) => { e.stopPropagation(); handleRemoveSlot(slot.slotId); }}
-                  title="Remove tab"
-                  style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: "0.65rem", padding: "1px 3px", borderRadius: 3, flexShrink: 0, lineHeight: 1 }}
-                >
-                  ✕
-                </button>
-              )}
-            </div>
+              onStartRename={() => {
+                setEditingId(slot.slotId);
+                setDraft(getTabName(slot));
+                setTimeout(() => renameInputRef.current?.select(), 30);
+              }}
+              onCommitRename={() => commitRename(slot.slotId)}
+              onCancelRename={() => setEditingId(null)}
+              onRemove={() => handleRemoveSlot(slot.slotId)}
+            />
           );
         })}
 
@@ -230,6 +232,7 @@ export default function LayoutTabsTop({ config }: ModuleProps) {
               <SlotContainer
                 slot={slot}
                 parentConfig={liveConfig}
+                targetParentId={getTabTargetId(layoutTargetId, slot.slotId)}
                 onSlotUpdated={handleSlotUpdated}
                 onSlotRemoved={() => handleRemoveSlot(slot.slotId)}
               />
@@ -244,6 +247,115 @@ export default function LayoutTabsTop({ config }: ModuleProps) {
           onCancel={() => setShowPicker(false)}
           headerOverride={{ title: "Add a tab", subtitle: "Choose the module for this tab" }}
         />
+      )}
+    </div>
+  );
+}
+
+function TabChip({
+  slot,
+  targetId,
+  editMode,
+  isActive,
+  isEditing,
+  renameInputRef,
+  draft,
+  setDraft,
+  onActivate,
+  onStartRename,
+  onCommitRename,
+  onCancelRename,
+  onRemove,
+}: {
+  slot: ChildSlot;
+  targetId: string;
+  editMode: boolean;
+  isActive: boolean;
+  isEditing: boolean;
+  renameInputRef: React.RefObject<HTMLInputElement | null>;
+  draft: string;
+  setDraft: (value: string) => void;
+  onActivate: () => void;
+  onStartRename: () => void;
+  onCommitRename: () => void;
+  onCancelRename: () => void;
+  onRemove: () => void;
+}) {
+  const isHighlighted = useIsTargetHighlighted(targetId);
+  const { completeLink } = useLinkAuthoring();
+  const linkStep = useLinkAuthoringStep();
+  const isSelectingTarget = linkStep === "select-target";
+  const isBusy = linkStep === "saving";
+
+  useRegisterUiTarget({
+    id: targetId,
+    kind: "tab",
+    parentId: targetId.split(":tab:")[0],
+    label: getTabName(slot),
+    reveal: () => {
+      onActivate();
+    },
+  });
+
+  return (
+    <div
+      onClick={() => {
+        if (isSelectingTarget) {
+          void completeLink(targetId);
+          return;
+        }
+        if (!isBusy) {
+          onActivate();
+        }
+      }}
+      style={{
+        display: "flex", alignItems: "center", gap: "0.4rem",
+        padding: "0 0.75rem", flexShrink: 0, minWidth: 0, maxWidth: 200,
+        background: isActive ? C.tabActive : "transparent",
+        borderRight: `1px solid ${C.border}`,
+        borderBottom: isActive ? `2px solid ${C.accent}` : "2px solid transparent",
+        cursor: "pointer", userSelect: "none",
+        boxShadow: isSelectingTarget
+          ? "inset 0 0 0 1px rgba(253, 224, 71, 0.9), 0 0 0 1px rgba(234, 179, 8, 0.4)"
+          : isHighlighted ? "inset 0 0 0 1px rgba(147, 197, 253, 0.9), 0 0 0 1px rgba(59, 130, 246, 0.45)" : undefined,
+      }}
+    >
+      {isEditing ? (
+        <input
+          ref={renameInputRef}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={onCommitRename}
+          onKeyDown={(e) => {
+            if (e.key === "Enter")  { e.preventDefault(); onCommitRename(); }
+            if (e.key === "Escape") onCancelRename();
+          }}
+          onClick={(e) => e.stopPropagation()}
+          autoFocus
+          style={{ width: 100, background: "#0a1525", border: `1px solid ${C.accent}`, borderRadius: 3, color: C.text, fontSize: "0.78rem", padding: "2px 5px", outline: "none", fontFamily: "inherit" }}
+        />
+      ) : (
+        <span
+          onDoubleClick={(e) => {
+            if (!editMode) return;
+            e.stopPropagation();
+            onStartRename();
+          }}
+          title={isSelectingTarget ? "Click to link to this tab" : editMode ? "Double-click to rename" : getTabName(slot)}
+          style={{ fontSize: "0.8rem", color: isSelectingTarget ? "#fde68a" : isActive ? C.text : isHighlighted ? "#bfdbfe" : C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}
+        >
+          {getTabName(slot)}
+        </span>
+      )}
+
+      {editMode && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onRemove(); }}
+          title="Remove tab"
+          style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: "0.65rem", padding: "1px 3px", borderRadius: 3, flexShrink: 0, lineHeight: 1 }}
+        >
+          ✕
+        </button>
       )}
     </div>
   );

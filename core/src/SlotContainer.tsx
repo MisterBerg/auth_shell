@@ -1,6 +1,6 @@
 import React, { useMemo, useState, useCallback, useRef, useContext } from "react";
 import type { ChildSlot, ModuleConfig } from "./types.ts";
-import { useAuthContext, useEditMode, useRegisterResources } from "./hooks.ts";
+import { useAuthContext, useEditMode, useLinkAuthoring, useLinkAuthoringStep, useParentUiTargetId, useRegisterResources, useRegisterUiTarget } from "./hooks.ts";
 import { loadBundle } from "./loadModule.ts";
 import { ModulePicker } from "./ModulePicker.tsx";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
@@ -10,18 +10,25 @@ import { SlotContext } from "./SlotContext.tsx";
 type SlotContainerProps = {
   slot: ChildSlot;
   parentConfig: ModuleConfig;
+  targetParentId?: string;
   onSlotUpdated?: (updatedSlot: ChildSlot) => void;
   onSlotRemoved?: () => void;
   fallback?: React.ReactNode;
 };
 
-export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved, fallback }: SlotContainerProps) {
+export function SlotContainer({ slot, parentConfig, targetParentId, onSlotUpdated, onSlotRemoved, fallback }: SlotContainerProps) {
   const { getS3Client } = useAuthContext();
   const registerResources = useRegisterResources();
   const { editMode } = useEditMode();
+  const { completeLink } = useLinkAuthoring();
+  const linkStep = useLinkAuthoringStep();
   const parentSlotCtx = useContext(SlotContext); // non-null when this SlotContainer is itself nested
+  const parentTargetId = useParentUiTargetId();
+  const effectiveParentTargetId = targetParentId ?? parentTargetId;
   const [showPicker, setShowPicker] = useState(false);
   const [swapError, setSwapError] = useState<string | undefined>();
+
+  const slotTargetId = `${effectiveParentTargetId ?? `module:${parentConfig.id}`}:slot:${slot.slotId}`;
 
   const slotConfig: ModuleConfig = {
     id: slot.slotId,
@@ -154,28 +161,59 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
   );
 
   const slotContextValue = { slotId: slot.slotId, updateSlotMeta, updateSlotChildren };
+  useRegisterUiTarget({
+    id: slotTargetId,
+    kind: "module",
+    parentId: effectiveParentTargetId,
+    label: slot.slotId,
+  });
 
   if (editMode) {
+    const isSelectingTarget = linkStep === "select-target";
+    const isBusy = linkStep === "saving";
     return (
-      <SlotContext value={slotContextValue}>
-        <div style={{ position: "relative", outline: "1px dashed #3b82f6", height: "100%" }}>
+      <SlotContext value={{ ...slotContextValue, targetId: slotTargetId }}>
+        <div
+          onClickCapture={(event) => {
+            if (!isSelectingTarget) return;
+            event.preventDefault();
+            event.stopPropagation();
+            void completeLink(slotTargetId);
+          }}
+          style={{
+            position: "relative",
+            outline: isSelectingTarget ? "2px solid #facc15" : "1px dashed #3b82f6",
+            boxShadow: isSelectingTarget ? "inset 0 0 0 1px rgba(250, 204, 21, 0.4)" : undefined,
+            cursor: isSelectingTarget ? "copy" : undefined,
+            height: "100%",
+          }}
+          title={isSelectingTarget ? `Click to link to ${slot.slotId}` : undefined}
+        >
           {content}
           <div style={{ position: "absolute", top: 4, right: 4, display: "flex", gap: 4, zIndex: 10 }}>
             <button
-              onClick={() => setShowPicker(true)}
+              onClick={() => {
+                if (isSelectingTarget) {
+                  void completeLink(slotTargetId);
+                  return;
+                }
+                if (!isBusy) {
+                  setShowPicker(true);
+                }
+              }}
               style={{
                 padding: "2px 8px",
                 fontSize: "0.75rem",
-                background: "#3b82f6",
-                color: "#fff",
+                background: isSelectingTarget ? "#f59e0b" : "#3b82f6",
+                color: isSelectingTarget ? "#111827" : "#fff",
                 border: "none",
                 borderRadius: 4,
                 cursor: "pointer",
                 opacity: 0.85,
               }}
-              title={`Replace slot: ${slot.slotId}`}
+              title={isSelectingTarget ? `Link to ${slot.slotId}` : `Replace slot: ${slot.slotId}`}
             >
-              ✎ {slot.slotId}
+              {isSelectingTarget ? `Link ${slot.slotId}` : `✎ ${slot.slotId}`}
             </button>
             {onSlotRemoved && (
               <button
@@ -210,7 +248,7 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
   }
 
   return (
-    <SlotContext value={slotContextValue}>
+    <SlotContext value={{ ...slotContextValue, targetId: slotTargetId }}>
       {content}
     </SlotContext>
   );

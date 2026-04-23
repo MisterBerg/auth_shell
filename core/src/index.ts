@@ -10,6 +10,8 @@ export type {
   UserProfile,
   ModuleCategory,
   ModuleRegistryEntry,
+  UiTargetKind,
+  UiTargetRegistration,
 } from "./types.ts";
 
 // Contexts & providers
@@ -20,8 +22,18 @@ export {
   ResourceRegistryProvider,
   EditModeContext,
   EditModeProvider,
+  UiNavigationContext,
+  UiNavigationProvider,
+  LinkAuthoringContext,
+  LinkAuthoringProvider,
 } from "./context.tsx";
-export type { AuthContextValue, ResourceRegistryValue, EditModeContextValue } from "./context.tsx";
+export type {
+  AuthContextValue,
+  ResourceRegistryValue,
+  EditModeContextValue,
+  UiNavigationContextValue,
+  LinkAuthoringContextValue,
+} from "./context.tsx";
 
 // Hooks
 export {
@@ -36,6 +48,17 @@ export {
   useAllResources,
   useRegisterResources,
   useEditMode,
+  useNavigateToTarget,
+  useUiTargets,
+  useHighlightedTargets,
+  useIsTargetHighlighted,
+  useRegisterUiTarget,
+  useLinkAuthoring,
+  useIsLinking,
+  useLinkAuthoringStep,
+  useIsLinkSourceSelected,
+  useRegisterLinkSource,
+  useParentUiTargetId,
   useUpdateSlotMeta,
   useUpdateSlotChildren,
   useReplaceModule,

@@ -1,12 +1,14 @@
-import { useContext, useCallback } from "react";
+import { useContext, useCallback, useEffect, useRef } from "react";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import {
   AuthContext,
   ResourceRegistryContext,
   EditModeContext,
+  UiNavigationContext,
+  LinkAuthoringContext,
 } from "./context.tsx";
 import { SlotContext } from "./SlotContext.tsx";
-import type { ModuleConfig, ModuleRegistryEntry, Resource } from "./types.ts";
+import type { ModuleConfig, ModuleRegistryEntry, Resource, UiTargetRegistration, LinkSourceRegistration, LinkAuthoringStep } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Auth hooks
@@ -90,6 +92,75 @@ export function useEditMode() {
 }
 
 // ---------------------------------------------------------------------------
+// UI navigation hooks
+// ---------------------------------------------------------------------------
+
+export function useNavigateToTarget() {
+  return useContext(UiNavigationContext).navigateToTarget;
+}
+
+export function useUiTargets(): ReadonlyMap<string, UiTargetRegistration> {
+  return useContext(UiNavigationContext).targets;
+}
+
+export function useHighlightedTargets(): ReadonlySet<string> {
+  return useContext(UiNavigationContext).highlightedTargetIds;
+}
+
+export function useIsTargetHighlighted(targetId: string): boolean {
+  return useContext(UiNavigationContext).highlightedTargetIds.has(targetId);
+}
+
+export function useRegisterUiTarget(target: UiTargetRegistration | null | undefined) {
+  const registerTarget = useContext(UiNavigationContext).registerTarget;
+  const targetRef = useRef<UiTargetRegistration | null | undefined>(target);
+  targetRef.current = target;
+
+  useEffect(() => {
+    if (!target) return;
+    return registerTarget({
+      id: target.id,
+      kind: target.kind,
+      parentId: target.parentId,
+      label: target.label,
+      reveal: () => targetRef.current?.reveal?.(),
+    });
+  }, [registerTarget, target?.id, target?.kind, target?.parentId, target?.label]);
+}
+
+export function useLinkAuthoring() {
+  const { step, selectedSourceId, startLinking, cancelLinking, chooseSource, completeLink, advanceToTargetSelection } = useContext(LinkAuthoringContext);
+  return { step, selectedSourceId, startLinking, cancelLinking, chooseSource, completeLink, advanceToTargetSelection };
+}
+
+export function useIsLinking(): boolean {
+  return useContext(LinkAuthoringContext).step !== "idle";
+}
+
+export function useLinkAuthoringStep(): LinkAuthoringStep {
+  return useContext(LinkAuthoringContext).step;
+}
+
+export function useIsLinkSourceSelected(sourceId: string): boolean {
+  return useContext(LinkAuthoringContext).selectedSourceId === sourceId;
+}
+
+export function useRegisterLinkSource(source: LinkSourceRegistration | null | undefined) {
+  const registerSource = useContext(LinkAuthoringContext).registerSource;
+  const sourceRef = useRef<LinkSourceRegistration | null | undefined>(source);
+  sourceRef.current = source;
+
+  useEffect(() => {
+    if (!source) return;
+    return registerSource({
+      id: source.id,
+      label: source.label,
+      commitLink: (targetId) => sourceRef.current?.commitLink(targetId),
+    });
+  }, [registerSource, source?.id, source?.label]);
+}
+
+// ---------------------------------------------------------------------------
 // useUpdateSlotMeta
 // For use inside modules loaded by SlotContainer. Merges newMeta into the
 // slot's existing meta and persists the parent config to S3. Does NOT
@@ -111,6 +182,10 @@ export function useUpdateSlotMeta(): ((newMeta: Record<string, unknown>) => Prom
 export function useUpdateSlotChildren(): ((children: import("./types.ts").ChildSlot[]) => Promise<void>) | null {
   const ctx = useContext(SlotContext);
   return ctx?.updateSlotChildren ?? null;
+}
+
+export function useParentUiTargetId(): string | undefined {
+  return useContext(SlotContext)?.targetId;
 }
 
 export function useReplaceModule() {

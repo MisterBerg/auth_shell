@@ -12,9 +12,12 @@ import * as moduleCore from "module-core";
 import {
   AuthProvider,
   EditModeProvider,
+  LinkAuthoringProvider,
   ResourceRegistryProvider,
+  UiNavigationProvider,
   loadModule,
   useEditMode,
+  useLinkAuthoring,
   useRegisterResources,
   type AuthContextValue,
   type ModuleConfig,
@@ -299,6 +302,17 @@ function ShellAuthProvider({
 
 function EditModeBar() {
   const { editMode, setEditMode } = useEditMode();
+  const { step, startLinking, cancelLinking, advanceToTargetSelection } = useLinkAuthoring();
+  const isLinking = step !== "idle";
+  const linkLabel = step === "select-source"
+    ? "Pick Source"
+    : step === "source-selected"
+      ? "Pick Destination"
+    : step === "select-target"
+      ? "Pick Destination"
+      : step === "saving"
+        ? "Saving Link..."
+        : "Link";
 
   return (
     <>
@@ -309,10 +323,48 @@ function EditModeBar() {
           left: 20,
           zIndex: 1000,
           pointerEvents: "auto",
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
         }}
       >
+        {editMode && (
+          <>
+            <button
+              onClick={() => {
+                if (step === "source-selected") {
+                  advanceToTargetSelection();
+                } else if (isLinking) {
+                  cancelLinking();
+                } else {
+                  startLinking();
+                }
+              }}
+              style={isLinking ? linkButtonActiveStyle : linkButtonStyle}
+              title="Create a link by picking a source, then later choosing a destination"
+              disabled={step === "saving"}
+            >
+              {linkLabel}
+            </button>
+            {isLinking && (
+              <button
+                onClick={cancelLinking}
+                style={cancelButtonStyle}
+                title="Cancel link selection"
+                disabled={step === "saving"}
+              >
+                Cancel
+              </button>
+            )}
+          </>
+        )}
         <button
-          onClick={() => setEditMode(!editMode)}
+          onClick={() => {
+            if (editMode) {
+              cancelLinking();
+            }
+            setEditMode(!editMode);
+          }}
           style={editMode ? doneButtonStyle : editButtonStyle}
           title={editMode ? "Exit interface editing" : "Edit the project interface"}
         >
@@ -437,11 +489,15 @@ function ShellCoreApp({
 export default function ProtectedShellCore(props: ProtectedShellCoreProps) {
   return (
     <ResourceRegistryProvider>
-      <EditModeProvider>
-        <ShellAuthProvider {...props}>
-          <ShellCoreApp shellConfig={props.shellConfig} runtimeEnv={props.runtimeEnv} />
-        </ShellAuthProvider>
-      </EditModeProvider>
+      <UiNavigationProvider>
+        <LinkAuthoringProvider>
+          <EditModeProvider>
+            <ShellAuthProvider {...props}>
+              <ShellCoreApp shellConfig={props.shellConfig} runtimeEnv={props.runtimeEnv} />
+            </ShellAuthProvider>
+          </EditModeProvider>
+        </LinkAuthoringProvider>
+      </UiNavigationProvider>
     </ResourceRegistryProvider>
   );
 }
@@ -469,4 +525,24 @@ const doneButtonStyle: React.CSSProperties = {
   ...baseBtn,
   background: "#2563eb",
   color: "#fff",
+};
+
+const linkButtonStyle: React.CSSProperties = {
+  ...baseBtn,
+  background: "rgba(15, 25, 41, 0.85)",
+  color: "#bfdbfe",
+  border: "1px solid #2563eb",
+  backdropFilter: "blur(4px)",
+};
+
+const linkButtonActiveStyle: React.CSSProperties = {
+  ...baseBtn,
+  background: "#1d4ed8",
+  color: "#eff6ff",
+};
+
+const cancelButtonStyle: React.CSSProperties = {
+  ...baseBtn,
+  background: "rgba(127, 29, 29, 0.92)",
+  color: "#fee2e2",
 };

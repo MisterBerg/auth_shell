@@ -38,7 +38,6 @@
     "kicad:export-board": "tsx scripts/kicad/export-board-viewer.ts"
   },
   "devDependencies": {
-    "@rollup/rollup-win32-x64-msvc": "^4.60.1",
     "tsx": "^4.19.4"
   },
   "dependencies": {
