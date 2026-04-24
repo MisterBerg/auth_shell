@@ -275,7 +275,7 @@ function MarkdownLink({ href, children }: { href?: string; children?: React.Reac
           e.preventDefault();
           if (key) ctx.onNavigate(key);
           if (hashPart) {
-            window.setTimeout(() => ctx.onNavigateHash(hashPart), 0);
+            ctx.onNavigateHash(hashPart);
           }
         }}
         style={{ color: "#60a5fa", cursor: "pointer" }}
@@ -415,6 +415,7 @@ export function MarkdownPane({ tab, getS3Client, onContentLoaded }: MarkdownPane
   const [content,  setContent]  = useState<string | null>(null);
   const [loading,  setLoading]  = useState(false);
   const [fetchErr, setFetchErr] = useState<string | undefined>();
+  const [pendingHash, setPendingHash] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const currentKey = navStack[navStack.length - 1] ?? tab.rootKey;
@@ -422,7 +423,10 @@ export function MarkdownPane({ tab, getS3Client, onContentLoaded }: MarkdownPane
   useEffect(() => ensureStyles(), []);
 
   // Reset nav when tab identity changes
-  useEffect(() => { setNavStack([tab.rootKey]); }, [tab.tabId, tab.rootKey]);
+  useEffect(() => {
+    setNavStack([tab.rootKey]);
+    setPendingHash(null);
+  }, [tab.tabId, tab.rootKey]);
 
   useEffect(() => {
     if (!currentKey) return;
@@ -459,11 +463,13 @@ export function MarkdownPane({ tab, getS3Client, onContentLoaded }: MarkdownPane
 
   const handleNavigate = useCallback((key: string) => {
     setNavStack((prev) => [...prev, key]);
+    setPendingHash(null);
     containerRef.current?.scrollTo(0, 0);
   }, []);
 
   const handleBack = useCallback(() => {
     setNavStack((prev) => (prev.length > 1 ? prev.slice(0, -1) : prev));
+    setPendingHash(null);
     containerRef.current?.scrollTo(0, 0);
   }, []);
 
@@ -476,8 +482,21 @@ export function MarkdownPane({ tab, getS3Client, onContentLoaded }: MarkdownPane
       ? cssEscape(hash)
       : hash.replace(/["\\.#:[\]]/g, "\\$&");
     const target = containerRef.current?.querySelector<HTMLElement>(`#${escaped}`);
-    target?.scrollIntoView({ block: "start" });
+    if (target) {
+      setPendingHash(null);
+      target.scrollIntoView({ block: "start" });
+      return;
+    }
+    setPendingHash(hash);
   }, []);
+
+  useEffect(() => {
+    if (!pendingHash || content === null) return;
+    const timer = window.setTimeout(() => {
+      handleNavigateHash(pendingHash);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [pendingHash, content, currentKey, handleNavigateHash]);
 
   const ctx: RenderCtx = {
     bucket: tab.bucket,
