@@ -11,6 +11,7 @@ const win = window as unknown as Record<string, unknown>;
 win["__React"] = React;
 win["__ReactJsxRuntime"] = ReactJsxRuntime;
 win["__ReactDOM"] = ReactDOM;
+win["__ReactDOMClient"] = ReactDOMClient;
 
 const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("Root element #root not found");

@@ -233,10 +233,13 @@ function openPopout(
   const root = popup.document.createElement("div");
   root.style.cssText = "height:100vh;overflow:auto";
   popup.document.body.appendChild(root);
-  // createRoot is available via __ReactDOM (react-dom/client)
-  const ReactDOM = (window as unknown as Record<string, unknown>)["__ReactDOM"] as typeof import("react-dom/client");
+  const ReactDOMClient = (window as unknown as Record<string, unknown>)["__ReactDOMClient"] as typeof import("react-dom/client") | undefined;
   const React = (window as unknown as Record<string, unknown>)["__React"] as typeof import("react");
-  ReactDOM.createRoot(root).render(
+  if (!ReactDOMClient?.createRoot) {
+    popup.document.body.innerHTML = '<div style="font-family: system-ui, sans-serif; color: #fca5a5; padding: 1rem;">Markdown popout failed: ReactDOM client renderer is unavailable.</div>';
+    return;
+  }
+  ReactDOMClient.createRoot(root).render(
     React.createElement(MarkdownPane, { tab, getS3Client }),
   );
 }
