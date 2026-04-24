@@ -3,6 +3,7 @@ import React, {
 } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import type { S3Client } from "@aws-sdk/client-s3";
 
@@ -10,20 +11,55 @@ import type { S3Client } from "@aws-sdk/client-s3";
 // Path utilities
 // ---------------------------------------------------------------------------
 
-export function resolveS3Key(baseKey: string, href: string): string | null {
+export function resolveS3Key(baseKey: string, href: string, rootKey?: string): string | null {
   if (/^(https?:|mailto:|#)/i.test(href)) return null;
-  const path = href.split("?")[0].split("#")[0];
+  const rawPath = href.split("?")[0].split("#")[0];
+  const path = rawPath
+    .split("/")
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    })
+    .join("/");
   if (!path) return null;
   if (path.startsWith("/")) return path.slice(1);
   const base = baseKey.split("/");
   base.pop();
+  const rootParts = (rootKey ?? baseKey).split("/");
+  rootParts.pop();
+  const minLength = rootParts.length;
   const parts = path.split("/");
   const result = [...base];
   for (const p of parts) {
-    if (p === "..") result.pop();
+    if (p === "..") {
+      if (result.length > minLength) result.pop();
+    }
     else if (p && p !== ".") result.push(p);
   }
   return result.join("/");
+}
+
+function mdLog(message: string, details?: unknown) {
+  if (details === undefined) {
+    console.log(`[markdown-viewer] ${message}`);
+    return;
+  }
+  console.log(`[markdown-viewer] ${message}`, details);
+}
+
+function toFriendlyLoadMessage(message: string): string {
+  return /specified key does not exist/i.test(message)
+    ? "The linked file is not present in the uploaded document set."
+    : message;
+}
+
+function renderPopupMessage(popup: Window, title: string, message: string) {
+  popup.document.open();
+  popup.document.write(`<!doctype html><html><head><title>${title}</title></head><body style="font-family: system-ui, sans-serif; color: #6b7280; padding: 1rem; white-space: pre-wrap;">${message}</body></html>`);
+  popup.document.close();
 }
 
 export function isExternal(url: string): boolean {
@@ -40,9 +76,23 @@ export function isMarkdownPath(href: string): boolean {
 
 const blobCache = new Map<string, string>();
 
+function splitHref(href: string): { path: string; hash: string } {
+  const [path, hash = ""] = href.split("#");
+  return { path, hash };
+}
+
+function fileNameFromKey(key: string): string {
+  return key.split("/").pop() ?? "download";
+}
+
 function mimeFromKey(key: string): string {
   const ext = key.split("?")[0].split(".").pop()?.toLowerCase() ?? "";
   const map: Record<string, string> = {
+    html: "text/html",
+    htm:  "text/html",
+    txt:  "text/plain",
+    csv:  "text/csv",
+    json: "application/json",
     pdf:  "application/pdf",
     png:  "image/png",
     jpg:  "image/jpeg",
@@ -58,6 +108,43 @@ function mimeFromKey(key: string): string {
   return map[ext] ?? "application/octet-stream";
 }
 
+function isBrowserRenderableMime(mime: string): boolean {
+  return (
+    mime.startsWith("text/html") ||
+    mime === "application/pdf" ||
+    mime.startsWith("image/") ||
+    mime.startsWith("audio/") ||
+    mime.startsWith("video/") ||
+    mime === "text/plain" ||
+    mime === "text/csv" ||
+    mime === "application/json"
+  );
+}
+
+async function getBlobUrlForKey(
+  ctx: RenderCtx,
+  key: string,
+): Promise<{ blobUrl: string; mime: string }> {
+  const cacheKey = `${ctx.bucket}:${key}`;
+  let blobUrl = blobCache.get(cacheKey);
+  const mime = mimeFromKey(key);
+  mdLog("requesting asset blob", {
+    bucket: ctx.bucket,
+    key,
+    mime,
+    cached: !!blobUrl,
+  });
+  if (!blobUrl) {
+    const s3 = await ctx.getS3Client(ctx.bucket);
+    const r = await s3.send(new GetObjectCommand({ Bucket: ctx.bucket, Key: key }));
+    const bytes = await r.Body!.transformToByteArray();
+    const blob = new Blob([bytes.buffer as ArrayBuffer], { type: mime });
+    blobUrl = URL.createObjectURL(blob);
+    blobCache.set(cacheKey, blobUrl);
+  }
+  return { blobUrl, mime };
+}
+
 // ---------------------------------------------------------------------------
 // Context passed to react-markdown custom renderers
 // ---------------------------------------------------------------------------
@@ -65,6 +152,7 @@ function mimeFromKey(key: string): string {
 interface RenderCtx {
   bucket: string;
   currentKey: string;
+  rootKey: string;
   getS3Client: (bucket?: string) => Promise<S3Client>;
   onNavigate: (key: string) => void;
   onNavigateHash: (hash: string) => void;
@@ -113,7 +201,12 @@ function S3Image({ src, alt }: { src?: string; alt?: string }) {
     if (!src || !ctx) { setUrl("error"); return; }
     if (isExternal(src)) { setUrl(src); return; }
 
-    const key = resolveS3Key(ctx.currentKey, src);
+    const key = resolveS3Key(ctx.currentKey, src, ctx.rootKey);
+    mdLog("resolving image source", {
+      currentKey: ctx.currentKey,
+      src,
+      resolvedKey: key,
+    });
     if (!key) { setUrl("error"); return; }
 
     const cacheKey = `${ctx.bucket}:${key}`;
@@ -167,7 +260,14 @@ function MarkdownLink({ href, children }: { href?: string; children?: React.Reac
   }
   if (ctx && isMarkdownPath(href)) {
     const [pathPart, hashPart] = href.split("#");
-    const key = resolveS3Key(ctx.currentKey, pathPart);
+    const key = resolveS3Key(ctx.currentKey, pathPart, ctx.rootKey);
+    mdLog("resolving markdown link", {
+      currentKey: ctx.currentKey,
+      href,
+      pathPart,
+      hashPart,
+      resolvedKey: key,
+    });
     return (
       <a
         href="#"
@@ -186,24 +286,61 @@ function MarkdownLink({ href, children }: { href?: string; children?: React.Reac
   }
   // Non-markdown local file (PDF, images, etc.) — fetch from S3 and open as blob URL
   if (ctx) {
-    const key = resolveS3Key(ctx.currentKey, href.split("#")[0]);
+    const { path, hash } = splitHref(href);
+    const key = resolveS3Key(ctx.currentKey, path, ctx.rootKey);
+    mdLog("resolving asset link", {
+      currentKey: ctx.currentKey,
+      href,
+      path,
+      hash,
+      resolvedKey: key,
+      mime: key ? mimeFromKey(key) : undefined,
+    });
     if (key) {
       return (
         <a
           href="#"
           onClick={async (e) => {
             e.preventDefault();
-            const cacheKey = `${ctx.bucket}:${key}`;
-            let blobUrl = blobCache.get(cacheKey);
-            if (!blobUrl) {
-              const s3 = await ctx.getS3Client(ctx.bucket);
-              const r = await s3.send(new GetObjectCommand({ Bucket: ctx.bucket, Key: key }));
-              const bytes = await r.Body!.transformToByteArray();
-              const blob = new Blob([bytes.buffer as ArrayBuffer], { type: mimeFromKey(key) });
-              blobUrl = URL.createObjectURL(blob);
-              blobCache.set(cacheKey, blobUrl);
+            const popup = window.open("about:blank", "_blank");
+            if (popup) {
+              renderPopupMessage(popup, "Loading asset...", "Loading asset...");
             }
-            window.open(blobUrl, "_blank");
+            try {
+              const { blobUrl, mime } = await getBlobUrlForKey(ctx, key);
+              const targetUrl = hash ? `${blobUrl}#${hash}` : blobUrl;
+              if (isBrowserRenderableMime(mime)) {
+                if (popup) {
+                  popup.location.replace(targetUrl);
+                } else {
+                  window.open(targetUrl, "_blank");
+                }
+                return;
+              }
+
+              if (popup) popup.close();
+              const link = document.createElement("a");
+              link.href = targetUrl;
+              link.download = fileNameFromKey(key);
+              link.rel = "noopener noreferrer";
+              document.body.appendChild(link);
+              link.click();
+              link.remove();
+            } catch (error) {
+              const message = String((error as Error).message ?? error);
+              mdLog("asset link failed", {
+                currentKey: ctx.currentKey,
+                href,
+                path,
+                hash,
+                resolvedKey: key,
+                message,
+              });
+              const friendly = toFriendlyLoadMessage(message);
+              if (popup) {
+                renderPopupMessage(popup, "Failed to load asset", friendly);
+              }
+            }
           }}
           style={{ color: "#60a5fa", cursor: "pointer" }}
         >
@@ -294,11 +431,29 @@ export function MarkdownPane({ tab, getS3Client, onContentLoaded }: MarkdownPane
     setContent(null);
     setFetchErr(undefined);
     onContentLoaded?.(null);
+    mdLog("loading markdown document", { bucket: tab.bucket, key: currentKey });
     getS3Client(tab.bucket)
       .then((s3) => s3.send(new GetObjectCommand({ Bucket: tab.bucket, Key: currentKey })))
       .then((r) => r.Body!.transformToString("utf-8"))
-      .then((text) => { if (!cancelled) { setContent(text); setLoading(false); onContentLoaded?.(text); } })
-      .catch((e) => { if (!cancelled) { setFetchErr((e as Error).message); setLoading(false); } });
+      .then((text) => {
+        if (!cancelled) {
+          mdLog("loaded markdown document", { key: currentKey, length: text.length });
+          setContent(text);
+          setLoading(false);
+          onContentLoaded?.(text);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          const message = String((e as Error).message ?? e);
+          mdLog("failed to load markdown document", {
+            key: currentKey,
+            message,
+          });
+          setFetchErr(toFriendlyLoadMessage(message));
+          setLoading(false);
+        }
+      });
     return () => { cancelled = true; };
   }, [currentKey, tab.bucket, getS3Client]);
 
@@ -327,6 +482,7 @@ export function MarkdownPane({ tab, getS3Client, onContentLoaded }: MarkdownPane
   const ctx: RenderCtx = {
     bucket: tab.bucket,
     currentKey,
+    rootKey: tab.rootKey,
     getS3Client,
     onNavigate: handleNavigate,
     onNavigateHash: handleNavigateHash,
@@ -349,6 +505,7 @@ export function MarkdownPane({ tab, getS3Client, onContentLoaded }: MarkdownPane
           <div className="hep-md">
             <Markdown
               remarkPlugins={[remarkGfm]}
+              rehypePlugins={[rehypeRaw]}
               components={{
                 a:   (p) => <MarkdownLink href={p.href}>{p.children}</MarkdownLink>,
                 img: (p) => <S3Image src={p.src} alt={p.alt} />,

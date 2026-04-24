@@ -42,31 +42,145 @@ function extractLocalRefs(content: string): string[] {
   return refs;
 }
 
+function mdLog(message: string, details?: unknown) {
+  if (details === undefined) {
+    console.log(`[markdown-viewer] ${message}`);
+    return;
+  }
+  console.log(`[markdown-viewer] ${message}`, details);
+}
+
+function decodePathSegments(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    })
+    .join("/");
+}
+
 function resolveRelativePath(basePath: string, ref: string): string {
+  const normalizedRef = decodePathSegments(ref);
   const parts = basePath.split("/");
   parts.pop();
-  for (const seg of ref.split("/")) {
+  for (const seg of normalizedRef.split("/")) {
     if (seg === "..") parts.pop();
     else if (seg && seg !== ".") parts.push(seg);
   }
   return parts.join("/");
 }
 
+function splitDirAndName(path: string): { dir: string; name: string } {
+  const parts = path.split("/");
+  const name = parts.pop() ?? "";
+  return { dir: parts.join("/"), name };
+}
+
+function fileStem(name: string): string {
+  return name.replace(/\.[^.]+$/, "");
+}
+
+function normalizeLoose(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/%20/g, " ")
+    .replace(/[_|]+/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function extractHtmlTitle(content: string): string | null {
+  const match = content.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return match?.[1]?.trim() || null;
+}
+
+async function resolveLocalFileRef(
+  entryPath: string,
+  ref: string,
+  fileMap: Map<string, File>,
+): Promise<{ requestedPath: string; sourcePath: string | null }> {
+  const requestedPath = resolveRelativePath(entryPath, ref);
+  if (fileMap.has(requestedPath)) {
+    return { requestedPath, sourcePath: requestedPath };
+  }
+
+  const { dir, name } = splitDirAndName(requestedPath);
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  if (!ext) return { requestedPath, sourcePath: null };
+
+  const requestedStem = normalizeLoose(fileStem(name));
+  const directoryPrefix = dir ? `${dir}/` : "";
+  const candidates = [...fileMap.keys()].filter((path) => {
+    const candidate = splitDirAndName(path);
+    return candidate.dir === dir && candidate.name.toLowerCase().endsWith(`.${ext}`);
+  });
+
+  for (const candidatePath of candidates) {
+    const candidateName = splitDirAndName(candidatePath).name;
+    const candidateStem = normalizeLoose(fileStem(candidateName));
+    if (
+      candidateStem === requestedStem ||
+      candidateStem.includes(requestedStem) ||
+      requestedStem.includes(candidateStem)
+    ) {
+      return { requestedPath, sourcePath: candidatePath };
+    }
+  }
+
+  if (ext === "html" || ext === "htm") {
+    for (const candidatePath of candidates) {
+      const file = fileMap.get(candidatePath);
+      if (!file) continue;
+      try {
+        const title = extractHtmlTitle(await file.text());
+        if (!title) continue;
+        const normalizedTitle = normalizeLoose(title);
+        if (
+          normalizedTitle === requestedStem ||
+          normalizedTitle.includes(requestedStem) ||
+          requestedStem.includes(normalizedTitle)
+        ) {
+          return { requestedPath, sourcePath: candidatePath };
+        }
+      } catch {
+        // Ignore parse failures and keep searching.
+      }
+    }
+  }
+
+  return { requestedPath, sourcePath: null };
+}
+
 async function crawlMarkdown(
   entryPath: string,
   fileMap: Map<string, File>,
-  visited: Set<string> = new Set(),
-): Promise<Set<string>> {
-  if (visited.has(entryPath) || !fileMap.has(entryPath)) return visited;
-  visited.add(entryPath);
+  reachable: Map<string, string> = new Map(),
+  visitedMarkdown: Set<string> = new Set(),
+): Promise<Map<string, string>> {
+  if (visitedMarkdown.has(entryPath) || !fileMap.has(entryPath)) return reachable;
+  visitedMarkdown.add(entryPath);
+  reachable.set(entryPath, entryPath);
   if (/\.mdx?$/i.test(entryPath)) {
     const content = await fileMap.get(entryPath)!.text();
-    for (const ref of extractLocalRefs(content)) {
-      const resolved = resolveRelativePath(entryPath, ref);
-      if (fileMap.has(resolved)) await crawlMarkdown(resolved, fileMap, visited);
+    const refs = extractLocalRefs(content);
+    mdLog("crawling markdown entry", { entryPath, refCount: refs.length });
+    for (const ref of refs) {
+      const { requestedPath, sourcePath } = await resolveLocalFileRef(entryPath, ref, fileMap);
+      const found = !!sourcePath;
+      mdLog("resolved local ref", { entryPath, ref, resolved: requestedPath, sourcePath, found });
+      if (!sourcePath) continue;
+      reachable.set(requestedPath, sourcePath);
+      if (/\.mdx?$/i.test(sourcePath)) {
+        await crawlMarkdown(sourcePath, fileMap, reachable, visitedMarkdown);
+      }
     }
   }
-  return visited;
+  return reachable;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +250,7 @@ type DropPhase =
   | { kind: "reading" }
   | { kind: "pick"; dirName: string; mdFiles: string[]; fileMap: Map<string, File> }
   | { kind: "crawling" }
-  | { kind: "confirm"; entryPath: string; fileMap: Map<string, File>; reachable: Set<string> }
+  | { kind: "confirm"; entryPath: string; fileMap: Map<string, File>; reachable: Map<string, string> }
   | { kind: "uploading"; done: number; total: number; current: string }
   | { kind: "error"; message: string };
 
@@ -184,8 +298,14 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
       if (autoEntry) {
         setPhase({ kind: "crawling" });
         const reachable = await crawlMarkdown(autoEntry, fileMap);
+        mdLog("auto-selected markdown entry", {
+          entryPath: autoEntry,
+          reachableCount: reachable.size,
+          reachable: [...reachable.keys()].sort(),
+        });
         setPhase({ kind: "confirm", entryPath: autoEntry, fileMap, reachable });
       } else {
+        mdLog("multiple possible markdown entries discovered", { mdFiles });
         setPhase({ kind: "pick", dirName: dirEntry.name, mdFiles, fileMap });
       }
     } catch (err: unknown) {
@@ -197,6 +317,11 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
     setPhase({ kind: "crawling" });
     try {
       const reachable = await crawlMarkdown(entryPath, fileMap);
+      mdLog("manually selected markdown entry", {
+        entryPath,
+        reachableCount: reachable.size,
+        reachable: [...reachable.keys()].sort(),
+      });
       setPhase({ kind: "confirm", entryPath, fileMap, reachable });
     } catch (err: unknown) {
       setPhase({ kind: "error", message: (err as Error).message });
@@ -206,13 +331,22 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
   const handleConfirm = useCallback(async (
     entryPath: string,
     fileMap: Map<string, File>,
-    reachable: Set<string>,
+    reachable: Map<string, string>,
   ) => {
-    const files = [...reachable].map((path) => ({ path, file: fileMap.get(path)! }));
+    const files = [...reachable.entries()].map(([path, sourcePath]) => ({
+      path,
+      sourcePath,
+      file: fileMap.get(sourcePath)!,
+    }));
+    mdLog("upload confirmed", {
+      entryPath,
+      totalFiles: files.length,
+      files: files.map(({ path, sourcePath }) => ({ path, sourcePath })).sort((a, b) => a.path.localeCompare(b.path)),
+    });
     let done = 0;
     try {
       const s3 = await getS3Client(bucket);
-      for (const { path, file } of files) {
+      for (const { path, file, sourcePath } of files) {
         setPhase({ kind: "uploading", done, total: files.length, current: path });
         const bytes = await file.arrayBuffer();
         await s3.send(new PutObjectCommand({
@@ -221,6 +355,9 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
           Body: new Uint8Array(bytes),
           ContentType: file.type || "application/octet-stream",
         }));
+        if (path !== sourcePath) {
+          mdLog("uploaded alias path", { path, sourcePath });
+        }
         done++;
       }
       const rootKey        = `${prefix}/${entryPath}`;
@@ -262,8 +399,9 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
   }
 
   if (phase.kind === "confirm") {
-    const mdFiles    = [...phase.reachable].filter((p) => /\.mdx?$/i.test(p));
-    const assetFiles = [...phase.reachable].filter((p) => !/\.mdx?$/i.test(p));
+    const uploadPaths = [...phase.reachable.keys()];
+    const mdFiles    = uploadPaths.filter((p) => /\.mdx?$/i.test(p));
+    const assetFiles = uploadPaths.filter((p) => !/\.mdx?$/i.test(p));
     return (
       <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "1.25rem", padding: "2rem" }}>
         <p style={{ margin: 0, fontSize: "0.9rem", color: C.text, fontWeight: 500 }}>Ready to upload</p>
@@ -275,7 +413,7 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
         <div style={{ display: "flex", gap: "0.75rem" }}>
           <button onClick={() => handleConfirm(phase.entryPath, phase.fileMap, phase.reachable)}
             style={{ padding: "0.45rem 1.25rem", borderRadius: 6, border: "none", background: C.accent, color: "#fff", cursor: "pointer", fontSize: "0.875rem", fontWeight: 500 }}>
-            Upload {phase.reachable.size} files
+            Upload {uploadPaths.length} files
           </button>
           <button onClick={() => setPhase({ kind: "idle" })}
             style={{ padding: "0.45rem 0.9rem", borderRadius: 6, border: `1px solid ${C.border}`, background: "transparent", color: C.muted, cursor: "pointer", fontSize: "0.875rem" }}>

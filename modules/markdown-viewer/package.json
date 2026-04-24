@@ -17,6 +17,7 @@
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "@aws-sdk/client-s3": "^3.943.0",
+    "rehype-raw": "^7.0.0",
     "react-markdown": "^9.0.3",
     "remark-gfm": "^4.0.1"
   },
