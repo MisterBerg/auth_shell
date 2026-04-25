@@ -1,4 +1,3 @@
-// src/stores/authStore.ts
 import { create } from "zustand";
 
 export type AwsCredentials = {
@@ -8,20 +7,26 @@ export type AwsCredentials = {
   expiration?: Date;
 };
 
+export type UserProfile = {
+  email?: string;
+  name?: string;
+  picture?: string;
+};
+
 export type AuthState = {
   isSignedIn: boolean;
-  googleToken?: string; // internal only – do not show in UI
+  googleToken?: string;
   awsCredentialProvider?: () => Promise<AwsCredentials>;
-  userProfile?: { email?: string; name?: string; picture?: string };
+  userProfile?: UserProfile;
   loading: boolean;
   error?: string;
-  // actions:
   signInWithGoogle: () => void;
   signInWithMicrosoft: () => void;
   signOut: () => void;
   setGoogleSession: (args: {
     googleToken: string;
-    userProfile?: { email?: string; name?: string; picture?: string };
+    expiresAt?: number;
+    userProfile?: UserProfile;
     awsCredentialProvider: () => Promise<AwsCredentials>;
   }) => void;
   clearSession: () => void;
@@ -29,32 +34,45 @@ export type AuthState = {
   setError: (error?: string) => void;
 };
 
-// ---------------------------------------------------------------------------
-// Session persistence — keeps the user signed in across hard reloads.
-// We store the Google ID token in sessionStorage (tab-scoped, not persisted
-// across browser restarts). On load, if a token is found we rebuild the
-// credential provider from it via googleCognito.ts.
-// ---------------------------------------------------------------------------
-
 const SESSION_KEY = "jsl:googleToken";
+const EXPIRES_AT_KEY = "jsl:expiresAt";
 const PROFILE_KEY = "jsl:userProfile";
 
-export function saveSession(googleToken: string, userProfile: AuthState["userProfile"]) {
+export function saveSession(
+  googleToken: string,
+  expiresAt: number | undefined,
+  userProfile: UserProfile | undefined
+) {
   try {
     sessionStorage.setItem(SESSION_KEY, googleToken);
+    if (expiresAt) {
+      sessionStorage.setItem(EXPIRES_AT_KEY, String(expiresAt));
+    } else {
+      sessionStorage.removeItem(EXPIRES_AT_KEY);
+    }
     sessionStorage.setItem(PROFILE_KEY, JSON.stringify(userProfile ?? {}));
   } catch {
-    // sessionStorage unavailable — continue without persistence
+    // sessionStorage unavailable - continue without persistence
   }
 }
 
-export function loadSavedSession(): { googleToken: string; userProfile: AuthState["userProfile"] } | null {
+export function loadSavedSession():
+  | {
+      googleToken: string;
+      expiresAt?: number;
+      userProfile?: UserProfile;
+    }
+  | null {
   try {
-    const token = sessionStorage.getItem(SESSION_KEY);
+    const googleToken = sessionStorage.getItem(SESSION_KEY);
+    if (!googleToken) return null;
+
+    const expiresAtRaw = sessionStorage.getItem(EXPIRES_AT_KEY);
     const profile = sessionStorage.getItem(PROFILE_KEY);
-    if (!token) return null;
+
     return {
-      googleToken: token,
+      googleToken,
+      expiresAt: expiresAtRaw ? Number(expiresAtRaw) : undefined,
       userProfile: profile ? JSON.parse(profile) : undefined,
     };
   } catch {
@@ -65,25 +83,22 @@ export function loadSavedSession(): { googleToken: string; userProfile: AuthStat
 export function clearSavedSession() {
   try {
     sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(EXPIRES_AT_KEY);
     sessionStorage.removeItem(PROFILE_KEY);
   } catch {
     // ignore
   }
 }
 
-// ---------------------------------------------------------------------------
-// External handler registration (wired by googleCognito.ts)
-// ---------------------------------------------------------------------------
-
-let _externalSignIn: (() => void) | null = null;
-let _externalSignOut: (() => void) | null = null;
+let externalSignIn: (() => void) | null = null;
+let externalSignOut: (() => void) | null = null;
 
 export const registerAuthHandlers = (handlers: {
   signIn: () => void;
   signOut: () => void;
 }) => {
-  _externalSignIn = handlers.signIn;
-  _externalSignOut = handlers.signOut;
+  externalSignIn = handlers.signIn;
+  externalSignOut = handlers.signOut;
 };
 
 export const useAuthStore = create<AuthState>((set, get) => ({
@@ -94,8 +109,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   loading: false,
   error: undefined,
 
-  setGoogleSession: ({ googleToken, userProfile, awsCredentialProvider }) => {
-    saveSession(googleToken, userProfile);
+  setGoogleSession: ({ googleToken, expiresAt, userProfile, awsCredentialProvider }) => {
+    saveSession(googleToken, expiresAt, userProfile);
     set({
       isSignedIn: true,
       googleToken,
@@ -122,23 +137,22 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   setError: (error) => set({ error }),
 
   signInWithGoogle: () => {
-    if (!_externalSignIn) {
+    if (!externalSignIn) {
       console.warn("Auth handlers not registered yet");
       return;
     }
     get().setLoading(true);
-    _externalSignIn();
+    externalSignIn();
   },
 
   signInWithMicrosoft: () => {
     get().setLoading(false);
     get().setError("Microsoft sign-in is not implemented yet.");
-    console.info("Microsoft sign-in placeholder invoked");
   },
 
   signOut: () => {
-    if (_externalSignOut) {
-      _externalSignOut();
+    if (externalSignOut) {
+      externalSignOut();
     }
     get().clearSession();
   },

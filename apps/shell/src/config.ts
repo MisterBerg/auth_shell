@@ -10,7 +10,7 @@ export type AppConfig = {
   /** S3 bucket and config path for the default org landing page module. */
   defaultAppBucket: string;
   defaultAppConfigPath: string;
-  /** DynamoDB table names — differ between local Docker dev and real AWS. */
+  /** DynamoDB table names - differ between local Docker dev and real AWS. */
   tables: {
     registry: string;
     projects: string;
@@ -33,7 +33,7 @@ export const CONFIG: AppConfig = {
     ? (import.meta.env.VITE_LOCAL_DEFAULT_APP_CONFIG as string | undefined) ?? "projects/dev-dev/config.json"
     : "apps/landing/config.json",
   tables: {
-    registry: import.meta.env.DEV ? "module-registry"      : "jeffspace-module-registry",
-    projects: import.meta.env.DEV ? "org-projects"         : "jeffspace-projects",
+    registry: import.meta.env.DEV ? "module-registry" : "jeffspace-module-registry",
+    projects: import.meta.env.DEV ? "org-projects" : "jeffspace-projects",
   },
 };

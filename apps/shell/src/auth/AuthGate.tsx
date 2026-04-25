@@ -202,7 +202,7 @@ async function loadProtectedShellCore(
 }
 
 export const AuthGate: React.FC = () => {
-  const { isSignedIn, awsCredentialProvider, userProfile, loading, error, signOut, signInWithMicrosoft } =
+  const { isSignedIn, awsCredentialProvider, userProfile, loading, error, signOut, signInWithGoogle, signInWithMicrosoft } =
     useAuthStore();
   const runtimeEnvRef = useRef(getRuntimeEnv());
 
@@ -250,11 +250,34 @@ export const AuthGate: React.FC = () => {
         <h1 style={{ fontSize: "1.5rem", marginBottom: "0.75rem" }}>
           Org Auth Shell
         </h1>
-        <p style={{ marginBottom: "1.5rem", textAlign: "center" }}>
-          Sign in to continue.
+        <p style={{ marginBottom: "1.5rem", textAlign: "center", maxWidth: "26rem" }}>
+          Sign in with Google to continue. Access is granted only after Cognito accepts your Google token and returns AWS credentials.
         </p>
 
         <div id="google-signin-container" style={{ marginBottom: "0.75rem" }} />
+
+        <button
+          onClick={signInWithGoogle}
+          disabled={loading}
+          style={{
+            padding: "0.6rem 1.1rem",
+            borderRadius: "999px",
+            border: "1px solid #4b5563",
+            cursor: "pointer",
+            fontWeight: 500,
+            fontSize: "0.95rem",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "0.5rem",
+            background: "transparent",
+            color: "#e5e7eb",
+            minWidth: "220px",
+            marginTop: "0.5rem",
+          }}
+        >
+          Sign in with Google
+        </button>
 
         <button
           onClick={signInWithMicrosoft}
@@ -286,7 +309,7 @@ export const AuthGate: React.FC = () => {
               fontSize: "0.85rem",
               color: "#fca5a5",
               textAlign: "center",
-              maxWidth: "20rem",
+              maxWidth: "24rem",
             }}
           >
             {error}
@@ -310,7 +333,7 @@ export const AuthGate: React.FC = () => {
               color: "#e5e7eb",
             }}
           >
-            Loading protected shell…
+            Loading protected shell...
           </div>
         }
       >

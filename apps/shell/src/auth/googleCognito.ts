@@ -1,10 +1,11 @@
 import { fromCognitoIdentityPool } from "@aws-sdk/credential-providers";
 import type { AppConfig } from "../config";
 import {
-  useAuthStore,
-  registerAuthHandlers,
   loadSavedSession,
+  registerAuthHandlers,
+  useAuthStore,
   type AwsCredentials,
+  type UserProfile,
 } from "../stores/authStore";
 
 declare global {
@@ -14,12 +15,16 @@ declare global {
 }
 
 const GOOGLE_PROVIDER = "accounts.google.com";
+const ACCESS_DENIED_MESSAGE =
+  "This Google account is not authorized for this app.";
 
 type GoogleIdTokenPayload = {
   email?: string;
+  email_verified?: boolean;
   name?: string;
   picture?: string;
-  [key: string]: any;
+  exp?: number;
+  [key: string]: unknown;
 };
 
 let gisInitialized = false;
@@ -36,11 +41,16 @@ function decodeGoogleIdTokenPayload(token: string): GoogleIdTokenPayload | null 
       normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
 
     const json = atob(padded);
-    return JSON.parse(json);
-  } catch (e) {
-    console.warn("Failed to decode Google ID token payload", e);
+    return JSON.parse(json) as GoogleIdTokenPayload;
+  } catch (error) {
+    console.warn("Failed to decode Google ID token payload", error);
     return null;
   }
+}
+
+function isSessionExpired(expiresAt?: number): boolean {
+  if (!expiresAt) return false;
+  return Date.now() >= expiresAt - 60_000;
 }
 
 function makeAwsCredentialProviderFromGoogle(
@@ -66,12 +76,32 @@ function makeAwsCredentialProviderFromGoogle(
   };
 }
 
+async function validateGoogleAccess(
+  config: AppConfig,
+  googleToken: string
+): Promise<() => Promise<AwsCredentials>> {
+  const awsCredentialProvider = makeAwsCredentialProviderFromGoogle(config, googleToken);
+  await awsCredentialProvider();
+  return awsCredentialProvider;
+}
+
+function buildUserProfile(googleToken: string): { userProfile: UserProfile; expiresAt?: number } {
+  const payload = decodeGoogleIdTokenPayload(googleToken);
+  return {
+    userProfile: {
+      email: payload?.email,
+      name: payload?.name,
+      picture: payload?.picture,
+    },
+    expiresAt: payload?.exp ? payload.exp * 1000 : undefined,
+  };
+}
+
 function renderGoogleButtonIfContainerExists() {
   if (!window.google || !gisInitialized) return;
   const container = document.getElementById("google-signin-container");
   if (!container) return;
 
-  // Clear any previous button instance
   container.innerHTML = "";
 
   window.google.accounts.id.renderButton(container, {
@@ -84,9 +114,13 @@ function renderGoogleButtonIfContainerExists() {
   });
 }
 
-/**
- * Initialize GIS once and register the ID token callback.
- */
+function handleUnauthorizedSignIn(error: unknown) {
+  console.warn("Google sign-in rejected by Cognito identity pool", error);
+  useAuthStore.getState().clearSession();
+  useAuthStore.getState().setError(ACCESS_DENIED_MESSAGE);
+  useAuthStore.getState().setLoading(false);
+}
+
 function ensureGisInitialized(): void {
   const { setError, setLoading } = useAuthStore.getState();
 
@@ -114,7 +148,7 @@ function ensureGisInitialized(): void {
 
   window.google.accounts.id.initialize({
     client_id: config.googleClientId,
-    callback: (resp: any) => {
+    callback: async (resp: any) => {
       try {
         const googleToken: string | undefined = resp?.credential;
         if (!googleToken) {
@@ -124,27 +158,17 @@ function ensureGisInitialized(): void {
           return;
         }
 
-        const awsCredentialProvider = makeAwsCredentialProviderFromGoogle(
-          config,
-          googleToken
-        );
-
-        const payload = decodeGoogleIdTokenPayload(googleToken);
-        const userProfile = {
-          email: payload?.email,
-          name: payload?.name,
-          picture: payload?.picture,
-        };
+        const { userProfile, expiresAt } = buildUserProfile(googleToken);
+        const awsCredentialProvider = await validateGoogleAccess(config, googleToken);
 
         useAuthStore.getState().setGoogleSession({
           googleToken,
+          expiresAt,
           userProfile,
           awsCredentialProvider,
         });
-      } catch (err) {
-        console.error("Error in Google sign-in callback", err);
-        useAuthStore.getState().setError("Google sign-in failed.");
-        useAuthStore.getState().setLoading(false);
+      } catch (error) {
+        handleUnauthorizedSignIn(error);
       }
     },
     ux_mode: "popup",
@@ -154,7 +178,30 @@ function ensureGisInitialized(): void {
   renderGoogleButtonIfContainerExists();
 }
 
-// --- public entrypoint used by AuthGate ---
+async function restoreSavedSession(config: AppConfig) {
+  const saved = loadSavedSession();
+  if (!saved || useAuthStore.getState().isSignedIn) {
+    return;
+  }
+
+  if (isSessionExpired(saved.expiresAt)) {
+    useAuthStore.getState().clearSession();
+    return;
+  }
+
+  try {
+    const awsCredentialProvider = await validateGoogleAccess(config, saved.googleToken);
+    const { userProfile } = buildUserProfile(saved.googleToken);
+    useAuthStore.getState().setGoogleSession({
+      googleToken: saved.googleToken,
+      expiresAt: saved.expiresAt,
+      userProfile: saved.userProfile ?? userProfile,
+      awsCredentialProvider,
+    });
+  } catch (error) {
+    handleUnauthorizedSignIn(error);
+  }
+}
 
 type InitAuthShellOptions = {
   config: AppConfig;
@@ -163,23 +210,10 @@ type InitAuthShellOptions = {
 export function initAuthShell({ config }: InitAuthShellOptions) {
   storedConfig = config;
 
-  // Restore session from sessionStorage if a previous Google token was saved.
-  // This keeps the user signed in across hard reloads within the same tab session.
-  const saved = loadSavedSession();
-  if (saved && !useAuthStore.getState().isSignedIn) {
-    const awsCredentialProvider = makeAwsCredentialProviderFromGoogle(config, saved.googleToken);
-    useAuthStore.getState().setGoogleSession({
-      googleToken: saved.googleToken,
-      userProfile: saved.userProfile,
-      awsCredentialProvider,
-    });
-  }
+  void restoreSavedSession(config);
 
-  // Register handlers so the store always has something (even if we don't
-  // call signInWithGoogle from UI anymore, this keeps the plumbing sane).
   registerAuthHandlers({
     signIn: () => {
-      // This is now mainly for future One Tap / programmatic flows.
       const { setLoading, setError } = useAuthStore.getState();
       setError(undefined);
       setLoading(true);
@@ -189,8 +223,8 @@ export function initAuthShell({ config }: InitAuthShellOptions) {
 
       try {
         window.google?.accounts.id.prompt();
-      } catch (err) {
-        console.error("Error invoking google.accounts.id.prompt", err);
+      } catch (error) {
+        console.error("Error invoking google.accounts.id.prompt", error);
         setError("Unable to start Google sign-in.");
         setLoading(false);
       }
@@ -199,21 +233,17 @@ export function initAuthShell({ config }: InitAuthShellOptions) {
     signOut: () => {
       try {
         window.google?.accounts.id.disableAutoSelect();
-      } catch (err) {
-        console.warn("Failed to disable Google auto-select", err);
+      } catch (error) {
+        console.warn("Failed to disable Google auto-select", error);
       }
-      // clearing Zustand session is handled by authStore.signOut()
     },
   });
 
-  // Try to initialize immediately; when the React tree mounts,
-  // the #google-signin-container div will be there and we can render into it.
   if (typeof window !== "undefined" && window.google) {
     try {
       ensureGisInitialized();
-      // renderGoogleButtonIfContainerExists is called inside ensureGisInitialized
-    } catch (err) {
-      console.warn("Initial GIS setup failed", err);
+    } catch (error) {
+      console.warn("Initial GIS setup failed", error);
     }
   }
 }
