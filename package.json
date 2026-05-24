@@ -19,6 +19,7 @@
     "modules/kicad-board-viewer",
     "modules/serial-display",
     "modules/shell-core",
+    "modules/chat-codex",
     "shared/web-serial-runtime",
     "shared/kicad-board-export"
   ],
