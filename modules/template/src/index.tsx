@@ -29,7 +29,10 @@ import {
  *          "bucket": "my-bucket", "key": "data/file.csv", "mimeType": "text/csv" }
  *      ],
  *      "children": [
- *        { "slotName": "content", "configPath": "modules/child/config.json" }
+ *        {
+ *          "slotId": "content",
+ *          "app": { "bucket": "my-bucket", "key": "modules/child/bundle.js" }
+ *        }
  *      ]
  *    }
  *
@@ -80,9 +83,9 @@ export default function TemplateModule({ config }: ModuleProps) {
       {/* Render child slots declared in config.children */}
       {config.children?.map((slot) => (
         <SlotContainer
-          key={slot.slotName}
+          key={slot.slotId}
           slot={slot}
-          parentBucket={config.app.bucket}
+          parentConfig={config}
         />
       ))}
     </div>

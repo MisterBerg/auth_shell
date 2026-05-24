@@ -20,10 +20,18 @@ export function useAuthContext() {
 
 export function useTableNames() {
   const ctx = useContext(AuthContext);
+  const projects = ctx?.tables?.projects ?? "org-projects";
   return {
     registry: ctx?.tables?.registry ?? "module-registry",
-    projects: ctx?.tables?.projects ?? "org-projects",
+    projects,
+    assets: ctx?.tables?.assets ?? deriveAssetsTableName(projects),
   };
+}
+
+function deriveAssetsTableName(projectsTable: string): string {
+  if (projectsTable === "jeffspace-projects") return "jeffspace-project-assets";
+  if (projectsTable === "org-projects") return "project-assets";
+  return `${projectsTable}-assets`;
 }
 
 /** Returns the async AWS credential provider function. */

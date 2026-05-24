@@ -12,6 +12,8 @@ dist
 dist-ssr
 *.local
 .npm-cache
+.local-data
+.local-tools
 
 # Editor directories and files
 .vscode/*

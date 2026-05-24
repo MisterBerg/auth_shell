@@ -40,6 +40,7 @@ const REGISTRY_BUCKET = "hep-dev-registry";
 const PROJECTS_TABLE = "org-projects";
 const REGISTRY_TABLE = "module-registry";
 const LOCKS_TABLE = "org-projects-locks";
+const ASSETS_TABLE = "project-assets";
 
 // ---------------------------------------------------------------------------
 // Clients
@@ -120,7 +121,7 @@ async function emptyBucketPrefix(bucket: string, prefix: string) {
   }
 }
 
-async function ensureTable(name: string, pkName: string, skName?: string) {
+async function recreateTable(name: string, pkName: string, skName?: string) {
   try {
     await ddbRaw.send(new DeleteTableCommand({ TableName: name }));
     console.log(`  · dropped table "${name}"`);
@@ -130,34 +131,51 @@ async function ensureTable(name: string, pkName: string, skName?: string) {
       throw err;
     }
   }
+  await createTable(name, pkName, skName);
+  console.log(`  ✓ table "${name}" created`);
+}
+
+async function ensureTable(name: string, pkName: string, skName?: string) {
+  try {
+    await createTable(name, pkName, skName);
+    console.log(`  ✓ table "${name}" created`);
+  } catch (err: unknown) {
+    if ((err as { name?: string }).name === "ResourceInUseException") {
+      console.log(`  · table "${name}" already exists`);
+      return;
+    }
+    throw err;
+  }
+}
+
+async function createTable(name: string, pkName: string, skName?: string) {
   await ddbRaw.send(new CreateTableCommand({
     TableName: name,
     AttributeDefinitions: [
-      { AttributeName: pkName, AttributeType: "S" },
-      ...(skName ? [{ AttributeName: skName, AttributeType: "S" }] : []),
+      { AttributeName: pkName, AttributeType: "S" as const },
+      ...(skName ? [{ AttributeName: skName, AttributeType: "S" as const }] : []),
       // GSI attributes for org-projects shared-project lookup
       ...(name === PROJECTS_TABLE ? [
-        { AttributeName: "sharedWithUserId", AttributeType: "S" },
-        { AttributeName: "updatedAt", AttributeType: "S" },
+        { AttributeName: "sharedWithUserId", AttributeType: "S" as const },
+        { AttributeName: "updatedAt", AttributeType: "S" as const },
       ] : []),
     ],
     KeySchema: [
-      { AttributeName: pkName, KeyType: "HASH" },
-      ...(skName ? [{ AttributeName: skName, KeyType: "RANGE" }] : []),
+      { AttributeName: pkName, KeyType: "HASH" as const },
+      ...(skName ? [{ AttributeName: skName, KeyType: "RANGE" as const }] : []),
     ],
     ...(name === PROJECTS_TABLE ? {
       GlobalSecondaryIndexes: [{
         IndexName: "sharedWithUserId-updatedAt-index",
         KeySchema: [
-          { AttributeName: "sharedWithUserId", KeyType: "HASH" },
-          { AttributeName: "updatedAt", KeyType: "RANGE" },
+          { AttributeName: "sharedWithUserId", KeyType: "HASH" as const },
+          { AttributeName: "updatedAt", KeyType: "RANGE" as const },
         ],
         Projection: { ProjectionType: "ALL" },
       }],
     } : {}),
     BillingMode: "PAY_PER_REQUEST",
   }));
-  console.log(`  ✓ table "${name}" created`);
 }
 
 // ---------------------------------------------------------------------------
@@ -180,25 +198,19 @@ async function main() {
   // Tables
   console.log("\nEnsuring DynamoDB tables...");
   if (reset) {
-    await ensureTable(PROJECTS_TABLE, "userId", "projectId");
-    await ensureTable(REGISTRY_TABLE, "moduleName", "version");
-    await ensureTable(LOCKS_TABLE, "projectId");
+    await recreateTable(PROJECTS_TABLE, "userId", "projectId");
+    await recreateTable(REGISTRY_TABLE, "moduleName", "version");
+    await recreateTable(LOCKS_TABLE, "projectId");
+    await recreateTable(ASSETS_TABLE, "projectId", "sk");
   } else {
-    // Create only if not already present — tolerate existing tables on non-reset runs
+    // Create only if not already present — do not wipe local registry/project data.
     for (const [table, pk, sk] of [
       [PROJECTS_TABLE, "userId", "projectId"],
       [REGISTRY_TABLE, "moduleName", "version"],
       [LOCKS_TABLE, "projectId", undefined],
+      [ASSETS_TABLE, "projectId", "sk"],
     ] as [string, string, string | undefined][]) {
-      try {
-        await ensureTable(table, pk, sk);
-      } catch (err: unknown) {
-        if ((err as { name?: string }).name === "ResourceInUseException") {
-          console.log(`  · table "${table}" already exists`);
-        } else {
-          throw err;
-        }
-      }
+      await ensureTable(table, pk, sk);
     }
   }
 

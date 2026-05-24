@@ -25,8 +25,9 @@
   "scripts": {
     "reset": "tsx scripts/reset-local.ts",
     "reset:cloud": "tsx scripts/reset-cloud.ts",
-    "compose:up": "podman compose up -d",
+    "compose:up": "tsx scripts/compose-up.ts",
     "compose:down": "podman compose down",
+    "run:local": "tsx scripts/run-local.ts",
     "seed": "tsx scripts/seed-local.ts",
     "update-locals": "tsx scripts/update-locals.ts",
     "publish:local": "tsx scripts/publish-module.ts --local",
@@ -38,17 +39,16 @@
     "kicad:export-board": "tsx scripts/kicad/export-board-viewer.ts"
   },
   "devDependencies": {
-    "@rollup/rollup-win32-x64-msvc": "^4.60.1",
     "tsx": "^4.19.4"
   },
   "dependencies": {
-    "@aws-sdk/client-cloudfront": "^3.943.0",
-    "@aws-sdk/client-cognito-identity": "^3.943.0",
-    "@aws-sdk/client-dynamodb": "^3.943.0",
-    "@aws-sdk/client-iam": "^3.943.0",
-    "@aws-sdk/client-s3": "^3.943.0",
-    "@aws-sdk/client-sts": "^3.943.0",
-    "@aws-sdk/credential-providers": "^3.943.0",
-    "@aws-sdk/lib-dynamodb": "^3.943.0"
+    "@aws-sdk/client-cloudfront": "3.943.0",
+    "@aws-sdk/client-cognito-identity": "3.943.0",
+    "@aws-sdk/client-dynamodb": "3.943.0",
+    "@aws-sdk/client-iam": "3.943.0",
+    "@aws-sdk/client-s3": "3.943.0",
+    "@aws-sdk/client-sts": "3.943.0",
+    "@aws-sdk/credential-providers": "3.943.0",
+    "@aws-sdk/lib-dynamodb": "3.943.0"
   }
 }

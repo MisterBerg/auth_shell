@@ -198,7 +198,7 @@ async function main() {
 
   // 1. Install dependencies
   heading(++step, TOTAL, "Install workspace dependencies");
-  run("npm install");
+  run("npm install --cache ./.npm-cache");
 
   // 2. Restart containers
   if (!noCompose) {

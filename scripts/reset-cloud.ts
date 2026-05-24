@@ -6,7 +6,7 @@
  * What it does:
  *   1. Installs workspace dependencies
  *   2. Clears project and registry S3 buckets
- *   3. Clears project / registry / lock DynamoDB tables
+ *   3. Clears project / registry / lock / asset DynamoDB tables
  *   4. Republishes app-landing and all publishable built-ins
  *   5. Rewrites the default landing config.json into jeffspace-modules
  *   6. Redeploys the shell bucket
@@ -51,6 +51,7 @@ const SHELL_BUCKET = "jeffspace-shell";
 const PROJECTS_TABLE = "jeffspace-projects";
 const REGISTRY_TABLE = "jeffspace-module-registry";
 const LOCKS_TABLE = "jeffspace-projects-locks";
+const ASSETS_TABLE = "jeffspace-project-assets";
 const DEFAULT_APP_CONFIG_PATH = "apps/landing/config.json";
 const DEFAULT_APP_BUNDLE_KEY = "modules/app-landing/bundle.js";
 
@@ -278,6 +279,7 @@ What it does:
   await clearTable(PROJECTS_TABLE, ["userId", "projectId"]);
   await clearTable(REGISTRY_TABLE, ["moduleName", "version"]);
   await clearTable(LOCKS_TABLE, ["projectId"]);
+  await clearTable(ASSETS_TABLE, ["projectId", "sk"]);
 
   heading(++step, TOTAL, "Publish default landing app");
   run("npx tsx scripts/publish-module.ts --module=apps/landing");
@@ -296,7 +298,7 @@ What it does:
   console.log(`  Modules bucket:  ${MODULES_BUCKET}`);
   console.log(`  Registry bucket: ${REGISTRY_BUCKET}`);
   console.log(`  Shell bucket:    ${SHELL_BUCKET}`);
-  console.log(`  Tables:          ${PROJECTS_TABLE}, ${REGISTRY_TABLE}, ${LOCKS_TABLE}`);
+  console.log(`  Tables:          ${PROJECTS_TABLE}, ${REGISTRY_TABLE}, ${LOCKS_TABLE}, ${ASSETS_TABLE}`);
   console.log(`  Default config:  s3://${MODULES_BUCKET}/${DEFAULT_APP_CONFIG_PATH}`);
 }
 

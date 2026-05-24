@@ -16,8 +16,8 @@
     "module-core": "*",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "@aws-sdk/client-s3": "^3.943.0",
-    "@aws-sdk/lib-dynamodb": "^3.943.0"
+    "@aws-sdk/client-s3": "3.943.0",
+    "@aws-sdk/lib-dynamodb": "3.943.0"
   },
   "devDependencies": {
     "@types/react": "^19.2.5",

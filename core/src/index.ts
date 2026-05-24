@@ -6,6 +6,8 @@ export type {
   ModuleProps,
   ModuleBundle,
   ExportContext,
+  AssetRecord,
+  AssetVersionRef,
   AwsCredentials,
   UserProfile,
   ModuleCategory,
@@ -51,3 +53,23 @@ export { SlotContainer } from "./SlotContainer.tsx";
 // Module registry
 export { useModuleRegistry } from "./useModuleRegistry.ts";
 export { ModulePicker } from "./ModulePicker.tsx";
+
+// Project assets
+export {
+  MAX_EMBEDDED_ASSET_VERSIONS,
+  addAssetVersion,
+  buildAssetVersionKey,
+  createAsset,
+  createAssetId,
+  createAssetRecord,
+  createAssetVersionId,
+  getAsset,
+  getAssetSk,
+  getCurrentAssetVersion,
+  listAssets,
+  putAsset,
+  rollbackAssetVersion,
+  sanitizeAssetFilename,
+  updateAsset,
+} from "./assets.ts";
+export type { AddAssetVersionInput, CreateAssetRecordInput } from "./assets.ts";

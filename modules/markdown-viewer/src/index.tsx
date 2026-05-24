@@ -267,21 +267,14 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
   const getS3Client = useAwsS3Client();
   const [dragging, setDragging] = useState(false);
   const [phase,    setPhase]    = useState<DropPhase>({ kind: "idle" });
+  const directoryInputRef = useRef<HTMLInputElement | null>(null);
 
-  const handleDrop = useCallback(async (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragging(false);
-    const items = Array.from(e.dataTransfer.items);
-    const dirEntry = items
-      .map((i) => i.webkitGetAsEntry())
-      .find((entry): entry is FileSystemDirectoryEntry => entry?.isDirectory === true);
-    if (!dirEntry) {
-      setPhase({ kind: "error", message: "Drop a folder — the browser only grants access to files you explicitly drag, not their siblings." });
-      return;
-    }
+  const processFileMap = useCallback(async (
+    fileMap: Map<string, File>,
+    dirName: string,
+  ) => {
     setPhase({ kind: "reading" });
     try {
-      const fileMap = await readDirEntry(dirEntry);
       const mdFiles = [...fileMap.keys()]
         .filter((p) => /\.mdx?$/i.test(p))
         .sort((a, b) => {
@@ -291,7 +284,7 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
           return a.localeCompare(b);
         });
       if (mdFiles.length === 0) {
-        setPhase({ kind: "error", message: "No .md files found in the dropped folder." });
+        setPhase({ kind: "error", message: "No .md files found in the selected folder." });
         return;
       }
       const rootMd   = mdFiles.filter((p) => !p.includes("/"));
@@ -309,12 +302,56 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
         setPhase({ kind: "confirm", entryPath: autoEntry, fileMap, reachable });
       } else {
         mdLog("multiple possible markdown entries discovered", { mdFiles });
-        setPhase({ kind: "pick", dirName: dirEntry.name, mdFiles, fileMap });
+        setPhase({ kind: "pick", dirName, mdFiles, fileMap });
       }
     } catch (err: unknown) {
       setPhase({ kind: "error", message: (err as Error).message });
     }
   }, []);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragging(false);
+    const items = Array.from(e.dataTransfer.items);
+    const dirEntry = items
+      .map((i) => i.webkitGetAsEntry())
+      .find((entry): entry is FileSystemDirectoryEntry => entry?.isDirectory === true);
+    if (!dirEntry) {
+      setPhase({ kind: "error", message: "Drop a folder — the browser only grants access to files you explicitly drag, not their siblings." });
+      return;
+    }
+    setPhase({ kind: "reading" });
+    try {
+      await processFileMap(await readDirEntry(dirEntry), dirEntry.name);
+    } catch (err: unknown) {
+      setPhase({ kind: "error", message: (err as Error).message });
+    }
+  }, [processFileMap]);
+
+  const handleChooseDirectory = useCallback(() => {
+    if (phase.kind === "idle" || phase.kind === "error") {
+      directoryInputRef.current?.click();
+    }
+  }, [phase.kind]);
+
+  const handleDirectoryInput = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.currentTarget.files ?? []);
+    e.currentTarget.value = "";
+    if (files.length === 0) return;
+
+    const firstPath = files[0]?.webkitRelativePath || files[0]?.name || "folder";
+    const rootDir = firstPath.split("/")[0] || "folder";
+    const fileMap = new Map<string, File>();
+
+    for (const file of files) {
+      const rawPath = file.webkitRelativePath || file.name;
+      const parts = rawPath.split("/");
+      const relativePath = parts.length > 1 ? parts.slice(1).join("/") : rawPath;
+      if (relativePath) fileMap.set(relativePath, file);
+    }
+
+    await processFileMap(fileMap, rootDir);
+  }, [processFileMap]);
 
   const handlePickEntry = useCallback(async (entryPath: string, fileMap: Map<string, File>) => {
     setPhase({ kind: "crawling" });
@@ -445,6 +482,15 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
   // idle / error
   return (
     <div
+      role="button"
+      tabIndex={0}
+      onClick={handleChooseDirectory}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          handleChooseDirectory();
+        }
+      }}
       onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
       onDragLeave={() => setDragging(false)}
       onDrop={handleDrop}
@@ -454,9 +500,19 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
         background: dragging ? "rgba(59,130,246,0.06)" : C.bg,
         border: `2px dashed ${dragging ? C.accent : C.border}`,
         borderRadius: 8, margin: "2rem",
+        cursor: "pointer",
+        outline: "none",
         transition: "background 0.15s, border-color 0.15s",
       }}
     >
+      <input
+        ref={directoryInputRef}
+        type="file"
+        multiple
+        onChange={handleDirectoryInput}
+        style={{ display: "none" }}
+        {...{ webkitdirectory: "", directory: "" }}
+      />
       {phase.kind === "error" && (
         <p style={{ margin: 0, fontSize: "0.8rem", color: "#fca5a5", textAlign: "center", maxWidth: 320 }}>
           {phase.message}
@@ -464,10 +520,10 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
       )}
       <div style={{ fontSize: "2.5rem", opacity: dragging ? 1 : 0.4 }}>📄</div>
       <p style={{ margin: 0, fontSize: "0.9rem", color: dragging ? C.text : C.muted, textAlign: "center", maxWidth: 360, lineHeight: 1.6 }}>
-        Drop your <strong>docs folder</strong> here.
+        Click to choose your <strong>docs folder</strong>, or drop it here.
       </p>
       <p style={{ margin: 0, fontSize: "0.75rem", color: "#374151", textAlign: "center", maxWidth: 320, lineHeight: 1.5 }}>
-        Drop the folder containing your .md files. A single entry point is picked
+        Select the folder containing your .md files. A single entry point is picked
         automatically (README/index) or chosen from a list. Only reachable files are uploaded.
       </p>
     </div>

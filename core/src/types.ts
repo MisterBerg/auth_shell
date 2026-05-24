@@ -19,6 +19,42 @@ export type Resource = {
   meta?: Record<string, unknown>;
 };
 
+// ---------------------------------------------------------------------------
+// Project assets — stable project-scoped data objects backed by S3.
+// ---------------------------------------------------------------------------
+
+export type AssetVersionRef = {
+  versionId: string;
+  bucket: string;
+  key: string;
+
+  mimeType?: string;
+  sizeBytes?: number;
+  etag?: string;
+  sha256?: string;
+
+  createdAt: string;
+  createdBy?: string;
+};
+
+export type AssetRecord = {
+  projectId: string;
+  sk: `asset#${string}`;
+
+  assetId: string;
+  label: string;
+
+  /** Current version is always versions[0]. */
+  versions: AssetVersionRef[];
+
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  updatedBy?: string;
+
+  meta?: Record<string, unknown>;
+};
+
 export type ChildSlot = {
   slotId: string;           // logical name for this slot; semantics defined by the parent module
   app: {

@@ -22,6 +22,7 @@ export type AuthContextValue = {
   tables?: {
     registry?: string;  // module registry table (default: "module-registry")
     projects?: string;  // org projects table   (default: "org-projects")
+    assets?: string;    // project asset table   (default derived from projects table)
   };
 };
 

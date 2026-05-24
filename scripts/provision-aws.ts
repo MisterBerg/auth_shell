@@ -12,6 +12,7 @@
  *     jeffspace-projects         — userId (PK) + projectId (SK) + shared GSI
  *     jeffspace-module-registry  — moduleName (PK) + version (SK)
  *     jeffspace-projects-locks   — projectId (PK)
+ *     jeffspace-project-assets   — projectId (PK) + sk (SK)
  *
  *   CloudFront:
  *     distribution → jeffspace-shell (OAC, HTTPS, SPA error routing)
@@ -82,6 +83,7 @@ const TABLES = {
   projects: "jeffspace-projects",
   registry: "jeffspace-module-registry",
   locks:    "jeffspace-projects-locks",
+  assets:   "jeffspace-project-assets",
 };
 
 // ---------------------------------------------------------------------------
@@ -471,6 +473,7 @@ async function main(): Promise<void> {
   await ensureProjectsTable();
   await ensureSimpleTable(TABLES.registry, "moduleName", "version");
   await ensureSimpleTable(TABLES.locks,    "projectId");
+  await ensureSimpleTable(TABLES.assets,   "projectId", "sk");
 
   // ── IAM ──────────────────────────────────────────────────────────────────
   console.log("\n[IAM — Cognito authenticated role]");
