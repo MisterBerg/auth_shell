@@ -211,25 +211,67 @@ In short:
 
 ## Asset Model
 
-### Asset vs Version
+### Settled First Asset Shape
 
-Use project-scoped logical assets, optionally with immutable versions underneath.
+Use project-scoped logical assets. Modules and agents should refer to assets by stable `assetId`, not by guessed S3 paths.
 
-`Asset`
-- stable project-scoped ID
-- human label
-- type
-- current version pointer
-- provenance / source module
-- metadata
+The first implementation should use one DynamoDB asset record with compact embedded version references. Do not create separate asset-version records yet.
 
-`AssetVersion`
-- immutable storage record
-- S3 bucket/key
-- content type
-- size
-- checksum / hash
-- createdAt / createdBy
+```ts
+type AssetVersionRef = {
+  versionId: string;
+  bucket: string;
+  key: string;
+
+  mimeType?: string;
+  sizeBytes?: number;
+  etag?: string;
+  sha256?: string;
+
+  createdAt: string;
+  createdBy?: string;
+};
+
+type AssetRecord = {
+  projectId: string;
+  sk: `asset#${string}`;
+
+  assetId: string;
+  label: string;
+
+  versions: AssetVersionRef[]; // current version is always versions[0]
+
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  updatedBy?: string;
+
+  meta?: Record<string, unknown>;
+};
+```
+
+Asset IDs should be opaque and project-scoped:
+
+```text
+asset_<random>
+```
+
+Version IDs should be timestamped plus random suffix:
+
+```text
+v_<yyyymmddThhmmssZ>_<random>
+```
+
+Asset labels are required. Use the user-provided label when available, otherwise fall back to original filename, generated purpose label, or finally the `assetId`.
+
+`meta` belongs to the logical asset only. Do not add version-level `meta` yet; update the asset-level `meta` as the logical asset changes.
+
+Embedded version rules:
+- `versions[0]` is current
+- rollback moves an existing version ref to index 0
+- `versions[1...]` are available prior versions and are not guaranteed chronological
+- keep at most 20 embedded version refs
+- do not automatically delete old S3 objects when trimming embedded refs in the first implementation
 
 Modules should usually store:
 - `assetId` for stable references
@@ -240,7 +282,21 @@ Modules should usually store:
 This prevents broken links:
 - a module can keep pointing at the same logical asset
 - the storage location can change without requiring every consumer to rewrite references
-- immutable versions allow reproducibility where needed
+- compact embedded versions allow basic rollback and reproducibility without a separate version table shape yet
+
+### S3 Layout
+
+Asset bytes should be stored under the project, not under the uploading module:
+
+```text
+projects/<projectId>/assets/<assetId>/versions/<versionId>/<filename>
+```
+
+Example:
+
+```text
+s3://jeffspace-modules/projects/hardware-eval-mabc123/assets/asset_k8x4p2m9/versions/v_20260523T182200Z_x4p2/motor-controller.pdf
+```
 
 ## Registry Shape
 
@@ -248,19 +304,21 @@ There should be one global asset registry table, not one table per project.
 
 However, the primary partition boundary must be `projectId`, so current-project reads are efficient and direct.
 
-Example high-level shape:
+First implementation shape:
 
 ```text
-Table: project-assets
+Table: jeffspace-project-assets
 PK: projectId
 SK: asset#<assetId>
 ```
 
-Possible sibling items:
+Accepted first item type:
 - `asset#<assetId>`
-- `asset-version#<assetId>#<versionId>`
-- `source#<sourceId>`
-- `derived-view#<assetId>#<viewType>`
+
+Possible later sibling items, not part of the first asset pass:
+- `typed-source#<sourceId>`
+- `typed-view#<sourceId>#<viewType>`
+- `asset-version#<assetId>#<versionId>` if embedded versions become too large
 
 This keeps all current-project assets queryable without scans, even if a project has tens of thousands of assets.
 
@@ -358,7 +416,7 @@ The agent should operate through stable objects and project graph updates, not t
 
 ## Project Graph
 
-The data layer needs to cover both:
+Over time, the data layer needs to cover both:
 - assets/artifacts
 - workspace structure
 
@@ -369,7 +427,9 @@ That means agents and future tooling should be able to reason about:
 - asset references
 - typed source links
 
-This likely becomes a "project graph" concept over time, even if the first implementation starts with assets.
+For now, do not persist a separate module-instance graph. Keep the nested project `config.json` as the canonical workspace structure and let the runtime broker build an in-memory graph from it.
+
+A persisted project graph may become useful later for server-side search, partial lazy-load mutation, indexing, locking, or agent operations that should not require loading the full project config in the browser.
 
 ## Scheduler Module Direction
 
@@ -409,7 +469,7 @@ Implemented today:
 
 Not implemented yet:
 - project asset table
-- asset/version abstraction
+- asset abstraction with embedded compact version refs
 - shared project data broker
 - typed data source registry
 - stable asset references across modules
@@ -431,8 +491,8 @@ Not implemented yet:
 - Whether structured module state and binary artifacts should share one table shape or be sibling concepts
 - Whether the broker should support persistence beyond the current loaded session
 - Whether cross-project asset reuse is supported initially or only project-scoped assets
-- Whether asset versions are first-class from day one or added after logical assets
-- How much of the project graph should be formalized in DynamoDB versus remaining config-file driven
+- Whether embedded asset versions need promotion to separate DynamoDB records after real usage
+- How much of the project graph should eventually be formalized in DynamoDB versus remaining config-file driven
 
 ## Operational Notes
 
