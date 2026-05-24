@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { spawnSync } from "child_process";
+import { createRequire } from "module";
 import { readFileSync, existsSync, readdirSync, statSync, writeFileSync } from "fs";
 import { dirname, join, relative, resolve } from "path";
 import { fileURLToPath } from "url";
@@ -11,6 +12,8 @@ import { DeleteCommand, DynamoDBDocumentClient, QueryCommand } from "@aws-sdk/li
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "..");
 const STATE_PATH = join(ROOT, ".local-publish-state.json");
+const require = createRequire(import.meta.url);
+const TSX_CLI = require.resolve("tsx/cli");
 
 const LOCAL = {
   s3Endpoint: "http://localhost:9000",
@@ -185,12 +188,11 @@ function selectPublishTargets(workspaces: WorkspaceEntry[], state: PublishState)
 function publishWorkspace(workspace: WorkspaceEntry): void {
   const publishScript = join(ROOT, "scripts", "publish-module.ts");
   const result = spawnSync(
-    "npx",
-    ["tsx", publishScript, `--module=${workspace.path}`, "--local"],
+    process.execPath,
+    [TSX_CLI, publishScript, `--module=${workspace.path}`, "--local"],
     {
       cwd: ROOT,
       stdio: "inherit",
-      shell: true,
     }
   );
 

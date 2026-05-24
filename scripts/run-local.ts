@@ -13,25 +13,29 @@
  */
 
 import { execFileSync, spawn } from "child_process";
+import { createRequire } from "module";
 import { join, resolve } from "path";
 
 const ROOT = resolve(process.cwd());
 const SHELL_DIR = join(ROOT, "apps", "shell");
+const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
+const require = createRequire(import.meta.url);
+const TSX_CLI = require.resolve("tsx/cli");
 
 function main() {
   const developer = parseDeveloper();
 
-  run("npx", ["tsx", "scripts/compose-up.ts"]);
-  run("npx", ["tsx", "scripts/seed-local.ts", `--developer=${developer}`]);
-  run("npx", ["tsx", "scripts/update-locals.ts"]);
+  runTsx("scripts/compose-up.ts");
+  runTsx("scripts/seed-local.ts", [`--developer=${developer}`]);
+  runTsx("scripts/update-locals.ts");
 
   console.log("\nStarting shell dev server...");
   console.log(`Project URL: http://localhost:5173/?bucket=hep-dev-modules&config=projects/${developer}-dev/config.json\n`);
 
-  const child = spawn("npm", ["run", "dev", "--", "--host", "0.0.0.0"], {
+  const child = spawn(NPM_COMMAND, ["run", "dev", "--", "--host", "0.0.0.0"], {
     cwd: SHELL_DIR,
     stdio: "inherit",
-    shell: true,
+    shell: process.platform === "win32",
   });
 
   child.on("exit", (code, signal) => {
@@ -57,6 +61,10 @@ function run(command: string, args: string[]): void {
     cwd: ROOT,
     stdio: "inherit",
   });
+}
+
+function runTsx(scriptPath: string, scriptArgs: string[] = []): void {
+  run(process.execPath, [TSX_CLI, scriptPath, ...scriptArgs]);
 }
 
 main();
