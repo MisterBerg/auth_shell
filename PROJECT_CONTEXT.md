@@ -466,25 +466,43 @@ Implemented today:
 - module registry and dynamic loading
 - project/module persistence in S3 + DynamoDB
 - serial shared runtime
+- project asset table provisioning for local and cloud environments
+- compact embedded-version asset helpers in `module-core`
+- Markdown Viewer upload to central project assets
+- Document Viewer upload to central project assets
+- Document Viewer project-PDF picker backed by the central asset table
 
 Not implemented yet:
-- project asset table
-- asset abstraction with embedded compact version refs
 - shared project data broker
 - typed data source registry
-- stable asset references across modules
 - agent-writable project data APIs
 - scheduler module
 
+Partially implemented:
+- stable asset references across modules: Markdown Viewer creates file-set/file assets and Document Viewer can select PDF file assets from the same project
+- browse/search: current PDF picker searches labels, paths, version metadata, asset metadata, and parent file-set labels; a reusable broker-level browser is still future work
+
+Markdown Viewer first asset behavior:
+- creates one `file-set` asset for the reachable markdown tree
+- creates one `file` asset for each reachable markdown-linked file
+- stores file bytes under `projects/<projectId>/assets/<fileSetAssetId>/versions/<versionId>/files/<path>`
+- stores a JSON manifest as the file-set version object
+- stores module meta as `{ prefix, rootKey, bucket, assetId, versionId }`
+
+Document Viewer first asset behavior:
+- new PDF uploads create one `file` asset
+- module meta stores `{ key, filename, bucket, assetId, versionId }`
+- edit mode can browse existing project PDF assets and point the viewer at the selected asset version
+- older S3-only document meta remains readable
+
 ## Recommended Implementation Order
 
-1. Introduce project asset metadata table in DynamoDB
-2. Introduce asset upload/resolve helpers in `module-core` or a sibling shared package
-3. Add the browser-local shared project data broker
-4. Convert document viewer and markdown viewer to create/use asset records instead of module-private storage assumptions
-5. Add typed data source support for structured module data
-6. Update task tracker to publish a typed task-date view
-7. Build scheduler on top of that data layer
+1. Add the browser-local shared project data broker
+2. Promote the Document Viewer PDF picker into a reusable asset/source picker
+3. Add typed data source support for structured module data
+4. Update task tracker to publish a typed task-date view
+5. Build scheduler on top of that data layer
+6. Add agent-facing project mutation APIs for creating nested modules and wiring asset/source references
 
 ## Open Decisions
 

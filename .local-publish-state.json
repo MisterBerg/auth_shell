@@ -1,19 +1,19 @@
 {
   "workspaces": {
-    "layouts/top-left": "20e105e7c7e54260429ace7b9c157cfe4beac2929736638bd00cf0bf6cc391e4",
-    "layouts/tabs-top": "476013a36a80efaba32b7c48e00848ce9dfaacb22800db7131533d8f57312b12",
-    "layouts/tabs-left": "17ede8564ffac5849f983c9aef47dc0a3d7a2e0d2673f8471bdccce820b77bff",
-    "layouts/left-right-columns": "667db17a8b78d56916e452f8112648ec40dfa167998c1342ec84fd427dca1737",
-    "modules/webview": "f2ce2b522f1b78efe1bd9dbf9b726ca40f973bf320c0fc1f7c21c29b3a8c2192",
-    "modules/oauth-badge": "da5429bebf8672141e86f1b0b3df77ae330778cd79568a8b84fc763b8426abcd",
-    "modules/markdown-viewer": "c132eace6fbb3694d476b69127d33bf4f8b966ae227148707836ad139c067f0c",
-    "modules/document-viewer": "e482761d66d81de199733fcfc6f6ca90bc796385b0480c3296e622b9e54cfe65",
-    "modules/documentation-viewer": "355b5da15f509a4df375836230a7753d08ac9b9421b825afa99a02cef0dd60b0",
-    "modules/links": "0f3ae9fbbe98b6b61d07d36c0ea3fc7e3524e74381e103e2b988ff4d533e01e1",
-    "modules/serial-display": "5d3fcf799c2fe8f29565aa4b00576f13ebe69481ebc9a314bca4a0499038d385",
-    "modules/task-tracker": "b69144fc7f308c093d5588d1d8b562f89a95ad01cb7790793b82d632eef6cb4b",
-    "modules/kicad-board-viewer": "3ea687ed1baefda0c11813960087eccbc5c9602dd173e3b02cc033245a952457",
-    "modules/shell-core": "94dce7c778083daf867df293853f881e5552f7b7c380daba2e53a68ba4dd3943",
-    "apps/landing": "9d1449c6da21edefecfacdf4dff6e92a95fc52bb9ef89c5ee645d0c3186b5ea2"
+    "layouts/top-left": "716b52c51a06960ccc29b98df6889dc26f5785f975b023b0ba2ddab059091b24",
+    "layouts/tabs-top": "999fd0ed82f7ebb76f1342913bd31a8a0a58b7ad70c274011d6093e94a6aac43",
+    "layouts/tabs-left": "03e1d13bd42f7638f51a4c25770b7de8dfcd4a7919553a9ef0beb2ade14b381d",
+    "layouts/left-right-columns": "446dc7096cd6fdc6290d5252afb1802a30e6ef8ba5a93d57194d359a1bb77f85",
+    "modules/webview": "3fd4d1fae6180e98e1e398a9534db5da410477d3a28f9617a7dc2e0e97551934",
+    "modules/oauth-badge": "7a4ede4ab1e84bb78513c85998dd077142092aa902f7fd7c820f3fd23aad2fb5",
+    "modules/markdown-viewer": "0d43c26289fddd6958e255a3e809d67aa90077687c1a57978c6a0a06ee6d61d5",
+    "modules/document-viewer": "11783c06dbcf9f74cc69d3d7fd38da3bfdaf4af0fada281e7acd148b025cee5d",
+    "modules/documentation-viewer": "02cacf5ec8edca8085e2ab2e7b434bbb743592ad5922a8ba6805a9822dc90383",
+    "modules/links": "d171b4d8f446dcf957f159ad980cb4cb757825e757481cd9e8ef57e2e12f39cc",
+    "modules/serial-display": "9a6c0a257ece4b6c796d7cd11263392bbc4ddda9bd25b6b305f3aac29848ae7e",
+    "modules/task-tracker": "96274172cf59d59f0db410f7126c99510bff3128a3d9f816be07652d467b4b5a",
+    "modules/kicad-board-viewer": "b73dfba3768492fe2fd12f34e4b23b515884cd8823407f287810d2030692b7ed",
+    "modules/shell-core": "224fe60becc79ccb8582b490e3c1c6dadd09147e8dea4feae34a72703cdc820b",
+    "apps/landing": "cfe4358fa9015e2180bea16b8cdb4cda958bd9795c7e4f67f3f8272ad85eed32"
   }
 }

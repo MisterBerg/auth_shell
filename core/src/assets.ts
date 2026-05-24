@@ -232,6 +232,41 @@ export async function updateAsset(args: {
   }));
 }
 
+export function getAssetSearchText(asset: AssetRecord, relatedAssets: AssetRecord[] = []): string {
+  return [
+    asset.assetId,
+    asset.label,
+    asset.versions.map((version) => [
+      version.versionId,
+      version.bucket,
+      version.key,
+      version.mimeType,
+      version.sizeBytes,
+      version.etag,
+      version.sha256,
+    ].join(" ")).join(" "),
+    JSON.stringify(asset.meta ?? {}),
+    relatedAssets.map((related) => [
+      related.assetId,
+      related.label,
+      related.versions[0]?.mimeType,
+      related.versions[0]?.key,
+      JSON.stringify(related.meta ?? {}),
+    ].join(" ")).join(" "),
+  ].join(" ").toLowerCase();
+}
+
+export function assetMatchesSearch(
+  asset: AssetRecord,
+  query: string,
+  relatedAssets: AssetRecord[] = [],
+): boolean {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return true;
+  const text = getAssetSearchText(asset, relatedAssets);
+  return terms.every((term) => text.includes(term));
+}
+
 function normalizeVersion(
   version: CreateAssetRecordInput["version"],
   fallbackCreatedAt: string,

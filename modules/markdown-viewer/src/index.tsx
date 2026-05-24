@@ -1,6 +1,16 @@
 import React, { useState, useCallback, useRef } from "react";
 import type { ModuleProps } from "module-core";
-import { useEditMode, useUpdateSlotMeta, useAwsS3Client } from "module-core";
+import {
+  createAsset,
+  createAssetId,
+  createAssetRecord,
+  createAssetVersionId,
+  useAwsDdbClient,
+  useAwsS3Client,
+  useEditMode,
+  useTableNames,
+  useUpdateSlotMeta,
+} from "module-core";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { MarkdownPane } from "./MarkdownPane.tsx";
 import type { MarkdownTab } from "./MarkdownPane.tsx";
@@ -78,6 +88,10 @@ function splitDirAndName(path: string): { dir: string; name: string } {
   const parts = path.split("/");
   const name = parts.pop() ?? "";
   return { dir: parts.join("/"), name };
+}
+
+function basename(path: string): string {
+  return splitDirAndName(path).name || path;
 }
 
 function fileStem(name: string): string {
@@ -183,6 +197,31 @@ async function crawlMarkdown(
   return reachable;
 }
 
+function mimeForFile(file: File, path: string): string {
+  if (file.type) return file.type;
+  const ext = path.split(".").pop()?.toLowerCase();
+  if (ext === "md" || ext === "mdx") return "text/markdown";
+  if (ext === "pdf") return "application/pdf";
+  if (ext === "png") return "image/png";
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "gif") return "image/gif";
+  if (ext === "svg") return "image/svg+xml";
+  if (ext === "html" || ext === "htm") return "text/html";
+  if (ext === "css") return "text/css";
+  if (ext === "js" || ext === "mjs") return "text/javascript";
+  if (ext === "json") return "application/json";
+  return "application/octet-stream";
+}
+
+function encodePathSegment(value: string): string {
+  return encodeURIComponent(value).replace(/%20/g, "-");
+}
+
+function extractProjectId(configPath: string, fallback: string): string {
+  const match = configPath.match(/(?:^|\/)projects\/([^/]+)/);
+  return match?.[1] ?? fallback;
+}
+
 // ---------------------------------------------------------------------------
 // File System helpers
 // ---------------------------------------------------------------------------
@@ -258,13 +297,22 @@ type DropPhase =
   | { kind: "error"; message: string };
 
 interface DropZoneProps {
-  prefix: string;
   bucket: string;
-  onUploaded: (rootKey: string, suggestedTitle: string) => void;
+  projectId: string;
+  moduleInstanceId: string;
+  onUploaded: (upload: {
+    prefix: string;
+    rootKey: string;
+    bucket: string;
+    assetId: string;
+    versionId: string;
+  }) => void;
 }
 
-function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
+function DropZone({ bucket, projectId, moduleInstanceId, onUploaded }: DropZoneProps) {
   const getS3Client = useAwsS3Client();
+  const getDdbClient = useAwsDdbClient();
+  const { assets: assetsTable } = useTableNames();
   const [dragging, setDragging] = useState(false);
   const [phase,    setPhase]    = useState<DropPhase>({ kind: "idle" });
   const directoryInputRef = useRef<HTMLInputElement | null>(null);
@@ -385,28 +433,115 @@ function DropZone({ prefix, bucket, onUploaded }: DropZoneProps) {
     });
     let done = 0;
     try {
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      const fileSetAssetId = createAssetId();
+      const fileSetVersionId = createAssetVersionId();
+      const versionRoot = [
+        "projects",
+        encodePathSegment(projectId),
+        "assets",
+        encodePathSegment(fileSetAssetId),
+        "versions",
+        encodePathSegment(fileSetVersionId),
+      ].join("/");
+      const filesPrefix = `${versionRoot}/files`;
+      const manifestKey = `${versionRoot}/manifest.json`;
+
       const s3 = await getS3Client(bucket);
+      const ddb = await getDdbClient();
+      const childAssetRefs: Array<{ path: string; assetId: string; versionId: string; key: string; mimeType: string; sizeBytes: number }> = [];
+
       for (const { path, file, sourcePath } of files) {
         setPhase({ kind: "uploading", done, total: files.length, current: path });
         const bytes = await file.arrayBuffer();
+        const key = `${filesPrefix}/${path}`;
+        const mimeType = mimeForFile(file, path);
         await s3.send(new PutObjectCommand({
           Bucket: bucket,
-          Key: `${prefix}/${path}`,
+          Key: key,
           Body: new Uint8Array(bytes),
-          ContentType: file.type || "application/octet-stream",
+          ContentType: mimeType,
         }));
+        const assetId = createAssetId();
+        const versionId = createAssetVersionId();
+        await createAsset({
+          ddb,
+          tableName: assetsTable,
+          asset: createAssetRecord({
+            projectId,
+            assetId,
+            label: basename(path),
+            version: {
+              versionId,
+              bucket,
+              key,
+              mimeType,
+              sizeBytes: file.size,
+            },
+            meta: {
+              kind: "file",
+              parentAssetId: fileSetAssetId,
+              path,
+              moduleInstanceId,
+              moduleType: "module-markdown-viewer",
+            },
+          }),
+        });
+        childAssetRefs.push({ path, assetId, versionId, key, mimeType, sizeBytes: file.size });
         if (path !== sourcePath) {
           mdLog("uploaded alias path", { path, sourcePath });
         }
         done++;
       }
-      const rootKey        = `${prefix}/${entryPath}`;
-      const suggestedTitle = entryPath.replace(/\.mdx?$/i, "").replace(/[-_]/g, " ");
-      onUploaded(rootKey, suggestedTitle);
+
+      setPhase({ kind: "uploading", done: files.length, total: files.length, current: "Registering file set" });
+      const manifestBytes = new TextEncoder().encode(JSON.stringify({
+        kind: "markdown-file-set",
+        entryPath,
+        moduleInstanceId,
+        files: childAssetRefs,
+      }, null, 2));
+      await s3.send(new PutObjectCommand({
+        Bucket: bucket,
+        Key: manifestKey,
+        Body: manifestBytes,
+        ContentType: "application/json",
+      }));
+      await createAsset({
+        ddb,
+        tableName: assetsTable,
+        asset: createAssetRecord({
+          projectId,
+          assetId: fileSetAssetId,
+          label: basename(entryPath).replace(/\.mdx?$/i, "").replace(/[-_]/g, " "),
+          version: {
+            versionId: fileSetVersionId,
+            bucket,
+            key: manifestKey,
+            mimeType: "application/json",
+            sizeBytes: manifestBytes.byteLength,
+          },
+          meta: {
+            kind: "file-set",
+            entryPath,
+            moduleInstanceId,
+            moduleType: "module-markdown-viewer",
+            fileCount: files.length,
+          },
+        }),
+      });
+
+      onUploaded({
+        prefix: filesPrefix,
+        rootKey: `${filesPrefix}/${entryPath}`,
+        bucket,
+        assetId: fileSetAssetId,
+        versionId: fileSetVersionId,
+      });
     } catch (err: unknown) {
       setPhase({ kind: "error", message: (err as Error).message });
     }
-  }, [prefix, bucket, getS3Client, onUploaded]);
+  }, [assetsTable, bucket, getDdbClient, getS3Client, moduleInstanceId, onUploaded, projectId]);
 
   if (phase.kind === "reading" || phase.kind === "crawling") {
     return (
@@ -543,12 +678,12 @@ export default function MarkdownViewer({ config }: ModuleProps) {
   const uploadBucket = params.get("bucket") ?? "";
   const configPath   = params.get("config") ?? "";
   const projectDir   = configPath.split("/").slice(0, -1).join("/");
+  const projectId    = extractProjectId(configPath, config.id);
 
-  // Meta shape: { prefix: string, rootKey: string, bucket: string }
-  // prefix is derived once from config.id (the slot ID) and never changes.
-  const savedMeta = config.meta as { prefix?: string; rootKey?: string; bucket?: string } | undefined;
+  // Meta shape: { prefix, rootKey, bucket, assetId?, versionId? }
+  // New uploads use central project assets; older S3-only meta still renders.
+  const savedMeta = config.meta as { prefix?: string; rootKey?: string; bucket?: string; assetId?: string; versionId?: string } | undefined;
   const bucket    = savedMeta?.bucket || uploadBucket;
-  // prefix is stable: computed from slotId on first upload, stored in meta
   const prefix    = savedMeta?.prefix ?? (projectDir ? `${projectDir}/docs/${config.id}` : `docs/${config.id}`);
 
   const [rootKey,   setRootKey]   = useState(savedMeta?.rootKey ?? "");
@@ -558,14 +693,20 @@ export default function MarkdownViewer({ config }: ModuleProps) {
     ? { tabId: config.id, title: "", bucket, prefix, rootKey }
     : undefined;
 
-  const handleUploaded = useCallback(async (newRootKey: string) => {
+  const handleUploaded = useCallback(async (upload: {
+    prefix: string;
+    rootKey: string;
+    bucket: string;
+    assetId: string;
+    versionId: string;
+  }) => {
     setReplacing(false);
-    setRootKey(newRootKey);
-    const newMeta = { prefix, rootKey: newRootKey, bucket: uploadBucket };
+    setRootKey(upload.rootKey);
+    const newMeta = upload;
     if (updateSlotMeta) {
       try { await updateSlotMeta(newMeta); } catch { /* non-fatal */ }
     }
-  }, [prefix, uploadBucket, updateSlotMeta]);
+  }, [updateSlotMeta]);
 
   const showDrop = (!rootKey || replacing) && editMode;
 
@@ -596,9 +737,10 @@ export default function MarkdownViewer({ config }: ModuleProps) {
       <div style={{ flex: 1, minHeight: 0 }}>
         {showDrop ? (
           <DropZone
-            prefix={prefix}
             bucket={uploadBucket || bucket}
-            onUploaded={(rootKey) => handleUploaded(rootKey)}
+            projectId={projectId}
+            moduleInstanceId={config.id}
+            onUploaded={handleUploaded}
           />
         ) : tab ? (
           <MarkdownPane tab={tab} getS3Client={getS3Client} />
