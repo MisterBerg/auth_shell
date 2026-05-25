@@ -223,6 +223,9 @@ type MarkdownFileInput = {
 const DEFAULT_MODEL = "gpt-5.2-codex";
 const DEFAULT_TITLE = "Codex Chat";
 const TOOL_ITERATION_LIMIT = 20;
+const BROWSER_CONTEXT_ITEM_LIMIT = 18;
+const BROWSER_CONTEXT_CHAR_BUDGET = 24000;
+const BROWSER_CONTEXT_SUMMARY_LIMIT = 2800;
 const DEFAULT_PROMPT = [
   "You are helping build and evolve this workspace.",
   "Use the provided workspace tools whenever project structure, assets, resources, or modules are relevant.",
@@ -1036,6 +1039,54 @@ function toInputItems(messages: ChatMessage[]): InputMessageItem[] {
         text: message.text,
       }],
     }));
+}
+
+function summarizeInputItem(item: InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem): string {
+  if ((item as FunctionCallOutputItem).type === "function_call_output") {
+    const outputItem = item as FunctionCallOutputItem;
+    const snippet = outputItem.output.replace(/\s+/g, " ").slice(0, 220);
+    return `tool-output ${outputItem.call_id}: ${snippet}`;
+  }
+
+  if ((item as ResponsesApiFunctionCall).type === "function_call") {
+    const call = item as ResponsesApiFunctionCall;
+    const args = call.arguments.replace(/\s+/g, " ").slice(0, 180);
+    return `tool-call ${call.name}: ${args}`;
+  }
+
+  if ((item as InputMessageItem).type === "message") {
+    const message = item as InputMessageItem;
+    const text = message.content.map((part) => part.text).join(" ").replace(/\s+/g, " ").slice(0, 240);
+    return `${message.role}: ${text}`;
+  }
+
+  const raw = JSON.stringify(item);
+  return raw.length > 240 ? `${raw.slice(0, 240)}...` : raw;
+}
+
+function compactInputItems(inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>) {
+  const serializedLength = inputItems.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
+  if (inputItems.length <= BROWSER_CONTEXT_ITEM_LIMIT && serializedLength <= BROWSER_CONTEXT_CHAR_BUDGET) {
+    return { inputItems, truncatedSummary: "" };
+  }
+
+  const recentItems = inputItems.slice(-BROWSER_CONTEXT_ITEM_LIMIT);
+  const droppedItems = inputItems.slice(0, Math.max(0, inputItems.length - recentItems.length));
+  const summaryLines: string[] = [];
+  let used = 0;
+  for (const item of droppedItems) {
+    const line = `- ${summarizeInputItem(item)}`;
+    if (used + line.length > BROWSER_CONTEXT_SUMMARY_LIMIT) break;
+    summaryLines.push(line);
+    used += line.length + 1;
+  }
+
+  return {
+    inputItems: recentItems,
+    truncatedSummary: summaryLines.length
+      ? `Older browser context was compacted. Summary of earlier turns and tool activity:\n${summaryLines.join("\n")}`
+      : "Older browser context was compacted.",
+  };
 }
 
 async function createOpenAiResponse(args: {
@@ -2182,15 +2233,25 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       if (args.signal.aborted) {
         throw new DOMException("The agent run was stopped.", "AbortError");
       }
+      const compacted = compactInputItems(inputItems);
+      const instructions = compacted.truncatedSummary
+        ? [...args.contextBits, compacted.truncatedSummary].join(" ")
+        : args.contextBits.join(" ");
+      if (compacted.truncatedSummary) {
+        args.onProgress({
+          kind: "status",
+          text: "Older browser context was compacted for this step.",
+        });
+      }
       args.onProgress({
         kind: "status",
         text: `Working step ${i + 1} of up to ${TOOL_ITERATION_LIMIT}...`,
       });
       const response = await createOpenAiResponse({
         apiKey: apiKey.trim(),
-        input: inputItems,
+        input: compacted.inputItems,
         model,
-        instructions: args.contextBits.join(" "),
+        instructions,
         tools: TOOL_DEFINITIONS,
         signal: args.signal,
       });
