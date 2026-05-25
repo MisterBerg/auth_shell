@@ -12,7 +12,7 @@
  *   npm run run:local -- --developer=jeff
  */
 
-import { execFileSync, spawn } from "child_process";
+import { execFileSync, execSync, spawn } from "child_process";
 import { createRequire } from "module";
 import { join, resolve } from "path";
 import { randomBytes } from "crypto";
@@ -20,11 +20,16 @@ import { randomBytes } from "crypto";
 const ROOT = resolve(process.cwd());
 const SHELL_DIR = join(ROOT, "apps", "shell");
 const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
+const SHELL_PORT = 5173;
+const BRIDGE_PORT = 4317;
 const require = createRequire(import.meta.url);
 const TSX_CLI = require.resolve("tsx/cli");
 
 function main() {
   const developer = parseDeveloper();
+
+  killPort(SHELL_PORT);
+  killPort(BRIDGE_PORT);
 
   runTsx("scripts/compose-up.ts");
   runTsx("scripts/seed-local.ts", [`--developer=${developer}`]);
@@ -43,16 +48,16 @@ function main() {
   });
 
   console.log("\nStarting shell dev server...");
-  console.log(`Project URL: http://localhost:5173/?bucket=hep-dev-modules&config=projects/${developer}-dev/config.json\n`);
-  console.log(`Agent bridge: http://127.0.0.1:4317\n`);
+  console.log(`Project URL: http://localhost:${SHELL_PORT}/?bucket=hep-dev-modules&config=projects/${developer}-dev/config.json\n`);
+  console.log(`Agent bridge: http://127.0.0.1:${BRIDGE_PORT}\n`);
 
-  const child = spawn(NPM_COMMAND, ["run", "dev", "--", "--host", "0.0.0.0"], {
+  const child = spawn(NPM_COMMAND, ["run", "dev", "--", "--host", "0.0.0.0", "--port", String(SHELL_PORT)], {
     cwd: SHELL_DIR,
     stdio: "inherit",
     shell: process.platform === "win32",
     env: {
       ...process.env,
-      VITE_AGENT_BRIDGE_URL: "http://127.0.0.1:4317",
+      VITE_AGENT_BRIDGE_URL: `http://127.0.0.1:${BRIDGE_PORT}`,
       VITE_AGENT_BRIDGE_TOKEN: agentBridgeToken,
     },
   });
@@ -85,6 +90,47 @@ function run(command: string, args: string[]): void {
 
 function runTsx(scriptPath: string, scriptArgs: string[] = []): void {
   run(process.execPath, [TSX_CLI, scriptPath, ...scriptArgs]);
+}
+
+function killPort(port: number) {
+  if (process.platform === "win32") {
+    try {
+      const out = execSync(`netstat -ano | findstr :${port}`, { stdio: "pipe" }).toString();
+      const pids = new Set(
+        out.split("\n")
+          .map((line) => line.trim().split(/\s+/).pop())
+          .filter((pid): pid is string => Boolean(pid) && /^\d+$/.test(pid) && pid !== "0")
+      );
+
+      for (const pid of pids) {
+        try {
+          execSync(`taskkill /F /PID ${pid}`, { stdio: "pipe" });
+        } catch {
+          // already gone
+        }
+      }
+    } catch {
+      // nothing on the port
+    }
+    return;
+  }
+
+  try {
+    const out = execSync(`lsof -ti tcp:${port}`, { stdio: "pipe" }).toString();
+    const pids = new Set(
+      out.split("\n").map((line) => line.trim()).filter((line) => /^\d+$/.test(line))
+    );
+
+    for (const pid of pids) {
+      try {
+        execFileSync("kill", ["-9", pid], { stdio: "pipe" });
+      } catch {
+        // already gone
+      }
+    }
+  } catch {
+    // nothing on the port
+  }
 }
 
 main();

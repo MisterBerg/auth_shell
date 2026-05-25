@@ -10,7 +10,12 @@ import type {
   Resource,
 } from "module-core";
 import {
+  buildAssetVersionKey,
   assetMatchesSearch,
+  createAsset,
+  createAssetId,
+  createAssetRecord,
+  createAssetVersionId,
   getAssetSearchText,
   getCurrentAssetVersion,
   listAssets,
@@ -123,6 +128,17 @@ type ModuleToolArgs = {
   title?: string;
 };
 
+type GenericSlotToolArgs = {
+  moduleName?: string;
+  parentSlotPath?: string[];
+  slotId: string;
+  meta?: Record<string, unknown>;
+  resources?: Resource[];
+  title?: string;
+  children?: ChildSlot[];
+  replaceChildren?: boolean;
+};
+
 type BridgeConfig = {
   url: string;
   token: string;
@@ -149,6 +165,51 @@ type PendingContinuation = {
   inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>;
   contextBits: string[];
   lastToolMessages: string[];
+};
+
+type PersistedChatSession = {
+  messages: ChatMessage[];
+  composer: string;
+  pendingContinuation: PendingContinuation | null;
+};
+
+type AgentRunResult = {
+  assistantText: string;
+  lastToolMessages: string[];
+  pending: PendingContinuation | null;
+  shouldNavigate: boolean;
+};
+
+const RESOURCE_TYPE_VALUES: Resource["type"][] = [
+  "s3-object",
+  "s3-prefix",
+  "dynamodb",
+  "api",
+  "other",
+];
+
+const RESOURCE_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    label: { type: "string" },
+    type: { type: "string", enum: RESOURCE_TYPE_VALUES },
+    bucket: { type: "string" },
+    key: { type: "string" },
+    table: { type: "string" },
+    region: { type: "string" },
+    endpoint: { type: "string" },
+    mimeType: { type: "string" },
+    meta: { type: "object", additionalProperties: true },
+  },
+  required: ["id", "label", "type"],
+  additionalProperties: false,
+} as const;
+
+type MarkdownFileInput = {
+  path: string;
+  content: string;
+  mimeType?: string;
 };
 
 const DEFAULT_MODEL = "gpt-5.2-codex";
@@ -216,6 +277,68 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         path: { type: "string" },
         maxChars: { type: "integer", minimum: 200, maximum: 200000 },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_text_asset",
+    description: "Create a new text-like project asset in the central asset store from inline content.",
+    parameters: {
+      type: "object",
+      properties: {
+        label: { type: "string" },
+        filename: { type: "string" },
+        content: { type: "string" },
+        mimeType: { type: "string" },
+        meta: { type: "object", additionalProperties: true },
+      },
+      required: ["label", "filename", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "import_workspace_file_as_asset",
+    description: "Import a file from the local bridge workspace into the project's central asset store.",
+    parameters: {
+      type: "object",
+      properties: {
+        workspacePath: { type: "string" },
+        label: { type: "string" },
+        filename: { type: "string" },
+        mimeType: { type: "string" },
+        meta: { type: "object", additionalProperties: true },
+      },
+      required: ["workspacePath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_markdown_file_set",
+    description: "Create a markdown-viewer compatible file set asset and child file assets from provided markdown/text files.",
+    parameters: {
+      type: "object",
+      properties: {
+        label: { type: "string" },
+        entryPath: { type: "string" },
+        files: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              content: { type: "string" },
+              mimeType: { type: "string" },
+            },
+            required: ["path", "content"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["label", "entryPath", "files"],
       additionalProperties: false,
     },
   },
@@ -377,23 +500,7 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         meta: { type: "object", additionalProperties: true },
         resources: {
           type: "array",
-          items: {
-            type: "object",
-            properties: {
-              id: { type: "string" },
-              label: { type: "string" },
-              type: { type: "string" },
-              bucket: { type: "string" },
-              key: { type: "string" },
-              table: { type: "string" },
-              region: { type: "string" },
-              endpoint: { type: "string" },
-              mimeType: { type: "string" },
-              meta: { type: "object", additionalProperties: true },
-            },
-            required: ["id", "label", "type"],
-            additionalProperties: false,
-          },
+          items: RESOURCE_SCHEMA,
         },
       },
       required: ["moduleName", "slotId"],
@@ -413,6 +520,90 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
     strict: true,
+  },
+  {
+    type: "function",
+    name: "list_slot_tree",
+    description: "Return the active app-space slot tree with full slot paths, module bundle keys, metadata, resources, and child counts.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "upsert_slot",
+    description: "Create or update a slot anywhere in the active app-space tree using the framework's ChildSlot structure. Parent path defaults to the root.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: {
+          type: "array",
+          items: { type: "string" },
+        },
+        slotId: { type: "string" },
+        moduleName: { type: "string" },
+        title: { type: "string" },
+        meta: { type: "object", additionalProperties: true },
+        resources: {
+          type: "array",
+          items: RESOURCE_SCHEMA,
+        },
+        children: {
+          type: "array",
+          items: { type: "object", additionalProperties: true },
+        },
+        replaceChildren: { type: "boolean" },
+      },
+      required: ["slotId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "remove_slot",
+    description: "Remove a slot anywhere in the active app-space tree by its full slot path.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "update_root_config",
+    description: "Update root-level app-space settings like title/meta, resources, and theme using the existing ModuleConfig contract.",
+    parameters: {
+      type: "object",
+      properties: {
+        moduleName: { type: "string" },
+        meta: { type: "object", additionalProperties: true },
+        resources: {
+          type: "array",
+          items: RESOURCE_SCHEMA,
+        },
+        replaceResources: { type: "boolean" },
+        theme: {
+          type: "object",
+          properties: {
+            cssKey: { type: "string" },
+            cssBucket: { type: "string" },
+          },
+          additionalProperties: false,
+        },
+      },
+      additionalProperties: false,
+    },
   },
 ];
 
@@ -442,6 +633,10 @@ function buildStorageKey(projectId: string, moduleId: string) {
   return `auth-shell:chat-codex:${projectId}:${moduleId}:openai-key`;
 }
 
+function buildChatSessionKey(configBucket: string, configPath: string, moduleId: string) {
+  return `auth-shell:chat-codex:${configBucket}:${configPath}:${moduleId}:session`;
+}
+
 function buildBridgeStorageKey(projectId: string, moduleId: string, field: "url" | "token") {
   return `auth-shell:chat-codex:${projectId}:${moduleId}:bridge-${field}`;
 }
@@ -468,6 +663,20 @@ function safeWriteLocalStorage(key: string, value: string) {
   } catch {
     // Ignore local storage failures so the module still works in-memory.
   }
+}
+
+function readPersistedChatSession(key: string): PersistedChatSession | null {
+  const raw = safeReadLocalStorage(key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as PersistedChatSession;
+  } catch {
+    return null;
+  }
+}
+
+function persistChatSessionNow(key: string, session: PersistedChatSession) {
+  safeWriteLocalStorage(key, JSON.stringify(session));
 }
 
 function createMessage(role: ChatMessage["role"], text: string): ChatMessage {
@@ -506,6 +715,45 @@ function parseToolArgs<T>(raw: string): T {
 function matchesQuery(haystack: string, query: string): boolean {
   if (!query.trim()) return true;
   return haystack.toLowerCase().includes(query.trim().toLowerCase());
+}
+
+function normalizeResources(resources: Resource[] | undefined, contextLabel: string): Resource[] | undefined {
+  if (!resources?.length) return undefined;
+  return resources.map((resource, index) => {
+    if (!RESOURCE_TYPE_VALUES.includes(resource.type)) {
+      throw new Error(
+        `${contextLabel} resource ${index + 1} has invalid type "${String(resource.type)}". ` +
+        `Allowed types: ${RESOURCE_TYPE_VALUES.join(", ")}.`,
+      );
+    }
+    if ((resource.type === "s3-object" || resource.type === "s3-prefix") && (!resource.bucket?.trim() || !resource.key?.trim())) {
+      throw new Error(`${contextLabel} resource ${resource.id} must include bucket and key for type ${resource.type}.`);
+    }
+    if (resource.type === "dynamodb" && !resource.table?.trim()) {
+      throw new Error(`${contextLabel} resource ${resource.id} must include table for type dynamodb.`);
+    }
+    return resource;
+  });
+}
+
+function normalizeChildSlots(children: ChildSlot[] | undefined, contextLabel: string): ChildSlot[] | undefined {
+  if (!children) return undefined;
+  return children.map((child, index) => {
+    if (!child?.slotId?.trim()) {
+      throw new Error(`${contextLabel} child ${index + 1} is missing slotId.`);
+    }
+    if (!child.app?.bucket?.trim() || !child.app?.key?.trim()) {
+      throw new Error(
+        `${contextLabel} child ${child.slotId} is missing app.bucket/app.key. ` +
+        `Nested children must already be full ChildSlot objects.`,
+      );
+    }
+    return {
+      ...child,
+      resources: normalizeResources(child.resources, `${contextLabel} child ${child.slotId}`),
+      children: normalizeChildSlots(child.children, `${contextLabel} child ${child.slotId}`),
+    };
+  });
 }
 
 function assetSearchScore(asset: AssetRecord, query: string): number {
@@ -548,6 +796,75 @@ function isTextLikeAsset(asset: AssetRecord): boolean {
   );
 }
 
+function basename(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || path;
+}
+
+function guessMimeType(filename: string, fallback = "application/octet-stream"): string {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "text/markdown";
+  if (lower.endsWith(".txt")) return "text/plain";
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "text/html";
+  if (lower.endsWith(".json")) return "application/json";
+  if (lower.endsWith(".csv")) return "text/csv";
+  if (lower.endsWith(".xml")) return "application/xml";
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  return fallback;
+}
+
+async function createProjectAssetFromBytes(args: {
+  getS3Client: ReturnType<typeof useAwsS3Client>;
+  getDdbClient: ReturnType<typeof useAwsDdbClient>;
+  assetsTable: string;
+  projectId: string;
+  bucket: string;
+  label: string;
+  filename: string;
+  bytes: Uint8Array;
+  mimeType: string;
+  meta?: Record<string, unknown>;
+}) {
+  const assetId = createAssetId();
+  const versionId = createAssetVersionId();
+  const key = buildAssetVersionKey({
+    projectId: args.projectId,
+    assetId,
+    versionId,
+    filename: args.filename,
+  });
+
+  const s3 = await args.getS3Client(args.bucket);
+  await s3.send(new PutObjectCommand({
+    Bucket: args.bucket,
+    Key: key,
+    Body: args.bytes,
+    ContentType: args.mimeType,
+  }));
+
+  const ddb = await args.getDdbClient();
+  await createAsset({
+    ddb,
+    tableName: args.assetsTable,
+    asset: createAssetRecord({
+      projectId: args.projectId,
+      assetId,
+      label: args.label,
+      version: {
+        versionId,
+        bucket: args.bucket,
+        key,
+        mimeType: args.mimeType,
+        sizeBytes: args.bytes.byteLength,
+      },
+      meta: args.meta,
+    }),
+  });
+
+  return { assetId, versionId, bucket: args.bucket, key, mimeType: args.mimeType, sizeBytes: args.bytes.byteLength };
+}
+
 function flattenSlots(children: ChildSlot[] | undefined, depth = 0): Array<{
   slotId: string;
   moduleKey: string;
@@ -566,6 +883,136 @@ function flattenSlots(children: ChildSlot[] | undefined, depth = 0): Array<{
     items.push(...flattenSlots(child.children, depth + 1));
   }
   return items;
+}
+
+function buildSlotTree(
+  children: ChildSlot[] | undefined,
+  path: string[] = [],
+): Array<{
+  slotId: string;
+  path: string[];
+  moduleKey: string;
+  bucket: string;
+  exportName?: string;
+  meta?: Record<string, unknown>;
+  resources?: Resource[];
+  childCount: number;
+  children: ReturnType<typeof buildSlotTree>;
+}> {
+  if (!children?.length) return [];
+  return children.map((child) => {
+    const nextPath = [...path, child.slotId];
+    return {
+      slotId: child.slotId,
+      path: nextPath,
+      moduleKey: child.app.key,
+      bucket: child.app.bucket,
+      exportName: child.app.exportName,
+      meta: child.meta,
+      resources: child.resources,
+      childCount: child.children?.length ?? 0,
+      children: buildSlotTree(child.children, nextPath),
+    };
+  });
+}
+
+function cloneChildren(children: ChildSlot[] | undefined): ChildSlot[] {
+  return (children ?? []).map((child) => ({
+    ...child,
+    meta: child.meta ? { ...child.meta } : undefined,
+    resources: child.resources ? [...child.resources] : undefined,
+    children: cloneChildren(child.children),
+  }));
+}
+
+function findSlotInChildren(children: ChildSlot[] | undefined, slotPath: string[]): ChildSlot | undefined {
+  if (!slotPath.length) return undefined;
+  let currentChildren = children ?? [];
+  let currentSlot: ChildSlot | undefined;
+  for (const slotId of slotPath) {
+    currentSlot = currentChildren.find((child) => child.slotId === slotId);
+    if (!currentSlot) return undefined;
+    currentChildren = currentSlot.children ?? [];
+  }
+  return currentSlot;
+}
+
+function getChildrenCollectionAtPath(children: ChildSlot[] | undefined, parentSlotPath: string[]): ChildSlot[] {
+  if (!parentSlotPath.length) {
+    return cloneChildren(children);
+  }
+  const rootChildren = cloneChildren(children);
+  let currentChildren = rootChildren;
+  for (const slotId of parentSlotPath) {
+    const currentSlot = currentChildren.find((child) => child.slotId === slotId);
+    if (!currentSlot) {
+      throw new Error(`Parent slot path not found: ${parentSlotPath.join(" / ")}`);
+    }
+    currentSlot.children = cloneChildren(currentSlot.children);
+    currentChildren = currentSlot.children;
+  }
+  return rootChildren;
+}
+
+function upsertSlotAtPath(args: {
+  children: ChildSlot[] | undefined;
+  parentSlotPath: string[];
+  slot: ChildSlot;
+}): ChildSlot[] {
+  const rootChildren = cloneChildren(args.children);
+  let currentChildren = rootChildren;
+
+  for (const slotId of args.parentSlotPath) {
+    const currentSlot = currentChildren.find((child) => child.slotId === slotId);
+    if (!currentSlot) {
+      throw new Error(`Parent slot path not found: ${args.parentSlotPath.join(" / ")}`);
+    }
+    currentSlot.children = cloneChildren(currentSlot.children);
+    currentChildren = currentSlot.children;
+  }
+
+  const existingIndex = currentChildren.findIndex((child) => child.slotId === args.slot.slotId);
+  if (existingIndex >= 0) {
+    currentChildren[existingIndex] = args.slot;
+  } else {
+    currentChildren.push(args.slot);
+  }
+
+  return rootChildren;
+}
+
+function removeSlotAtPath(children: ChildSlot[] | undefined, slotPath: string[]): ChildSlot[] {
+  if (!slotPath.length) {
+    throw new Error("slotPath is required.");
+  }
+
+  const rootChildren = cloneChildren(children);
+  if (slotPath.length === 1) {
+    const filtered = rootChildren.filter((child) => child.slotId !== slotPath[0]);
+    if (filtered.length === rootChildren.length) {
+      throw new Error(`No slot found at path ${slotPath.join(" / ")}`);
+    }
+    return filtered;
+  }
+
+  let currentChildren = rootChildren;
+  for (let i = 0; i < slotPath.length - 1; i++) {
+    const currentSlot = currentChildren.find((child) => child.slotId === slotPath[i]);
+    if (!currentSlot) {
+      throw new Error(`No slot found at path ${slotPath.join(" / ")}`);
+    }
+    currentSlot.children = cloneChildren(currentSlot.children);
+    currentChildren = currentSlot.children;
+  }
+
+  const targetId = slotPath[slotPath.length - 1]!;
+  const filtered = currentChildren.filter((child) => child.slotId !== targetId);
+  if (filtered.length === currentChildren.length) {
+    throw new Error(`No slot found at path ${slotPath.join(" / ")}`);
+  }
+
+  currentChildren.splice(0, currentChildren.length, ...filtered);
+  return rootChildren;
 }
 
 function toInputItems(messages: ChatMessage[]): InputMessageItem[] {
@@ -850,6 +1297,197 @@ async function executeTool(args: {
       };
     }
 
+    case "create_text_asset": {
+      const parsed = parseToolArgs<{
+        label: string;
+        filename: string;
+        content: string;
+        mimeType?: string;
+        meta?: Record<string, unknown>;
+      }>(toolCall.arguments);
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      const bytes = new TextEncoder().encode(parsed.content);
+      const created = await createProjectAssetFromBytes({
+        getS3Client,
+        getDdbClient,
+        assetsTable,
+        projectId,
+        bucket: configBucket,
+        label: parsed.label,
+        filename: parsed.filename,
+        bytes,
+        mimeType: parsed.mimeType ?? guessMimeType(parsed.filename, "text/plain"),
+        meta: {
+          kind: "file",
+          path: parsed.filename,
+          moduleInstanceId: config.id,
+          moduleType: "module-chat-codex",
+          ...(parsed.meta ?? {}),
+        },
+      });
+      return {
+        output: JSON.stringify({ status: "ok", ...created }, null, 2),
+        toolMessage: `Created project asset ${parsed.label}.`,
+      };
+    }
+
+    case "import_workspace_file_as_asset": {
+      if (!bridge) throw new Error("Local agent bridge is not configured.");
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      const parsed = parseToolArgs<{
+        workspacePath: string;
+        label?: string;
+        filename?: string;
+        mimeType?: string;
+        meta?: Record<string, unknown>;
+      }>(toolCall.arguments);
+      const workspaceFile = await callBridge<{ path: string; encoding: string; content: string }>(
+        bridge,
+        "read_workspace_file",
+        { path: parsed.workspacePath, encoding: "base64" }
+      );
+      const bytes = Uint8Array.from(atob(workspaceFile.content), (ch) => ch.charCodeAt(0));
+      const filename = parsed.filename ?? basename(parsed.workspacePath);
+      const created = await createProjectAssetFromBytes({
+        getS3Client,
+        getDdbClient,
+        assetsTable,
+        projectId,
+        bucket: configBucket,
+        label: parsed.label ?? filename,
+        filename,
+        bytes,
+        mimeType: parsed.mimeType ?? guessMimeType(filename),
+        meta: {
+          kind: "file",
+          path: filename,
+          sourceWorkspacePath: parsed.workspacePath,
+          moduleInstanceId: config.id,
+          moduleType: "module-chat-codex",
+          ...(parsed.meta ?? {}),
+        },
+      });
+      return {
+        output: JSON.stringify({ status: "ok", workspacePath: parsed.workspacePath, ...created }, null, 2),
+        toolMessage: `Imported workspace file ${parsed.workspacePath} as a project asset.`,
+      };
+    }
+
+    case "create_markdown_file_set": {
+      const parsed = parseToolArgs<{
+        label: string;
+        entryPath: string;
+        files: MarkdownFileInput[];
+      }>(toolCall.arguments);
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+
+      const fileSetAssetId = createAssetId();
+      const fileSetVersionId = createAssetVersionId();
+      const versionRoot = [
+        "projects",
+        encodeURIComponent(projectId).replace(/%20/g, "-"),
+        "assets",
+        encodeURIComponent(fileSetAssetId).replace(/%20/g, "-"),
+        "versions",
+        encodeURIComponent(fileSetVersionId).replace(/%20/g, "-"),
+      ].join("/");
+      const filesPrefix = `${versionRoot}/files`;
+      const manifestKey = `${versionRoot}/manifest.json`;
+      const s3 = await getS3Client(configBucket);
+      const ddb = await getDdbClient();
+      const childAssetRefs: Array<{ path: string; assetId: string; versionId: string; key: string; mimeType: string; sizeBytes: number }> = [];
+
+      for (const file of parsed.files) {
+        const bytes = new TextEncoder().encode(file.content);
+        const key = `${filesPrefix}/${file.path}`;
+        const mimeType = file.mimeType ?? guessMimeType(file.path, "text/plain");
+        await s3.send(new PutObjectCommand({
+          Bucket: configBucket,
+          Key: key,
+          Body: bytes,
+          ContentType: mimeType,
+        }));
+        const assetId = createAssetId();
+        const versionId = createAssetVersionId();
+        await createAsset({
+          ddb,
+          tableName: assetsTable,
+          asset: createAssetRecord({
+            projectId,
+            assetId,
+            label: basename(file.path),
+            version: {
+              versionId,
+              bucket: configBucket,
+              key,
+              mimeType,
+              sizeBytes: bytes.byteLength,
+            },
+            meta: {
+              kind: "file",
+              parentAssetId: fileSetAssetId,
+              path: file.path,
+              moduleInstanceId: config.id,
+              moduleType: "module-markdown-viewer",
+            },
+          }),
+        });
+        childAssetRefs.push({ path: file.path, assetId, versionId, key, mimeType, sizeBytes: bytes.byteLength });
+      }
+
+      const manifestBytes = new TextEncoder().encode(JSON.stringify({
+        kind: "markdown-file-set",
+        entryPath: parsed.entryPath,
+        moduleInstanceId: config.id,
+        files: childAssetRefs,
+      }, null, 2));
+
+      await s3.send(new PutObjectCommand({
+        Bucket: configBucket,
+        Key: manifestKey,
+        Body: manifestBytes,
+        ContentType: "application/json",
+      }));
+
+      await createAsset({
+        ddb,
+        tableName: assetsTable,
+        asset: createAssetRecord({
+          projectId,
+          assetId: fileSetAssetId,
+          label: parsed.label,
+          version: {
+            versionId: fileSetVersionId,
+            bucket: configBucket,
+            key: manifestKey,
+            mimeType: "application/json",
+            sizeBytes: manifestBytes.byteLength,
+          },
+          meta: {
+            kind: "file-set",
+            entryPath: parsed.entryPath,
+            moduleInstanceId: config.id,
+            moduleType: "module-markdown-viewer",
+            fileCount: parsed.files.length,
+          },
+        }),
+      });
+
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          assetId: fileSetAssetId,
+          versionId: fileSetVersionId,
+          bucket: configBucket,
+          manifestKey,
+          prefix: filesPrefix,
+          rootKey: `${filesPrefix}/${parsed.entryPath}`,
+          fileCount: parsed.files.length,
+        }, null, 2),
+        toolMessage: `Created markdown file set ${parsed.label}.`,
+      };
+    }
+
     case "list_registered_resources": {
       const parsed = parseToolArgs<{ query?: string; limit?: number }>(toolCall.arguments);
       const resources = [...loadedResources.values()]
@@ -991,6 +1629,7 @@ async function executeTool(args: {
       if (parsed.title && meta["title"] === undefined) {
         meta["title"] = parsed.title;
       }
+      const nextResources = normalizeResources(parsed.resources, "Root slot");
 
       const nextSlot: ChildSlot = {
         slotId: parsed.slotId,
@@ -999,7 +1638,7 @@ async function executeTool(args: {
           key: entry.bundlePath,
         },
         meta: Object.keys(meta).length ? meta : undefined,
-        resources: parsed.resources?.length ? parsed.resources : undefined,
+        resources: nextResources,
       };
 
       const existingIndex = children.findIndex((child) => child.slotId === parsed.slotId);
@@ -1021,7 +1660,6 @@ async function executeTool(args: {
       };
 
       await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
-      window.dispatchEvent(new Event("shell:navigate"));
       return {
         output: JSON.stringify({
           status: "ok",
@@ -1049,10 +1687,166 @@ async function executeTool(args: {
         configPath,
         rootConfig: { ...context.rootConfig, children: after },
       });
-      window.dispatchEvent(new Event("shell:navigate"));
       return {
         output: JSON.stringify({ status: "ok", action: "removed", slotId: parsed.slotId }, null, 2),
         toolMessage: `Removed root slot ${parsed.slotId}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "list_slot_tree": {
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const tree = buildSlotTree(context.rootConfig.children);
+      return {
+        output: JSON.stringify({
+          projectId,
+          rootModule: context.rootConfig.app,
+          slotTree: tree,
+        }, null, 2),
+        toolMessage: "Loaded the app-space slot tree.",
+      };
+    }
+
+    case "upsert_slot": {
+      const parsed = parseToolArgs<GenericSlotToolArgs>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const parentPath = parsed.parentSlotPath ?? [];
+      const existing = findSlotInChildren(context.rootConfig.children, [...parentPath, parsed.slotId]);
+
+      let app = existing?.app;
+      if (parsed.moduleName?.trim()) {
+        const entry = findModuleEntry(registryEntries, parsed.moduleName);
+        if (!entry) {
+          throw new Error(`Published module not found: ${parsed.moduleName}`);
+        }
+        app = {
+          bucket: entry.bundleBucket,
+          key: entry.bundlePath,
+        };
+      }
+
+      if (!app) {
+        throw new Error("moduleName is required when creating a new slot.");
+      }
+
+      const mergedMeta = {
+        ...(existing?.meta ?? {}),
+        ...(parsed.meta ?? {}),
+      };
+      if (parsed.title && mergedMeta["title"] === undefined) {
+        mergedMeta["title"] = parsed.title;
+      } else if (parsed.title) {
+        mergedMeta["title"] = parsed.title;
+      }
+      const nextResources = parsed.resources === undefined
+        ? existing?.resources
+        : normalizeResources(parsed.resources, `Slot ${[...parentPath, parsed.slotId].join(" / ")}`);
+
+      const nextChildren = parsed.replaceChildren
+        ? normalizeChildSlots(parsed.children ?? [], `Slot ${[...parentPath, parsed.slotId].join(" / ")}`)
+        : (parsed.children
+            ? normalizeChildSlots(parsed.children, `Slot ${[...parentPath, parsed.slotId].join(" / ")}`)
+            : existing?.children);
+
+      const nextSlot: ChildSlot = {
+        slotId: parsed.slotId,
+        app,
+        meta: Object.keys(mergedMeta).length ? mergedMeta : undefined,
+        resources: nextResources,
+        children: nextChildren,
+      };
+
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parentPath,
+          slot: nextSlot,
+        }),
+      };
+
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          action: existing ? "updated" : "created",
+          parentSlotPath: parentPath,
+          slotPath: [...parentPath, parsed.slotId],
+          moduleKey: nextSlot.app.key,
+        }, null, 2),
+        toolMessage: `${existing ? "Updated" : "Created"} slot ${[...parentPath, parsed.slotId].join(" / ")}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "remove_slot": {
+      const parsed = parseToolArgs<{ slotPath: string[] }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: removeSlotAtPath(context.rootConfig.children, parsed.slotPath),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          action: "removed",
+          slotPath: parsed.slotPath,
+        }, null, 2),
+        toolMessage: `Removed slot ${parsed.slotPath.join(" / ")}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "update_root_config": {
+      const parsed = parseToolArgs<{
+        moduleName?: string;
+        meta?: Record<string, unknown>;
+        resources?: Resource[];
+        replaceResources?: boolean;
+        theme?: ModuleConfig["theme"];
+      }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const nextParsedResources = parsed.resources
+        ? normalizeResources(parsed.resources, "Root config")
+        : undefined;
+
+      let nextApp = context.rootConfig.app;
+      if (parsed.moduleName?.trim()) {
+        const entry = findModuleEntry(registryEntries, parsed.moduleName);
+        if (!entry) {
+          throw new Error(`Published module not found: ${parsed.moduleName}`);
+        }
+        nextApp = {
+          bucket: entry.bundleBucket,
+          key: entry.bundlePath,
+        };
+      }
+
+      const nextRoot: ModuleConfig = {
+        ...context.rootConfig,
+        app: nextApp,
+        meta: parsed.meta
+          ? { ...(context.rootConfig.meta ?? {}), ...parsed.meta }
+          : context.rootConfig.meta,
+        resources: nextParsedResources
+          ? (parsed.replaceResources ? nextParsedResources : [...(context.rootConfig.resources ?? []), ...nextParsedResources])
+          : context.rootConfig.resources,
+        theme: parsed.theme
+          ? { ...(context.rootConfig.theme ?? {}), ...parsed.theme }
+          : context.rootConfig.theme,
+      };
+
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: nextRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          rootModuleKey: nextRoot.app.key,
+          metaKeys: Object.keys(nextRoot.meta ?? {}),
+          resourceCount: nextRoot.resources?.length ?? 0,
+          theme: nextRoot.theme ?? null,
+        }, null, 2),
+        toolMessage: "Updated root app-space config.",
         mutatedWorkspace: true,
       };
     }
@@ -1089,6 +1883,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const configPath = params.get("config") ?? "";
   const projectId = extractProjectId(configPath, config.id);
   const storageKey = useMemo(() => buildStorageKey(projectId, config.id), [projectId, config.id]);
+  const chatSessionKey = useMemo(
+    () => buildChatSessionKey(configBucket, configPath, config.id),
+    [configBucket, configPath, config.id]
+  );
   const bridgeUrlKey = useMemo(() => buildBridgeStorageKey(projectId, config.id, "url"), [projectId, config.id]);
   const bridgeTokenKey = useMemo(() => buildBridgeStorageKey(projectId, config.id, "token"), [projectId, config.id]);
   const bridgeWorkspaceRootKey = useMemo(() => buildBridgeWorkspaceRootKey(projectId, config.id), [projectId, config.id]);
@@ -1115,7 +1913,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const [composer, setComposer] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
-  const [continuationPending, setContinuationPending] = useState(false);
+  const [pendingContinuation, setPendingContinuation] = useState<PendingContinuation | null>(null);
+  const [hydratedSessionKey, setHydratedSessionKey] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | undefined>();
   const [saveError, setSaveError] = useState<string | undefined>();
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1125,13 +1924,26 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     systemPrompt,
   });
   const scrollRef = useRef<HTMLDivElement>(null);
-  const pendingContinuationRef = useRef<PendingContinuation | null>(null);
 
   useEffect(() => {
     const stored = safeReadLocalStorage(storageKey);
     setApiKey(stored);
     setDraftApiKey(stored);
   }, [storageKey]);
+
+  useEffect(() => {
+    setHydratedSessionKey(null);
+    setMessages([]);
+    setComposer("");
+    setPendingContinuation(null);
+    const storedSession = readPersistedChatSession(chatSessionKey);
+    if (storedSession) {
+      setMessages(storedSession.messages ?? []);
+      setComposer(storedSession.composer ?? "");
+      setPendingContinuation(storedSession.pendingContinuation ?? null);
+    }
+    setHydratedSessionKey(chatSessionKey);
+  }, [chatSessionKey]);
 
   useEffect(() => {
     const defaults = readBridgeDefaults();
@@ -1185,10 +1997,20 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     element.scrollTop = element.scrollHeight;
   }, [messages, busy]);
 
+  useEffect(() => {
+    if (hydratedSessionKey !== chatSessionKey) return;
+    safeWriteLocalStorage(chatSessionKey, JSON.stringify({
+      messages,
+      composer,
+      pendingContinuation,
+    } satisfies PersistedChatSession));
+  }, [chatSessionKey, composer, hydratedSessionKey, messages, pendingContinuation]);
+
   const connectionLabel = apiKey ? maskKey(apiKey) : "Not connected";
   const bridgeLabel = bridgeUrl ? `${bridgeUrl} · ${maskBridgeToken(bridgeToken)}` : "Not connected";
   const canSend = !!apiKey.trim() && !!composer.trim() && !busy;
   const canSaveSettings = !!metaDraft.title.trim() && !!metaDraft.model.trim() && !!metaDraft.systemPrompt.trim() && !busy;
+  const continuationPending = Boolean(pendingContinuation);
 
   async function handleConnect() {
     const trimmed = draftApiKey.trim();
@@ -1365,10 +2187,11 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     initialInputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>;
     contextBits: string[];
     bridge: BridgeConfig | null;
-  }): Promise<{ assistantText: string; lastToolMessages: string[]; pending: PendingContinuation | null }> {
+  }): Promise<AgentRunResult> {
     let inputItems = args.initialInputItems;
     let assistantText = "";
     let lastToolMessages: string[] = [];
+    let shouldNavigate = false;
 
     for (let i = 0; i < TOOL_ITERATION_LIMIT; i++) {
       const response = await createOpenAiResponse({
@@ -1393,7 +2216,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
 
       if (!functionCalls.length) {
         assistantText = extractAssistantText(response) || "The model returned no text output.";
-        return { assistantText, lastToolMessages, pending: null };
+        return { assistantText, lastToolMessages, pending: null, shouldNavigate };
       }
 
       const toolOutputs: FunctionCallOutputItem[] = [];
@@ -1438,6 +2261,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         if (result.toolMessage) {
           lastToolMessages.push(result.toolMessage);
         }
+        if (result.mutatedWorkspace) {
+          shouldNavigate = true;
+        }
       }
 
       inputItems = [
@@ -1457,6 +2283,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         contextBits: args.contextBits,
         lastToolMessages,
       },
+      shouldNavigate,
     };
   }
 
@@ -1469,8 +2296,12 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     setMessages(history);
     setComposer("");
     setBusy(true);
-    setContinuationPending(false);
-    pendingContinuationRef.current = null;
+    setPendingContinuation(null);
+    persistChatSessionNow(chatSessionKey, {
+      messages: history,
+      composer: "",
+      pendingContinuation: null,
+    });
     setConnectionError(undefined);
 
     try {
@@ -1496,17 +2327,21 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         contextBits,
         bridge,
       });
-      pendingContinuationRef.current = session.pending;
-      setContinuationPending(Boolean(session.pending));
-
-      setMessages((current) => {
-        const next = [...current];
-        if (session.lastToolMessages.length) {
-          next.push(createMessage("tool", session.lastToolMessages.join("\n")));
-        }
-        next.push(createMessage("assistant", session.assistantText || "The model returned no text output."));
-        return next;
+      setPendingContinuation(session.pending);
+      const nextMessages = [...history];
+      if (session.lastToolMessages.length) {
+        nextMessages.push(createMessage("tool", session.lastToolMessages.join("\n")));
+      }
+      nextMessages.push(createMessage("assistant", session.assistantText || "The model returned no text output."));
+      setMessages(nextMessages);
+      persistChatSessionNow(chatSessionKey, {
+        messages: nextMessages,
+        composer: "",
+        pendingContinuation: session.pending,
       });
+      if (session.shouldNavigate) {
+        window.dispatchEvent(new Event("shell:navigate"));
+      }
     } catch (error) {
       console.debug("[chat-codex] tool loop error", {
         message: (error as Error).message,
@@ -1521,11 +2356,11 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }
 
   async function handleContinueWorking() {
-    const pending = pendingContinuationRef.current;
+    const pending = pendingContinuation;
     if (!apiKey.trim() || !pending || busy) return;
 
     setBusy(true);
-    setContinuationPending(false);
+    setPendingContinuation(null);
     setConnectionError(undefined);
 
     try {
@@ -1537,17 +2372,21 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         contextBits: pending.contextBits,
         bridge,
       });
-      pendingContinuationRef.current = session.pending;
-      setContinuationPending(Boolean(session.pending));
-
-      setMessages((current) => {
-        const next = [...current];
-        if (session.lastToolMessages.length) {
-          next.push(createMessage("tool", session.lastToolMessages.join("\n")));
-        }
-        next.push(createMessage("assistant", session.assistantText || "The model returned no text output."));
-        return next;
+      setPendingContinuation(session.pending);
+      const nextMessages = [...messages];
+      if (session.lastToolMessages.length) {
+        nextMessages.push(createMessage("tool", session.lastToolMessages.join("\n")));
+      }
+      nextMessages.push(createMessage("assistant", session.assistantText || "The model returned no text output."));
+      setMessages(nextMessages);
+      persistChatSessionNow(chatSessionKey, {
+        messages: nextMessages,
+        composer,
+        pendingContinuation: session.pending,
       });
+      if (session.shouldNavigate) {
+        window.dispatchEvent(new Event("shell:navigate"));
+      }
     } catch (error) {
       console.debug("[chat-codex] continuation error", {
         message: (error as Error).message,
@@ -1569,9 +2408,14 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }
 
   function clearConversation() {
-    pendingContinuationRef.current = null;
-    setContinuationPending(false);
+    setPendingContinuation(null);
+    setComposer("");
     setMessages([]);
+    persistChatSessionNow(chatSessionKey, {
+      messages: [],
+      composer: "",
+      pendingContinuation: null,
+    });
   }
 
   return (
