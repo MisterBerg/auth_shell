@@ -29,6 +29,7 @@
     "compose:up": "tsx scripts/compose-up.ts",
     "compose:down": "podman compose down",
     "run:local": "tsx scripts/run-local.ts",
+    "bridge:local": "tsx scripts/agent-bridge.ts",
     "seed": "tsx scripts/seed-local.ts",
     "update-locals": "tsx scripts/update-locals.ts",
     "publish:local": "tsx scripts/publish-module.ts --local",

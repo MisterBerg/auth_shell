@@ -62,7 +62,11 @@ export async function loadBundle(
   exportName: string = "default"
 ): Promise<React.ComponentType<ModuleProps>> {
   const s3 = await getS3Client(bucket);
-  const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const resp = await s3.send(new GetObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    ResponseCacheControl: "no-store",
+  }));
   const jsCode = await resp.Body!.transformToString("utf-8");
   const rawModule = await loadIife(jsCode);
 
@@ -106,7 +110,11 @@ export async function loadModule(
   // Step 2: fetch and run bundle
   const s3 = await getS3Client(config.app.bucket);
   const bundleResp = await s3.send(
-    new GetObjectCommand({ Bucket: config.app.bucket, Key: config.app.key })
+    new GetObjectCommand({
+      Bucket: config.app.bucket,
+      Key: config.app.key,
+      ResponseCacheControl: "no-store",
+    })
   );
   const jsCode = await bundleResp.Body!.transformToString("utf-8");
   const rawModule = await loadIife(jsCode);

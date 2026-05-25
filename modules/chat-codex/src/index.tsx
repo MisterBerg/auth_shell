@@ -27,6 +27,11 @@ type ChatMeta = {
   systemPrompt?: string;
 };
 
+type AgentBridgeDefaults = {
+  url?: string;
+  token?: string;
+};
+
 type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "error" | "tool";
@@ -109,6 +114,27 @@ type ModuleToolArgs = {
   title?: string;
 };
 
+type BridgeConfig = {
+  url: string;
+  token: string;
+};
+
+type BridgeStatus = {
+  status: string;
+  workspaceRoot: string;
+};
+
+type BridgeListResult = {
+  root: string;
+  recursive: boolean;
+  count: number;
+  files: Array<{
+    path: string;
+    kind: "file" | "directory";
+    sizeBytes?: number;
+  }>;
+};
+
 const DEFAULT_MODEL = "gpt-5.2-codex";
 const DEFAULT_TITLE = "Codex Chat";
 const DEFAULT_PROMPT = [
@@ -177,6 +203,63 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         query: { type: "string" },
         limit: { type: "integer", minimum: 1, maximum: 100 },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_workspace_files",
+    description: "List files and directories from the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        recursive: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 1000 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_workspace_file",
+    description: "Read a file from the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        encoding: { type: "string", enum: ["utf8", "base64"] },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "run_workspace_command",
+    description: "Run a shell command through the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string" },
+        cwd: { type: "string" },
+        timeoutMs: { type: "integer", minimum: 100, maximum: 600000 },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "extract_pdf_text",
+    description: "Extract text from a PDF file through the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        maxPages: { type: "integer", minimum: 1, maximum: 500 },
+      },
+      required: ["path"],
       additionalProperties: false,
     },
   },
@@ -256,6 +339,14 @@ function extractProjectId(configPath: string, fallback: string): string {
 
 function buildStorageKey(projectId: string, moduleId: string) {
   return `auth-shell:chat-codex:${projectId}:${moduleId}:openai-key`;
+}
+
+function buildBridgeStorageKey(projectId: string, moduleId: string, field: "url" | "token") {
+  return `auth-shell:chat-codex:${projectId}:${moduleId}:bridge-${field}`;
+}
+
+function buildBridgeWorkspaceRootKey(projectId: string, moduleId: string) {
+  return `auth-shell:chat-codex:${projectId}:${moduleId}:bridge-workspace-root`;
 }
 
 function safeReadLocalStorage(key: string): string {
@@ -385,6 +476,41 @@ function maskKey(value: string): string {
   return `${value.slice(0, 7)}...${value.slice(-4)}`;
 }
 
+function maskBridgeToken(value: string): string {
+  if (!value) return "Not connected";
+  if (value.length < 10) return "Saved locally";
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function readBridgeDefaults(): AgentBridgeDefaults {
+  const win = window as unknown as { __AgentBridgeDefaults?: AgentBridgeDefaults };
+  return win.__AgentBridgeDefaults ?? {};
+}
+
+function parentPath(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const slash = normalized.lastIndexOf("/");
+  if (slash <= 1) return normalized;
+  return normalized.slice(0, slash);
+}
+
+async function callBridge<T>(bridge: BridgeConfig, method: string, params: Record<string, unknown> = {}): Promise<T> {
+  const response = await fetch(`${bridge.url.replace(/\/$/, "")}/rpc`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${bridge.token}`,
+    },
+    body: JSON.stringify({ method, params }),
+  });
+
+  const payload = (await response.json()) as { ok?: boolean; result?: T; error?: string };
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || `Bridge call failed: ${response.status}`);
+  }
+  return payload.result as T;
+}
+
 async function loadWorkspaceContext(getS3Client: ReturnType<typeof useAwsS3Client>, configBucket: string, configPath: string, projectId: string): Promise<WorkspaceContext> {
   const s3 = await getS3Client(configBucket);
   const object = await s3.send(new GetObjectCommand({ Bucket: configBucket, Key: configPath }));
@@ -451,6 +577,7 @@ async function executeTool(args: {
   assetsTable?: string;
   loadedResources: ReadonlyMap<string, Resource>;
   registryEntries: ModuleRegistryEntry[];
+  bridge: BridgeConfig | null;
 }): Promise<{ output: string; toolMessage?: string; mutatedWorkspace?: boolean }> {
   const {
     toolCall,
@@ -463,6 +590,7 @@ async function executeTool(args: {
     assetsTable,
     loadedResources,
     registryEntries,
+    bridge,
   } = args;
 
   switch (toolCall.name) {
@@ -567,6 +695,46 @@ async function executeTool(args: {
       };
     }
 
+    case "list_workspace_files": {
+      if (!bridge) throw new Error("Local agent bridge is not configured.");
+      const parsed = parseToolArgs<{ path?: string; recursive?: boolean; limit?: number }>(toolCall.arguments);
+      const result = await callBridge<unknown>(bridge, "list_workspace_files", parsed);
+      return {
+        output: JSON.stringify(result, null, 2),
+        toolMessage: "Listed files from the local workspace bridge.",
+      };
+    }
+
+    case "read_workspace_file": {
+      if (!bridge) throw new Error("Local agent bridge is not configured.");
+      const parsed = parseToolArgs<{ path: string; encoding?: string }>(toolCall.arguments);
+      const result = await callBridge<unknown>(bridge, "read_workspace_file", parsed);
+      return {
+        output: JSON.stringify(result, null, 2),
+        toolMessage: `Read workspace file ${parsed.path}.`,
+      };
+    }
+
+    case "run_workspace_command": {
+      if (!bridge) throw new Error("Local agent bridge is not configured.");
+      const parsed = parseToolArgs<{ command: string; cwd?: string; timeoutMs?: number }>(toolCall.arguments);
+      const result = await callBridge<unknown>(bridge, "run_workspace_command", parsed);
+      return {
+        output: JSON.stringify(result, null, 2),
+        toolMessage: `Ran workspace command: ${parsed.command}`,
+      };
+    }
+
+    case "extract_pdf_text": {
+      if (!bridge) throw new Error("Local agent bridge is not configured.");
+      const parsed = parseToolArgs<{ path: string; maxPages?: number }>(toolCall.arguments);
+      const result = await callBridge<unknown>(bridge, "extract_pdf_text", parsed);
+      return {
+        output: JSON.stringify(result, null, 2),
+        toolMessage: `Extracted PDF text from ${parsed.path}.`,
+      };
+    }
+
     case "upsert_root_slot": {
       const parsed = parseToolArgs<ModuleToolArgs>(toolCall.arguments);
       const entry = findModuleEntry(registryEntries, parsed.moduleName);
@@ -666,6 +834,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const configPath = params.get("config") ?? "";
   const projectId = extractProjectId(configPath, config.id);
   const storageKey = useMemo(() => buildStorageKey(projectId, config.id), [projectId, config.id]);
+  const bridgeUrlKey = useMemo(() => buildBridgeStorageKey(projectId, config.id, "url"), [projectId, config.id]);
+  const bridgeTokenKey = useMemo(() => buildBridgeStorageKey(projectId, config.id, "token"), [projectId, config.id]);
+  const bridgeWorkspaceRootKey = useMemo(() => buildBridgeWorkspaceRootKey(projectId, config.id), [projectId, config.id]);
 
   const meta = (config.meta as ChatMeta | undefined) ?? {};
   const title = meta.title?.trim() || DEFAULT_TITLE;
@@ -674,6 +845,18 @@ export default function ChatCodexModule({ config }: ModuleProps) {
 
   const [apiKey, setApiKey] = useState("");
   const [draftApiKey, setDraftApiKey] = useState("");
+  const [bridgeUrl, setBridgeUrl] = useState("");
+  const [bridgeToken, setBridgeToken] = useState("");
+  const [bridgeWorkspaceRoot, setBridgeWorkspaceRoot] = useState("");
+  const [draftBridgeUrl, setDraftBridgeUrl] = useState("");
+  const [draftBridgeToken, setDraftBridgeToken] = useState("");
+  const [draftBridgeWorkspaceRoot, setDraftBridgeWorkspaceRoot] = useState("");
+  const [bridgeBrowserOpen, setBridgeBrowserOpen] = useState(false);
+  const [bridgeBrowserPath, setBridgeBrowserPath] = useState("");
+  const [bridgeBrowserEntries, setBridgeBrowserEntries] = useState<BridgeListResult["files"]>([]);
+  const [bridgeBrowserLoading, setBridgeBrowserLoading] = useState(false);
+  const [bridgeBrowserError, setBridgeBrowserError] = useState<string | undefined>();
+  const [newFolderName, setNewFolderName] = useState("");
   const [composer, setComposer] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -694,6 +877,19 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }, [storageKey]);
 
   useEffect(() => {
+    const defaults = readBridgeDefaults();
+    const storedUrl = safeReadLocalStorage(bridgeUrlKey) || defaults.url || "";
+    const storedToken = safeReadLocalStorage(bridgeTokenKey) || defaults.token || "";
+    const storedWorkspaceRoot = safeReadLocalStorage(bridgeWorkspaceRootKey) || "";
+    setBridgeUrl(storedUrl);
+    setBridgeToken(storedToken);
+    setBridgeWorkspaceRoot(storedWorkspaceRoot);
+    setDraftBridgeUrl(storedUrl);
+    setDraftBridgeToken(storedToken);
+    setDraftBridgeWorkspaceRoot(storedWorkspaceRoot);
+  }, [bridgeTokenKey, bridgeUrlKey, bridgeWorkspaceRootKey]);
+
+  useEffect(() => {
     setMetaDraft({ title, model, systemPrompt });
   }, [title, model, systemPrompt]);
 
@@ -704,6 +900,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }, [messages, busy]);
 
   const connectionLabel = apiKey ? maskKey(apiKey) : "Not connected";
+  const bridgeLabel = bridgeUrl ? `${bridgeUrl} · ${maskBridgeToken(bridgeToken)}` : "Not connected";
   const canSend = !!apiKey.trim() && !!composer.trim() && !busy;
   const canSaveSettings = !!metaDraft.title.trim() && !!metaDraft.model.trim() && !!metaDraft.systemPrompt.trim() && !busy;
 
@@ -723,6 +920,127 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     setApiKey("");
     setDraftApiKey("");
     setConnectionError(undefined);
+  }
+
+  function handleSaveBridge() {
+    const normalizedUrl = draftBridgeUrl.trim().replace(/\/$/, "");
+    const normalizedToken = draftBridgeToken.trim();
+    if (!normalizedUrl || !normalizedToken) {
+      setConnectionError("Bridge URL and bridge token are both required.");
+      return;
+    }
+    safeWriteLocalStorage(bridgeUrlKey, normalizedUrl);
+    safeWriteLocalStorage(bridgeTokenKey, normalizedToken);
+    setBridgeUrl(normalizedUrl);
+    setBridgeToken(normalizedToken);
+    setConnectionError(undefined);
+  }
+
+  function handleForgetBridge() {
+    safeWriteLocalStorage(bridgeUrlKey, "");
+    safeWriteLocalStorage(bridgeTokenKey, "");
+    safeWriteLocalStorage(bridgeWorkspaceRootKey, "");
+    setBridgeUrl("");
+    setBridgeToken("");
+    setBridgeWorkspaceRoot("");
+    setDraftBridgeUrl("");
+    setDraftBridgeToken("");
+    setDraftBridgeWorkspaceRoot("");
+  }
+
+  async function loadBridgeDirectory(path: string) {
+    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
+      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
+      : bridgeUrl.trim() && bridgeToken.trim()
+        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
+        : null;
+
+    if (!bridge) {
+      setBridgeBrowserError("Save the bridge URL and token before browsing.");
+      return;
+    }
+
+    setBridgeBrowserLoading(true);
+    setBridgeBrowserError(undefined);
+    try {
+      const result = await callBridge<BridgeListResult>(bridge, "list_workspace_files", {
+        path,
+        recursive: false,
+        limit: 500,
+      });
+      setBridgeBrowserPath(result.root);
+      setBridgeBrowserEntries(result.files);
+    } catch (error) {
+      setBridgeBrowserError((error as Error).message);
+    } finally {
+      setBridgeBrowserLoading(false);
+    }
+  }
+
+  async function openBridgeBrowser() {
+    setBridgeBrowserOpen(true);
+    setNewFolderName("");
+    const startPath = draftBridgeWorkspaceRoot.trim() || bridgeWorkspaceRoot || ".";
+    await loadBridgeDirectory(startPath);
+  }
+
+  async function handleApplyBridgeWorkspaceRoot() {
+    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
+      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
+      : bridgeUrl.trim() && bridgeToken.trim()
+        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
+        : null;
+
+    if (!bridge) {
+      setConnectionError("Save the bridge URL and token before changing the workspace root.");
+      return;
+    }
+
+    const path = draftBridgeWorkspaceRoot.trim();
+    if (!path) {
+      setConnectionError("Enter a workspace root path.");
+      return;
+    }
+
+    const status = await callBridge<BridgeStatus>(bridge, "set_workspace_root", { path });
+    safeWriteLocalStorage(bridgeWorkspaceRootKey, status.workspaceRoot);
+    setBridgeWorkspaceRoot(status.workspaceRoot);
+    setDraftBridgeWorkspaceRoot(status.workspaceRoot);
+    setConnectionError(undefined);
+    setBridgeBrowserOpen(false);
+  }
+
+  async function handleCreateBridgeFolder() {
+    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
+      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
+      : bridgeUrl.trim() && bridgeToken.trim()
+        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
+        : null;
+
+    if (!bridge) {
+      setBridgeBrowserError("Save the bridge URL and token before creating folders.");
+      return;
+    }
+
+    const name = newFolderName.trim();
+    if (!name) {
+      setBridgeBrowserError("Enter a folder name.");
+      return;
+    }
+
+    setBridgeBrowserLoading(true);
+    setBridgeBrowserError(undefined);
+    try {
+      await callBridge(bridge, "create_directory", {
+        parentPath: bridgeBrowserPath || draftBridgeWorkspaceRoot || bridgeWorkspaceRoot || ".",
+        name,
+      });
+      setNewFolderName("");
+      await loadBridgeDirectory(bridgeBrowserPath || draftBridgeWorkspaceRoot || bridgeWorkspaceRoot || ".");
+    } catch (error) {
+      setBridgeBrowserError((error as Error).message);
+      setBridgeBrowserLoading(false);
+    }
   }
 
   async function handleSaveSettings() {
@@ -768,6 +1086,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       let inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem> = toInputItems(history);
       let assistantText = "";
       let lastToolMessages: string[] = [];
+      const bridge = bridgeUrl.trim() && bridgeToken.trim()
+        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
+        : null;
 
       for (let i = 0; i < 6; i++) {
         const response = await createOpenAiResponse({
@@ -805,6 +1126,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             assetsTable,
             loadedResources: resources,
             registryEntries,
+            bridge,
           });
 
           toolOutputs.push({
@@ -860,7 +1182,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         <div style={{ minWidth: 0, flex: 1 }}>
           <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>{title}</div>
           <div style={{ fontSize: "0.74rem", color: C.muted }}>
-            {model} · {connectionLabel} · tools enabled
+            {model} · OpenAI {connectionLabel} · Bridge {bridgeLabel}
           </div>
         </div>
         <button onClick={clearConversation} style={ghostButtonStyle}>
@@ -896,6 +1218,53 @@ export default function ChatCodexModule({ config }: ModuleProps) {
               Stored only in this browser for this project/module instance. It is not written into shared project config.
             </div>
             {connectionError && <div style={{ fontSize: "0.74rem", color: C.danger }}>{connectionError}</div>}
+          </div>
+
+          <div style={{ display: "grid", gap: "0.35rem" }}>
+            <label style={labelStyle}>Local bridge</label>
+            <input
+              value={draftBridgeUrl}
+              onChange={(event) => setDraftBridgeUrl(event.currentTarget.value)}
+              placeholder="http://127.0.0.1:4317"
+              style={inputStyle}
+            />
+            <input
+              value={draftBridgeToken}
+              onChange={(event) => setDraftBridgeToken(event.currentTarget.value)}
+              placeholder="Bridge token"
+              type="password"
+              style={inputStyle}
+            />
+            <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap" }}>
+              <button onClick={handleSaveBridge} style={primaryButtonStyle}>
+                Save Bridge
+              </button>
+              {(bridgeUrl || bridgeToken) && (
+                <button onClick={handleForgetBridge} style={dangerButtonStyle}>
+                  Forget Bridge
+                </button>
+              )}
+            </div>
+            <div style={{ fontSize: "0.72rem", color: C.muted }}>
+              Used for local file access, command execution, and host-side analysis tools.
+            </div>
+            <input
+              value={draftBridgeWorkspaceRoot}
+              onChange={(event) => setDraftBridgeWorkspaceRoot(event.currentTarget.value)}
+              placeholder={bridgeWorkspaceRoot || "Workspace root path"}
+              style={inputStyle}
+            />
+            <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap", alignItems: "center" }}>
+              <button onClick={() => void handleApplyBridgeWorkspaceRoot()} style={primaryButtonStyle}>
+                Set Workspace Root
+              </button>
+              <button onClick={() => void openBridgeBrowser()} style={ghostButtonStyle}>
+                Browse...
+              </button>
+              <span style={{ fontSize: "0.72rem", color: C.muted }}>
+                Current root: {bridgeWorkspaceRoot || "not set"}
+              </span>
+            </div>
           </div>
 
           {editMode && (
@@ -941,7 +1310,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
           <div style={{ maxWidth: 720, margin: "0 auto", padding: "1.2rem 1.25rem", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 16 }}>
             <div style={{ fontSize: "0.95rem", fontWeight: 700, marginBottom: "0.45rem" }}>Workspace-side Codex test module</div>
             <div style={{ fontSize: "0.82rem", lineHeight: 1.6, color: C.muted }}>
-              This version can inspect the workspace, browse assets and resources, list published modules, and add, update, or remove top-level slots in the root config.
+              This version can inspect the workspace, browse assets and resources, list published modules, add, update, or remove top-level slots, and use a local bridge for files, commands, and PDF analysis.
             </div>
           </div>
         ) : (
@@ -988,6 +1357,88 @@ export default function ChatCodexModule({ config }: ModuleProps) {
           </button>
         </div>
       </div>
+
+      {bridgeBrowserOpen && (
+        <div style={{ position: "absolute", inset: 0, background: "rgba(3,8,15,0.76)", display: "flex", alignItems: "center", justifyContent: "center", padding: "1rem", zIndex: 40 }}>
+          <div style={{ width: "min(820px, 100%)", maxHeight: "min(720px, 92vh)", display: "grid", gridTemplateRows: "auto auto 1fr auto", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 16, overflow: "hidden", boxShadow: "0 28px 80px rgba(0,0,0,0.45)" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem", padding: "0.9rem 1rem", borderBottom: `1px solid ${C.border}` }}>
+              <div>
+                <div style={{ fontSize: "0.92rem", fontWeight: 700 }}>Choose Workspace Root</div>
+                <div style={{ fontSize: "0.75rem", color: C.muted }}>{bridgeBrowserPath || "Loading..."}</div>
+              </div>
+              <button onClick={() => setBridgeBrowserOpen(false)} style={ghostButtonStyle}>Close</button>
+            </div>
+
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "0.55rem", alignItems: "center", padding: "0.85rem 1rem", borderBottom: `1px solid ${C.border}` }}>
+              <button
+                onClick={() => void loadBridgeDirectory(parentPath(bridgeBrowserPath || draftBridgeWorkspaceRoot || bridgeWorkspaceRoot || "."))}
+                style={ghostButtonStyle}
+                disabled={bridgeBrowserLoading}
+              >
+                Up
+              </button>
+              <button
+                onClick={() => void handleApplyBridgeWorkspaceRoot()}
+                style={primaryButtonStyle}
+                disabled={bridgeBrowserLoading || !draftBridgeWorkspaceRoot.trim()}
+              >
+                Use Current Folder
+              </button>
+              <input
+                value={newFolderName}
+                onChange={(event) => setNewFolderName(event.currentTarget.value)}
+                placeholder="New folder name"
+                style={{ ...inputStyle, flex: "1 1 220px", minWidth: 180 }}
+              />
+              <button onClick={() => void handleCreateBridgeFolder()} style={ghostButtonStyle} disabled={bridgeBrowserLoading}>
+                Create Folder
+              </button>
+            </div>
+
+            <div style={{ minHeight: 0, overflowY: "auto", padding: "0.8rem 1rem" }}>
+              {bridgeBrowserLoading && <div style={{ fontSize: "0.82rem", color: C.muted }}>Loading folders...</div>}
+              {bridgeBrowserError && <div style={{ fontSize: "0.82rem", color: C.danger }}>{bridgeBrowserError}</div>}
+              {!bridgeBrowserLoading && !bridgeBrowserError && (
+                <div style={{ display: "grid", gap: "0.45rem" }}>
+                  {bridgeBrowserEntries
+                    .filter((entry) => entry.kind === "directory")
+                    .sort((a, b) => a.path.localeCompare(b.path))
+                    .map((entry) => {
+                      const nextPath = `${bridgeBrowserPath.replace(/[\\/]+$/, "")}/${entry.path}`.replaceAll("//", "/");
+                      return (
+                        <div key={entry.path} style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: "0.55rem", alignItems: "center", padding: "0.6rem 0.75rem", border: `1px solid ${C.border}`, borderRadius: 10, background: "#091423" }}>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ fontSize: "0.84rem", fontWeight: 600 }}>{entry.path}</div>
+                            <div style={{ fontSize: "0.72rem", color: C.muted }}>Folder</div>
+                          </div>
+                          <button onClick={() => void loadBridgeDirectory(nextPath)} style={ghostButtonStyle}>
+                            Open
+                          </button>
+                          <button
+                            onClick={() => {
+                              setDraftBridgeWorkspaceRoot(nextPath);
+                              setBridgeBrowserPath(nextPath);
+                            }}
+                            style={primaryButtonStyle}
+                          >
+                            Select
+                          </button>
+                        </div>
+                      );
+                    })}
+                  {bridgeBrowserEntries.filter((entry) => entry.kind === "directory").length === 0 && (
+                    <div style={{ fontSize: "0.8rem", color: C.muted }}>No subfolders found here.</div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div style={{ padding: "0.8rem 1rem", borderTop: `1px solid ${C.border}`, fontSize: "0.74rem", color: C.muted }}>
+              Selected path: {draftBridgeWorkspaceRoot || bridgeBrowserPath || "none"}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

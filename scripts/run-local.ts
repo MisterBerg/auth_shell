@@ -15,6 +15,7 @@
 import { execFileSync, spawn } from "child_process";
 import { createRequire } from "module";
 import { join, resolve } from "path";
+import { randomBytes } from "crypto";
 
 const ROOT = resolve(process.cwd());
 const SHELL_DIR = join(ROOT, "apps", "shell");
@@ -29,16 +30,35 @@ function main() {
   runTsx("scripts/seed-local.ts", [`--developer=${developer}`]);
   runTsx("scripts/update-locals.ts");
 
+  const agentBridgeToken = randomBytes(24).toString("hex");
+  const bridgeChild = spawn(process.execPath, [TSX_CLI, "scripts/agent-bridge.ts"], {
+    cwd: ROOT,
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      AGENT_BRIDGE_TOKEN: agentBridgeToken,
+      AGENT_BRIDGE_WORKSPACE_ROOT: ROOT,
+      AGENT_BRIDGE_ALLOWED_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173",
+    },
+  });
+
   console.log("\nStarting shell dev server...");
   console.log(`Project URL: http://localhost:5173/?bucket=hep-dev-modules&config=projects/${developer}-dev/config.json\n`);
+  console.log(`Agent bridge: http://127.0.0.1:4317\n`);
 
   const child = spawn(NPM_COMMAND, ["run", "dev", "--", "--host", "0.0.0.0"], {
     cwd: SHELL_DIR,
     stdio: "inherit",
     shell: process.platform === "win32",
+    env: {
+      ...process.env,
+      VITE_AGENT_BRIDGE_URL: "http://127.0.0.1:4317",
+      VITE_AGENT_BRIDGE_TOKEN: agentBridgeToken,
+    },
   });
 
   child.on("exit", (code, signal) => {
+    bridgeChild.kill();
     if (signal) process.kill(process.pid, signal);
     process.exit(code ?? 0);
   });

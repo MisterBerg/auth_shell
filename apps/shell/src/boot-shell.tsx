@@ -12,6 +12,10 @@ win["__React"] = React;
 win["__ReactJsxRuntime"] = ReactJsxRuntime;
 win["__ReactDOM"] = ReactDOM;
 win["__ReactDOMClient"] = ReactDOMClient;
+win["__AgentBridgeDefaults"] = {
+  url: import.meta.env.VITE_AGENT_BRIDGE_URL ?? "",
+  token: import.meta.env.VITE_AGENT_BRIDGE_TOKEN ?? "",
+};
 
 const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("Root element #root not found");
