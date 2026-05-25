@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent } from "react";
 import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type {
   AssetRecord,
   ChildSlot,
@@ -146,8 +148,9 @@ type BridgeConfig = {
 
 type BridgeStatus = {
   status: string;
-  workspaceRoot: string;
+  workspaceRoot: string | null;
   pythonRoot?: string;
+  browseStartPath?: string;
 };
 
 type BridgeListResult = {
@@ -179,6 +182,11 @@ type AgentRunResult = {
   pending: PendingContinuation | null;
   shouldNavigate: boolean;
 };
+
+type AgentProgressEvent =
+  | { kind: "status"; text: string }
+  | { kind: "tool_call"; name: string; arguments: string }
+  | { kind: "tool_result"; name: string; text: string };
 
 const RESOURCE_TYPE_VALUES: Resource["type"][] = [
   "s3-object",
@@ -1036,6 +1044,7 @@ async function createOpenAiResponse(args: {
   model: string;
   instructions: string;
   tools: ToolDefinition[];
+  signal?: AbortSignal;
 }): Promise<ResponsesApiResponse> {
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -1050,6 +1059,7 @@ async function createOpenAiResponse(args: {
       tools: args.tools,
       parallel_tool_calls: true,
     }),
+    signal: args.signal,
   });
 
   const payload = (await response.json()) as ResponsesApiResponse;
@@ -1068,6 +1078,10 @@ function maskBridgeToken(value: string): string {
   if (!value) return "Not connected";
   if (value.length < 10) return "Saved locally";
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function readBridgeDefaults(): AgentBridgeDefaults {
@@ -1099,15 +1113,8 @@ async function callBridge<T>(bridge: BridgeConfig, method: string, params: Recor
   return payload.result as T;
 }
 
-async function syncBridgeWorkspaceRoot(args: {
-  bridge: BridgeConfig;
-  preferredRoot: string;
-}): Promise<BridgeStatus> {
-  const preferred = args.preferredRoot.trim();
-  if (preferred) {
-    return callBridge<BridgeStatus>(args.bridge, "set_workspace_root", { path: preferred });
-  }
-  return callBridge<BridgeStatus>(args.bridge, "get_bridge_status");
+async function getBridgeStatus(bridge: BridgeConfig): Promise<BridgeStatus> {
+  return callBridge<BridgeStatus>(bridge, "get_bridge_status");
 }
 
 async function loadWorkspaceContext(getS3Client: ReturnType<typeof useAwsS3Client>, configBucket: string, configPath: string, projectId: string): Promise<WorkspaceContext> {
@@ -1903,7 +1910,6 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const [bridgeWorkspaceRoot, setBridgeWorkspaceRoot] = useState("");
   const [draftBridgeUrl, setDraftBridgeUrl] = useState("");
   const [draftBridgeToken, setDraftBridgeToken] = useState("");
-  const [draftBridgeWorkspaceRoot, setDraftBridgeWorkspaceRoot] = useState("");
   const [bridgeBrowserOpen, setBridgeBrowserOpen] = useState(false);
   const [bridgeBrowserPath, setBridgeBrowserPath] = useState("");
   const [bridgeBrowserEntries, setBridgeBrowserEntries] = useState<BridgeListResult["files"]>([]);
@@ -1913,6 +1919,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const [composer, setComposer] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
+  const [stopRequested, setStopRequested] = useState(false);
   const [pendingContinuation, setPendingContinuation] = useState<PendingContinuation | null>(null);
   const [hydratedSessionKey, setHydratedSessionKey] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | undefined>();
@@ -1924,6 +1931,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     systemPrompt,
   });
   const scrollRef = useRef<HTMLDivElement>(null);
+  const runAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const stored = safeReadLocalStorage(storageKey);
@@ -1955,37 +1963,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     setBridgeWorkspaceRoot(storedWorkspaceRoot);
     setDraftBridgeUrl(storedUrl);
     setDraftBridgeToken(storedToken);
-    setDraftBridgeWorkspaceRoot(storedWorkspaceRoot);
   }, [bridgeTokenKey, bridgeUrlKey, bridgeWorkspaceRootKey]);
-
-  useEffect(() => {
-    const normalizedUrl = bridgeUrl.trim().replace(/\/$/, "");
-    const normalizedToken = bridgeToken.trim();
-    if (!normalizedUrl || !normalizedToken) return;
-
-    const bridge = { url: normalizedUrl, token: normalizedToken };
-    const preferredRoot = safeReadLocalStorage(bridgeWorkspaceRootKey) || draftBridgeWorkspaceRoot || bridgeWorkspaceRoot;
-    let cancelled = false;
-
-    void syncBridgeWorkspaceRoot({ bridge, preferredRoot })
-      .then((status) => {
-        if (cancelled) return;
-        safeWriteLocalStorage(bridgeWorkspaceRootKey, status.workspaceRoot);
-        setBridgeWorkspaceRoot(status.workspaceRoot);
-        setDraftBridgeWorkspaceRoot((current) => current.trim() ? current : status.workspaceRoot);
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        console.debug("[chat-codex] bridge workspace sync failed", {
-          message: (error as Error).message,
-          preferredRoot,
-        });
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [bridgeUrl, bridgeToken, bridgeWorkspaceRootKey]);
 
   useEffect(() => {
     setMetaDraft({ title, model, systemPrompt });
@@ -2040,17 +2018,13 @@ export default function ChatCodexModule({ config }: ModuleProps) {
 
     try {
       const bridge = { url: normalizedUrl, token: normalizedToken };
-      const status = await syncBridgeWorkspaceRoot({
-        bridge,
-        preferredRoot: draftBridgeWorkspaceRoot || safeReadLocalStorage(bridgeWorkspaceRootKey),
-      });
+      const status = await getBridgeStatus(bridge);
       safeWriteLocalStorage(bridgeUrlKey, normalizedUrl);
       safeWriteLocalStorage(bridgeTokenKey, normalizedToken);
-      safeWriteLocalStorage(bridgeWorkspaceRootKey, status.workspaceRoot);
+      safeWriteLocalStorage(bridgeWorkspaceRootKey, status.workspaceRoot ?? "");
       setBridgeUrl(normalizedUrl);
       setBridgeToken(normalizedToken);
-      setBridgeWorkspaceRoot(status.workspaceRoot);
-      setDraftBridgeWorkspaceRoot(status.workspaceRoot);
+      setBridgeWorkspaceRoot(status.workspaceRoot ?? "");
       setConnectionError(undefined);
     } catch (error) {
       setConnectionError((error as Error).message);
@@ -2066,7 +2040,6 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     setBridgeWorkspaceRoot("");
     setDraftBridgeUrl("");
     setDraftBridgeToken("");
-    setDraftBridgeWorkspaceRoot("");
   }
 
   async function loadBridgeDirectory(path: string) {
@@ -2099,13 +2072,30 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }
 
   async function openBridgeBrowser() {
+    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
+      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
+      : bridgeUrl.trim() && bridgeToken.trim()
+        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
+        : null;
+
+    if (!bridge) {
+      setConnectionError("Save the bridge URL and token before choosing a workspace root.");
+      return;
+    }
+
     setBridgeBrowserOpen(true);
     setNewFolderName("");
-    const startPath = draftBridgeWorkspaceRoot.trim() || bridgeWorkspaceRoot || ".";
-    await loadBridgeDirectory(startPath);
+    setBridgeBrowserError(undefined);
+    try {
+      const status = await getBridgeStatus(bridge);
+      const startPath = bridgeWorkspaceRoot || status.workspaceRoot || status.browseStartPath || ".";
+      await loadBridgeDirectory(startPath);
+    } catch (error) {
+      setBridgeBrowserError((error as Error).message);
+    }
   }
 
-  async function handleApplyBridgeWorkspaceRoot() {
+  async function handleSelectBridgeWorkspaceRoot(path: string) {
     const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
       ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
       : bridgeUrl.trim() && bridgeToken.trim()
@@ -2117,16 +2107,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       return;
     }
 
-    const path = draftBridgeWorkspaceRoot.trim();
-    if (!path) {
-      setConnectionError("Enter a workspace root path.");
-      return;
-    }
-
     const status = await callBridge<BridgeStatus>(bridge, "set_workspace_root", { path });
-    safeWriteLocalStorage(bridgeWorkspaceRootKey, status.workspaceRoot);
-    setBridgeWorkspaceRoot(status.workspaceRoot);
-    setDraftBridgeWorkspaceRoot(status.workspaceRoot);
+    safeWriteLocalStorage(bridgeWorkspaceRootKey, status.workspaceRoot ?? "");
+    setBridgeWorkspaceRoot(status.workspaceRoot ?? "");
     setConnectionError(undefined);
     setBridgeBrowserOpen(false);
   }
@@ -2153,11 +2136,11 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     setBridgeBrowserError(undefined);
     try {
       await callBridge(bridge, "create_directory", {
-        parentPath: bridgeBrowserPath || draftBridgeWorkspaceRoot || bridgeWorkspaceRoot || ".",
+        parentPath: bridgeBrowserPath || bridgeWorkspaceRoot || ".",
         name,
       });
       setNewFolderName("");
-      await loadBridgeDirectory(bridgeBrowserPath || draftBridgeWorkspaceRoot || bridgeWorkspaceRoot || ".");
+      await loadBridgeDirectory(bridgeBrowserPath || bridgeWorkspaceRoot || ".");
     } catch (error) {
       setBridgeBrowserError((error as Error).message);
       setBridgeBrowserLoading(false);
@@ -2187,6 +2170,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     initialInputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>;
     contextBits: string[];
     bridge: BridgeConfig | null;
+    signal: AbortSignal;
+    onProgress: (event: AgentProgressEvent) => void;
   }): Promise<AgentRunResult> {
     let inputItems = args.initialInputItems;
     let assistantText = "";
@@ -2194,12 +2179,20 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     let shouldNavigate = false;
 
     for (let i = 0; i < TOOL_ITERATION_LIMIT; i++) {
+      if (args.signal.aborted) {
+        throw new DOMException("The agent run was stopped.", "AbortError");
+      }
+      args.onProgress({
+        kind: "status",
+        text: `Working step ${i + 1} of up to ${TOOL_ITERATION_LIMIT}...`,
+      });
       const response = await createOpenAiResponse({
         apiKey: apiKey.trim(),
         input: inputItems,
         model,
         instructions: args.contextBits.join(" "),
         tools: TOOL_DEFINITIONS,
+        signal: args.signal,
       });
 
       const functionCalls = (response.output ?? []).filter(
@@ -2223,7 +2216,15 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       lastToolMessages = [];
 
       for (const call of functionCalls) {
+        if (args.signal.aborted) {
+          throw new DOMException("The agent run was stopped.", "AbortError");
+        }
         console.debug("[chat-codex] tool call", {
+          name: call.name,
+          arguments: call.arguments,
+        });
+        args.onProgress({
+          kind: "tool_call",
           name: call.name,
           arguments: call.arguments,
         });
@@ -2260,6 +2261,11 @@ export default function ChatCodexModule({ config }: ModuleProps) {
 
         if (result.toolMessage) {
           lastToolMessages.push(result.toolMessage);
+          args.onProgress({
+            kind: "tool_result",
+            name: call.name,
+            text: result.toolMessage,
+          });
         }
         if (result.mutatedWorkspace) {
           shouldNavigate = true;
@@ -2296,6 +2302,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     setMessages(history);
     setComposer("");
     setBusy(true);
+    setStopRequested(false);
     setPendingContinuation(null);
     persistChatSessionNow(chatSessionKey, {
       messages: history,
@@ -2305,6 +2312,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     setConnectionError(undefined);
 
     try {
+      const controller = new AbortController();
+      runAbortRef.current = controller;
       const bridge = bridgeUrl.trim() && bridgeToken.trim()
         ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
         : null;
@@ -2326,18 +2335,26 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         initialInputItems: toInputItems(history),
         contextBits,
         bridge,
+        signal: controller.signal,
+        onProgress: (event) => {
+          const text =
+            event.kind === "status"
+              ? event.text
+              : event.kind === "tool_call"
+                ? `Calling ${event.name}\n\n\`\`\`json\n${event.arguments || "{}"}\n\`\`\``
+                : event.text;
+          setMessages((current) => [...current, createMessage("tool", text)]);
+        },
       });
       setPendingContinuation(session.pending);
-      const nextMessages = [...history];
-      if (session.lastToolMessages.length) {
-        nextMessages.push(createMessage("tool", session.lastToolMessages.join("\n")));
-      }
-      nextMessages.push(createMessage("assistant", session.assistantText || "The model returned no text output."));
-      setMessages(nextMessages);
-      persistChatSessionNow(chatSessionKey, {
-        messages: nextMessages,
-        composer: "",
-        pendingContinuation: session.pending,
+      setMessages((current) => {
+        const nextMessages = [...current, createMessage("assistant", session.assistantText || "The model returned no text output.")];
+        persistChatSessionNow(chatSessionKey, {
+          messages: nextMessages,
+          composer: "",
+          pendingContinuation: session.pending,
+        });
+        return nextMessages;
       });
       if (session.shouldNavigate) {
         window.dispatchEvent(new Event("shell:navigate"));
@@ -2346,12 +2363,22 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       console.debug("[chat-codex] tool loop error", {
         message: (error as Error).message,
       });
-      setMessages((current) => [
-        ...current,
-        createMessage("error", (error as Error).message),
-      ]);
+      setMessages((current) => {
+        const nextMessages = [
+          ...current,
+          createMessage(isAbortError(error) ? "tool" : "error", isAbortError(error) ? "Agent run stopped." : (error as Error).message),
+        ];
+        persistChatSessionNow(chatSessionKey, {
+          messages: nextMessages,
+          composer: "",
+          pendingContinuation: null,
+        });
+        return nextMessages;
+      });
     } finally {
+      runAbortRef.current = null;
       setBusy(false);
+      setStopRequested(false);
     }
   }
 
@@ -2360,10 +2387,13 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     if (!apiKey.trim() || !pending || busy) return;
 
     setBusy(true);
+    setStopRequested(false);
     setPendingContinuation(null);
     setConnectionError(undefined);
 
     try {
+      const controller = new AbortController();
+      runAbortRef.current = controller;
       const bridge = bridgeUrl.trim() && bridgeToken.trim()
         ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
         : null;
@@ -2371,18 +2401,26 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         initialInputItems: pending.inputItems,
         contextBits: pending.contextBits,
         bridge,
+        signal: controller.signal,
+        onProgress: (event) => {
+          const text =
+            event.kind === "status"
+              ? event.text
+              : event.kind === "tool_call"
+                ? `Calling ${event.name}\n\n\`\`\`json\n${event.arguments || "{}"}\n\`\`\``
+                : event.text;
+          setMessages((current) => [...current, createMessage("tool", text)]);
+        },
       });
       setPendingContinuation(session.pending);
-      const nextMessages = [...messages];
-      if (session.lastToolMessages.length) {
-        nextMessages.push(createMessage("tool", session.lastToolMessages.join("\n")));
-      }
-      nextMessages.push(createMessage("assistant", session.assistantText || "The model returned no text output."));
-      setMessages(nextMessages);
-      persistChatSessionNow(chatSessionKey, {
-        messages: nextMessages,
-        composer,
-        pendingContinuation: session.pending,
+      setMessages((current) => {
+        const nextMessages = [...current, createMessage("assistant", session.assistantText || "The model returned no text output.")];
+        persistChatSessionNow(chatSessionKey, {
+          messages: nextMessages,
+          composer,
+          pendingContinuation: session.pending,
+        });
+        return nextMessages;
       });
       if (session.shouldNavigate) {
         window.dispatchEvent(new Event("shell:navigate"));
@@ -2391,13 +2429,29 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       console.debug("[chat-codex] continuation error", {
         message: (error as Error).message,
       });
-      setMessages((current) => [
-        ...current,
-        createMessage("error", (error as Error).message),
-      ]);
+      setMessages((current) => {
+        const nextMessages = [
+          ...current,
+          createMessage(isAbortError(error) ? "tool" : "error", isAbortError(error) ? "Agent run stopped." : (error as Error).message),
+        ];
+        persistChatSessionNow(chatSessionKey, {
+          messages: nextMessages,
+          composer,
+          pendingContinuation: null,
+        });
+        return nextMessages;
+      });
     } finally {
+      runAbortRef.current = null;
       setBusy(false);
+      setStopRequested(false);
     }
+  }
+
+  function handleStopRun() {
+    if (!runAbortRef.current) return;
+    setStopRequested(true);
+    runAbortRef.current.abort();
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -2490,18 +2544,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             <div style={{ fontSize: "0.72rem", color: C.muted }}>
               Used for local file access, command execution, and host-side analysis tools.
             </div>
-            <input
-              value={draftBridgeWorkspaceRoot}
-              onChange={(event) => setDraftBridgeWorkspaceRoot(event.currentTarget.value)}
-              placeholder={bridgeWorkspaceRoot || "Workspace root path"}
-              style={inputStyle}
-            />
             <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap", alignItems: "center" }}>
-              <button onClick={() => void handleApplyBridgeWorkspaceRoot()} style={primaryButtonStyle}>
+              <button onClick={() => void openBridgeBrowser()} style={primaryButtonStyle}>
                 Set Workspace Root
-              </button>
-              <button onClick={() => void openBridgeBrowser()} style={ghostButtonStyle}>
-                Browse...
               </button>
               <span style={{ fontSize: "0.72rem", color: C.muted }}>
                 Current root: {bridgeWorkspaceRoot || "not set"}
@@ -2547,7 +2592,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         </div>
       )}
 
-      <div ref={scrollRef} style={{ minHeight: 0, overflowY: "auto", padding: "1rem", display: "grid", gap: "0.8rem", alignContent: messages.length ? "start" : "center" }}>
+      <div ref={scrollRef} style={{ minHeight: 0, overflowY: "auto", overflowX: "hidden", padding: "1rem", display: "grid", gap: "0.8rem", alignContent: messages.length ? "start" : "center" }}>
         {messages.length === 0 ? (
           <div style={{ maxWidth: 720, margin: "0 auto", padding: "1.2rem 1.25rem", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 16 }}>
             <div style={{ fontSize: "0.95rem", fontWeight: 700, marginBottom: "0.45rem" }}>Workspace-side Codex test module</div>
@@ -2557,12 +2602,12 @@ export default function ChatCodexModule({ config }: ModuleProps) {
           </div>
         ) : (
           messages.map((message) => (
-            <div key={message.id} style={{ display: "flex", justifyContent: message.role === "user" ? "flex-end" : "flex-start" }}>
+            <div key={message.id} style={{ display: "flex", justifyContent: message.role === "user" ? "flex-end" : "flex-start", minWidth: 0, width: "100%" }}>
               <div style={bubbleStyle(message.role)}>
                 <div style={{ fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.08em", color: C.muted, marginBottom: "0.3rem" }}>
                   {message.role === "user" ? "You" : message.role === "assistant" ? "Codex" : message.role === "tool" ? "Tool" : "Error"}
                 </div>
-                <div style={{ fontSize: "0.86rem", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{message.text}</div>
+                <MessageBody role={message.role} text={message.text} />
               </div>
             </div>
           ))
@@ -2604,9 +2649,15 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             rows={3}
             style={{ ...inputStyle, resize: "none", minHeight: 84 }}
           />
-          <button disabled={!canSend} onClick={handleSend} style={sendButtonStyle(canSend)}>
-            {busy ? "Sending..." : "Send"}
-          </button>
+          {busy ? (
+            <button onClick={handleStopRun} style={stopButtonStyle(stopRequested)}>
+              {stopRequested ? "Stopping..." : "Stop"}
+            </button>
+          ) : (
+            <button disabled={!canSend} onClick={handleSend} style={sendButtonStyle(canSend)}>
+              Send
+            </button>
+          )}
         </div>
       </div>
 
@@ -2623,18 +2674,11 @@ export default function ChatCodexModule({ config }: ModuleProps) {
 
             <div style={{ display: "flex", flexWrap: "wrap", gap: "0.55rem", alignItems: "center", padding: "0.85rem 1rem", borderBottom: `1px solid ${C.border}` }}>
               <button
-                onClick={() => void loadBridgeDirectory(parentPath(bridgeBrowserPath || draftBridgeWorkspaceRoot || bridgeWorkspaceRoot || "."))}
+                onClick={() => void loadBridgeDirectory(parentPath(bridgeBrowserPath || bridgeWorkspaceRoot || "."))}
                 style={ghostButtonStyle}
                 disabled={bridgeBrowserLoading}
               >
                 Up
-              </button>
-              <button
-                onClick={() => void handleApplyBridgeWorkspaceRoot()}
-                style={primaryButtonStyle}
-                disabled={bridgeBrowserLoading || !draftBridgeWorkspaceRoot.trim()}
-              >
-                Use Current Folder
               </button>
               <input
                 value={newFolderName}
@@ -2667,11 +2711,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                             Open
                           </button>
                           <button
-                            onClick={() => {
-                              setDraftBridgeWorkspaceRoot(nextPath);
-                              setBridgeBrowserPath(nextPath);
-                            }}
+                            onClick={() => void handleSelectBridgeWorkspaceRoot(nextPath)}
                             style={primaryButtonStyle}
+                            disabled={bridgeBrowserLoading}
                           >
                             Select
                           </button>
@@ -2686,7 +2728,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             </div>
 
             <div style={{ padding: "0.8rem 1rem", borderTop: `1px solid ${C.border}`, fontSize: "0.74rem", color: C.muted }}>
-              Selected path: {draftBridgeWorkspaceRoot || bridgeBrowserPath || "none"}
+              Selecting a folder sets it as the workspace root and closes this window.
             </div>
           </div>
         </div>
@@ -2749,15 +2791,116 @@ const dangerButtonStyle: CSSProperties = {
 function bubbleStyle(role: ChatMessage["role"]): CSSProperties {
   return {
     maxWidth: "min(760px, 90%)",
+    minWidth: 0,
+    width: "fit-content",
     padding: "0.9rem 1rem",
     borderRadius: 16,
     border: `1px solid ${C.border}`,
+    overflow: "hidden",
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
     background:
       role === "user" ? C.userBubble :
       role === "assistant" ? C.assistantBubble :
       role === "tool" ? C.toolBubble :
       C.errorBubble,
   };
+}
+
+function ChatMarkdownImage({ src, alt }: { src?: string; alt?: string }) {
+  const trimmed = src?.trim();
+  const [failed, setFailed] = useState(false);
+
+  if (!trimmed) {
+    return null;
+  }
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return (
+      <span
+        style={{
+          display: "block",
+          margin: "0.6rem 0",
+          padding: "0.65rem 0.8rem",
+          border: `1px solid ${C.border}`,
+          borderRadius: 10,
+          color: C.muted,
+          background: "#071321",
+          fontSize: "0.8rem",
+        }}
+      >
+        External image{alt ? `: ${alt}` : ""}.{" "}
+        <a href={trimmed} target="_blank" rel="noopener noreferrer" style={{ color: C.accent, textDecoration: "underline" }}>
+          Open image
+        </a>
+      </span>
+    );
+  }
+
+  if (failed) {
+    return (
+      <span
+        style={{
+          display: "block",
+          margin: "0.6rem 0",
+          padding: "0.65rem 0.8rem",
+          border: `1px solid ${C.border}`,
+          borderRadius: 10,
+          color: C.muted,
+          background: "#071321",
+          fontSize: "0.8rem",
+        }}
+      >
+        Image unavailable{alt ? `: ${alt}` : "."}
+      </span>
+    );
+  }
+
+  return (
+    <img
+      src={trimmed}
+      alt={alt ?? ""}
+      onError={() => setFailed(true)}
+      style={{ display: "block", maxWidth: "100%", height: "auto", borderRadius: 10, margin: "0.6rem 0" }}
+    />
+  );
+}
+
+function MessageBody({ role, text }: { role: ChatMessage["role"]; text: string }) {
+  if (role === "user" || role === "error") {
+    return <div style={{ fontSize: "0.86rem", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{text}</div>;
+  }
+
+  return (
+    <div style={{ fontSize: "0.86rem", lineHeight: 1.6, minWidth: 0, maxWidth: "100%", overflowX: "hidden" }} className="chat-codex-markdown">
+      <Markdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, children }) => (
+            <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: C.accent, textDecoration: "underline" }}>
+              {children}
+            </a>
+          ),
+          code: ({ children }) => (
+            <code style={{ background: "#071321", border: `1px solid ${C.border}`, borderRadius: 6, padding: "0.12rem 0.35rem", fontSize: "0.82em", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+              {children}
+            </code>
+          ),
+          pre: ({ children }) => (
+            <pre style={{ margin: "0.75rem 0", padding: "0.8rem 0.9rem", maxWidth: "100%", overflowX: "auto", background: "#071321", border: `1px solid ${C.border}`, borderRadius: 10, boxSizing: "border-box" }}>
+              {children}
+            </pre>
+          ),
+          img: ({ src, alt }) => <ChatMarkdownImage src={src} alt={alt} />,
+          ul: ({ children }) => <ul style={{ margin: "0.5rem 0", paddingLeft: "1.2rem" }}>{children}</ul>,
+          ol: ({ children }) => <ol style={{ margin: "0.5rem 0", paddingLeft: "1.2rem" }}>{children}</ol>,
+          p: ({ children }) => <p style={{ margin: "0.45rem 0", overflowWrap: "anywhere", wordBreak: "break-word" }}>{children}</p>,
+        }}
+      >
+        {text}
+      </Markdown>
+    </div>
+  );
 }
 
 function sendButtonStyle(enabled: boolean): CSSProperties {
@@ -2772,5 +2915,20 @@ function sendButtonStyle(enabled: boolean): CSSProperties {
     fontSize: "0.84rem",
     padding: "0.8rem 1rem",
     cursor: enabled ? "pointer" : "default",
+  };
+}
+
+function stopButtonStyle(stopping: boolean): CSSProperties {
+  return {
+    alignSelf: "stretch",
+    minWidth: 110,
+    border: "none",
+    borderRadius: 14,
+    background: stopping ? "#4b5563" : "#7f1d1d",
+    color: "#fee2e2",
+    fontWeight: 700,
+    fontSize: "0.84rem",
+    padding: "0.8rem 1rem",
+    cursor: "pointer",
   };
 }

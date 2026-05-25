@@ -42,7 +42,6 @@ function main() {
     env: {
       ...process.env,
       AGENT_BRIDGE_TOKEN: agentBridgeToken,
-      AGENT_BRIDGE_WORKSPACE_ROOT: ROOT,
       AGENT_BRIDGE_ALLOWED_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173",
     },
   });

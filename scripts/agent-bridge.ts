@@ -4,6 +4,7 @@ import { execFileSync, spawn } from "child_process";
 import { dirname, extname, isAbsolute, resolve, join } from "path";
 import { pathToFileURL } from "url";
 import { randomUUID } from "crypto";
+import { homedir } from "os";
 
 type RpcRequest = {
   method?: string;
@@ -23,9 +24,12 @@ type RpcFailure = {
 const PORT = Number(process.env["AGENT_BRIDGE_PORT"] ?? "4317");
 const HOST = "127.0.0.1";
 const TOKEN = process.env["AGENT_BRIDGE_TOKEN"] ?? "";
-let workspaceRoot = resolve(process.env["AGENT_BRIDGE_WORKSPACE_ROOT"] ?? process.cwd());
+let workspaceRoot = process.env["AGENT_BRIDGE_WORKSPACE_ROOT"]?.trim()
+  ? resolve(process.env["AGENT_BRIDGE_WORKSPACE_ROOT"]!)
+  : null;
 const bridgeStateRoot = resolve(process.env["AGENT_BRIDGE_STATE_ROOT"] ?? join(process.cwd(), ".agent-bridge"));
 const pythonStateRoot = resolve(process.env["AGENT_BRIDGE_PYTHON_ROOT"] ?? join(bridgeStateRoot, "python"));
+const defaultBrowseRoot = resolve(process.env["AGENT_BRIDGE_BROWSE_ROOT"] ?? homedir());
 const allowedOrigins = new Set(
   (process.env["AGENT_BRIDGE_ALLOWED_ORIGINS"] ?? "http://localhost:5173,http://127.0.0.1:5173")
     .split(",")
@@ -119,6 +123,7 @@ createServer(async (req, res) => {
         result: {
           status: "ok",
           workspaceRoot,
+          browseStartPath: defaultBrowseRoot,
           methods: [
             "get_bridge_status",
             "set_workspace_root",
@@ -152,7 +157,7 @@ createServer(async (req, res) => {
   }
 }).listen(PORT, HOST, () => {
   console.log(`[agent-bridge] listening on http://${HOST}:${PORT}`);
-  console.log(`[agent-bridge] workspace root: ${workspaceRoot}`);
+  console.log(`[agent-bridge] workspace root: ${workspaceRoot ?? "<unset>"}`);
 });
 
 async function runRpc(body: RpcRequest): Promise<unknown> {
@@ -234,7 +239,11 @@ function resolvePath(inputPath: unknown): string {
   if (typeof inputPath !== "string" || !inputPath.trim()) {
     throw new Error("A non-empty path is required.");
   }
-  return isAbsolute(inputPath) ? resolve(inputPath) : resolve(workspaceRoot, inputPath);
+  if (isAbsolute(inputPath)) return resolve(inputPath);
+  if (!workspaceRoot) {
+    throw new Error("Workspace root is not set.");
+  }
+  return resolve(workspaceRoot, inputPath);
 }
 
 function getBridgeStatus(): unknown {
@@ -242,11 +251,20 @@ function getBridgeStatus(): unknown {
     status: "ok",
     workspaceRoot,
     pythonRoot: pythonStateRoot,
+    browseStartPath: defaultBrowseRoot,
   };
 }
 
 async function setWorkspaceRoot(params: Record<string, unknown> = {}): Promise<unknown> {
-  const nextRoot = resolvePath(params["path"]);
+  const rawPath = typeof params["path"] === "string" ? params["path"].trim() : "";
+  if (!rawPath) {
+    throw new Error("Workspace root path is required.");
+  }
+  const nextRoot = isAbsolute(rawPath)
+    ? resolve(rawPath)
+    : workspaceRoot
+      ? resolve(workspaceRoot, rawPath)
+      : resolve(defaultBrowseRoot, rawPath);
   const stats = await fs.stat(nextRoot);
   if (!stats.isDirectory()) {
     throw new Error("Workspace root must be a directory.");
@@ -259,7 +277,10 @@ async function setWorkspaceRoot(params: Record<string, unknown> = {}): Promise<u
 }
 
 async function listWorkspaceFiles(params: Record<string, unknown> = {}): Promise<unknown> {
-  const target = resolvePath(typeof params["path"] === "string" ? params["path"] : ".");
+  const pathParam = typeof params["path"] === "string" ? params["path"].trim() : "";
+  const target = pathParam
+    ? resolvePath(pathParam)
+    : (workspaceRoot ?? defaultBrowseRoot);
   const recursive = params["recursive"] === true;
   const limit = clampNumber(params["limit"], 1, 1000, 200);
   const files: Array<{ path: string; kind: "file" | "directory"; sizeBytes?: number }> = [];
@@ -295,7 +316,10 @@ async function listWorkspaceFiles(params: Record<string, unknown> = {}): Promise
 }
 
 async function createDirectory(params: Record<string, unknown> = {}): Promise<unknown> {
-  const parentPath = resolvePath(typeof params["parentPath"] === "string" ? params["parentPath"] : ".");
+  const parentParam = typeof params["parentPath"] === "string" ? params["parentPath"].trim() : "";
+  const parentPath = parentParam
+    ? resolvePath(parentParam)
+    : (workspaceRoot ?? defaultBrowseRoot);
   const name = typeof params["name"] === "string" ? params["name"].trim() : "";
   if (!name) {
     throw new Error("Directory name is required.");
@@ -346,6 +370,9 @@ async function runWorkspaceCommand(params: Record<string, unknown> = {}): Promis
   const command = typeof params["command"] === "string" ? params["command"].trim() : "";
   if (!command) throw new Error("Command is required.");
   const cwd = params["cwd"] ? resolvePath(params["cwd"]) : workspaceRoot;
+  if (!cwd) {
+    throw new Error("Workspace root is not set.");
+  }
   const timeoutMs = clampNumber(params["timeoutMs"], 100, 600000, 120000);
   const shellSpec = getWorkspaceShellCommand(command);
 
@@ -537,7 +564,7 @@ async function ensurePythonEnvironment(): Promise<{ root: string; scriptsRoot: s
     const createResult = await spawnCommand({
       command: bootstrap.command,
       args: [...bootstrap.args, "-m", "venv", envPaths.root],
-      cwd: workspaceRoot,
+      cwd: bridgeStateRoot,
       timeoutMs: 240000,
     });
     if (createResult.exitCode !== 0) {
@@ -562,7 +589,7 @@ async function getPythonEnvironment(): Promise<unknown> {
   const versionResult = await spawnCommand({
     command: envInfo.pythonPath,
     args: ["--version"],
-    cwd: workspaceRoot,
+    cwd: bridgeStateRoot,
     timeoutMs: 20000,
   });
   if (versionResult.exitCode !== 0) {
@@ -607,11 +634,11 @@ async function checkPythonDependencies(params: Record<string, unknown> = {}): Pr
     ? await spawnCommand({
         command: envInfo.pythonPath,
         args: ["-c", script],
-        cwd: workspaceRoot,
+        cwd: bridgeStateRoot,
         timeoutMs: 30000,
       })
     : {
-        cwd: workspaceRoot,
+        cwd: bridgeStateRoot,
         command: envInfo.pythonPath,
         exitCode: 0,
         signal: null,
@@ -655,7 +682,7 @@ async function installPythonDependencies(params: Record<string, unknown> = {}): 
   const pipUpgrade = await spawnCommand({
     command: envInfo.pythonPath,
     args: ["-m", "pip", "install", "--upgrade", "pip"],
-    cwd: workspaceRoot,
+    cwd: bridgeStateRoot,
     timeoutMs: 240000,
   });
   if (pipUpgrade.exitCode !== 0) {
@@ -672,7 +699,7 @@ async function installPythonDependencies(params: Record<string, unknown> = {}): 
   const installResult = await spawnCommand({
     command: envInfo.pythonPath,
     args: ["-m", "pip", "install", ...specs],
-    cwd: workspaceRoot,
+    cwd: bridgeStateRoot,
     timeoutMs: 600000,
   });
   if (installResult.exitCode !== 0) {
@@ -707,6 +734,9 @@ async function runPythonScript(params: Record<string, unknown> = {}): Promise<un
   }
 
   const cwd = params["cwd"] ? resolvePath(params["cwd"]) : workspaceRoot;
+  if (!cwd) {
+    throw new Error("Workspace root is not set.");
+  }
   const timeoutMs = clampNumber(params["timeoutMs"], 100, 600000, 120000);
   const tempDir = join(bridgeStateRoot, "tmp");
   await fs.mkdir(tempDir, { recursive: true });
