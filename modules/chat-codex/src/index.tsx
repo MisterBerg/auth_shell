@@ -459,6 +459,117 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     type: "function",
+    name: "create_markdown_slot_from_content",
+    description: "Create a markdown-viewer slot and its backing markdown file-set asset in one operation.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        entryPath: { type: "string" },
+        files: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              content: { type: "string" },
+              mimeType: { type: "string" },
+            },
+            required: ["path", "content"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotId", "title", "entryPath", "files"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_document_viewer_slot",
+    description: "Create a document-viewer slot wired either to an existing PDF asset or by importing a local workspace PDF.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        assetId: { type: "string" },
+        workspacePath: { type: "string" },
+        filename: { type: "string" },
+        label: { type: "string" },
+      },
+      required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_task_tracker_slot",
+    description: "Create a task-tracker slot and optionally seed it with initial tasks in one operation.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        tasks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              description: { type: "string" },
+              notes: { type: "string" },
+              status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
+              priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+              assignee: { type: "string" },
+              tags: { type: "array", items: { type: "string" } },
+              repeatable: { type: "boolean" },
+            },
+            required: ["title"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_documentation_slot",
+    description: "Create a documentation-viewer slot and initialize it with starter pages and content in one operation.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        pages: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              content: { type: "string" },
+              action: { type: "string", enum: ["child", "sibling"] },
+              afterDocTitle: { type: "string" },
+            },
+            required: ["title"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "list_registered_resources",
     description: "List resources currently registered across the loaded module tree.",
     parameters: {
@@ -1426,6 +1537,120 @@ async function createProjectAssetFromBytes(args: {
   return { assetId, versionId, bucket: args.bucket, key, mimeType: args.mimeType, sizeBytes: args.bytes.byteLength };
 }
 
+async function createMarkdownFileSetAsset(args: {
+  getS3Client: ReturnType<typeof useAwsS3Client>;
+  getDdbClient: ReturnType<typeof useAwsDdbClient>;
+  assetsTable: string;
+  projectId: string;
+  bucket: string;
+  label: string;
+  entryPath: string;
+  files: MarkdownFileInput[];
+  moduleInstanceId: string;
+}) {
+  const fileSetAssetId = createAssetId();
+  const fileSetVersionId = createAssetVersionId();
+  const versionRoot = [
+    "projects",
+    encodeURIComponent(args.projectId).replace(/%20/g, "-"),
+    "assets",
+    encodeURIComponent(fileSetAssetId).replace(/%20/g, "-"),
+    "versions",
+    encodeURIComponent(fileSetVersionId).replace(/%20/g, "-"),
+  ].join("/");
+  const filesPrefix = `${versionRoot}/files`;
+  const manifestKey = `${versionRoot}/manifest.json`;
+  const s3 = await args.getS3Client(args.bucket);
+  const ddb = await args.getDdbClient();
+  const childAssetRefs: Array<{ path: string; assetId: string; versionId: string; key: string; mimeType: string; sizeBytes: number }> = [];
+
+  for (const file of args.files) {
+    const bytes = new TextEncoder().encode(file.content);
+    const key = `${filesPrefix}/${file.path}`;
+    const mimeType = file.mimeType ?? guessMimeType(file.path, "text/plain");
+    await s3.send(new PutObjectCommand({
+      Bucket: args.bucket,
+      Key: key,
+      Body: bytes,
+      ContentType: mimeType,
+    }));
+    const assetId = createAssetId();
+    const versionId = createAssetVersionId();
+    await createAsset({
+      ddb,
+      tableName: args.assetsTable,
+      asset: createAssetRecord({
+        projectId: args.projectId,
+        assetId,
+        label: basename(file.path),
+        version: {
+          versionId,
+          bucket: args.bucket,
+          key,
+          mimeType,
+          sizeBytes: bytes.byteLength,
+        },
+        meta: {
+          kind: "file",
+          parentAssetId: fileSetAssetId,
+          path: file.path,
+          moduleInstanceId: args.moduleInstanceId,
+          moduleType: "module-markdown-viewer",
+        },
+      }),
+    });
+    childAssetRefs.push({ path: file.path, assetId, versionId, key, mimeType, sizeBytes: bytes.byteLength });
+  }
+
+  const manifestBytes = new TextEncoder().encode(JSON.stringify({
+    kind: "markdown-file-set",
+    entryPath: args.entryPath,
+    moduleInstanceId: args.moduleInstanceId,
+    files: childAssetRefs,
+  }, null, 2));
+
+  await s3.send(new PutObjectCommand({
+    Bucket: args.bucket,
+    Key: manifestKey,
+    Body: manifestBytes,
+    ContentType: "application/json",
+  }));
+
+  await createAsset({
+    ddb,
+    tableName: args.assetsTable,
+    asset: createAssetRecord({
+      projectId: args.projectId,
+      assetId: fileSetAssetId,
+      label: args.label,
+      version: {
+        versionId: fileSetVersionId,
+        bucket: args.bucket,
+        key: manifestKey,
+        mimeType: "application/json",
+        sizeBytes: manifestBytes.byteLength,
+      },
+      meta: {
+        kind: "file-set",
+        entryPath: args.entryPath,
+        moduleInstanceId: args.moduleInstanceId,
+        moduleType: "module-markdown-viewer",
+        fileCount: args.files.length,
+      },
+    }),
+  });
+
+  return {
+    assetId: fileSetAssetId,
+    versionId: fileSetVersionId,
+    bucket: args.bucket,
+    manifestKey,
+    prefix: filesPrefix,
+    rootKey: `${filesPrefix}/${args.entryPath}`,
+    fileCount: args.files.length,
+  };
+}
+
 function flattenSlots(children: ChildSlot[] | undefined, depth = 0): Array<{
   slotId: string;
   moduleKey: string;
@@ -2181,111 +2406,295 @@ async function executeTool(args: {
         files: MarkdownFileInput[];
       }>(toolCall.arguments);
       if (!assetsTable) throw new Error("Project asset table is not configured.");
-
-      const fileSetAssetId = createAssetId();
-      const fileSetVersionId = createAssetVersionId();
-      const versionRoot = [
-        "projects",
-        encodeURIComponent(projectId).replace(/%20/g, "-"),
-        "assets",
-        encodeURIComponent(fileSetAssetId).replace(/%20/g, "-"),
-        "versions",
-        encodeURIComponent(fileSetVersionId).replace(/%20/g, "-"),
-      ].join("/");
-      const filesPrefix = `${versionRoot}/files`;
-      const manifestKey = `${versionRoot}/manifest.json`;
-      const s3 = await getS3Client(configBucket);
-      const ddb = await getDdbClient();
-      const childAssetRefs: Array<{ path: string; assetId: string; versionId: string; key: string; mimeType: string; sizeBytes: number }> = [];
-
-      for (const file of parsed.files) {
-        const bytes = new TextEncoder().encode(file.content);
-        const key = `${filesPrefix}/${file.path}`;
-        const mimeType = file.mimeType ?? guessMimeType(file.path, "text/plain");
-        await s3.send(new PutObjectCommand({
-          Bucket: configBucket,
-          Key: key,
-          Body: bytes,
-          ContentType: mimeType,
-        }));
-        const assetId = createAssetId();
-        const versionId = createAssetVersionId();
-        await createAsset({
-          ddb,
-          tableName: assetsTable,
-          asset: createAssetRecord({
-            projectId,
-            assetId,
-            label: basename(file.path),
-            version: {
-              versionId,
-              bucket: configBucket,
-              key,
-              mimeType,
-              sizeBytes: bytes.byteLength,
-            },
-            meta: {
-              kind: "file",
-              parentAssetId: fileSetAssetId,
-              path: file.path,
-              moduleInstanceId: config.id,
-              moduleType: "module-markdown-viewer",
-            },
-          }),
-        });
-        childAssetRefs.push({ path: file.path, assetId, versionId, key, mimeType, sizeBytes: bytes.byteLength });
-      }
-
-      const manifestBytes = new TextEncoder().encode(JSON.stringify({
-        kind: "markdown-file-set",
+      const created = await createMarkdownFileSetAsset({
+        getS3Client,
+        getDdbClient,
+        assetsTable,
+        projectId,
+        bucket: configBucket,
+        label: parsed.label,
         entryPath: parsed.entryPath,
+        files: parsed.files,
         moduleInstanceId: config.id,
-        files: childAssetRefs,
-      }, null, 2));
-
-      await s3.send(new PutObjectCommand({
-        Bucket: configBucket,
-        Key: manifestKey,
-        Body: manifestBytes,
-        ContentType: "application/json",
-      }));
-
-      await createAsset({
-        ddb,
-        tableName: assetsTable,
-        asset: createAssetRecord({
-          projectId,
-          assetId: fileSetAssetId,
-          label: parsed.label,
-          version: {
-            versionId: fileSetVersionId,
-            bucket: configBucket,
-            key: manifestKey,
-            mimeType: "application/json",
-            sizeBytes: manifestBytes.byteLength,
-          },
-          meta: {
-            kind: "file-set",
-            entryPath: parsed.entryPath,
-            moduleInstanceId: config.id,
-            moduleType: "module-markdown-viewer",
-            fileCount: parsed.files.length,
-          },
-        }),
       });
 
       return {
+        output: JSON.stringify({ status: "ok", ...created }, null, 2),
+        toolMessage: `Created markdown file set ${parsed.label}.`,
+      };
+    }
+
+    case "create_markdown_slot_from_content": {
+      const parsed = parseToolArgs<{
+        parentSlotPath?: string[];
+        slotId: string;
+        title: string;
+        entryPath: string;
+        files: MarkdownFileInput[];
+      }>(toolCall.arguments);
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const entry = findModuleEntry(registryEntries, "modules/markdown-viewer");
+      if (!entry) throw new Error("Published module not found: modules/markdown-viewer");
+      const created = await createMarkdownFileSetAsset({
+        getS3Client,
+        getDdbClient,
+        assetsTable,
+        projectId,
+        bucket: configBucket,
+        label: parsed.title,
+        entryPath: parsed.entryPath,
+        files: parsed.files,
+        moduleInstanceId: parsed.slotId,
+      });
+      const parentPath = parsed.parentSlotPath ?? [];
+      const nextSlot: ChildSlot = {
+        slotId: parsed.slotId,
+        app: { bucket: entry.bundleBucket, key: entry.bundlePath },
+        meta: {
+          tabName: parsed.title,
+          title: parsed.title,
+          prefix: created.prefix,
+          rootKey: created.rootKey,
+          bucket: created.bucket,
+          assetId: created.assetId,
+          versionId: created.versionId,
+          manifestKey: created.manifestKey,
+        },
+      };
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parentPath,
+          slot: nextSlot,
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
         output: JSON.stringify({
           status: "ok",
-          assetId: fileSetAssetId,
-          versionId: fileSetVersionId,
-          bucket: configBucket,
-          manifestKey,
-          prefix: filesPrefix,
-          rootKey: `${filesPrefix}/${parsed.entryPath}`,
-          fileCount: parsed.files.length,
+          slotPath: [...parentPath, parsed.slotId],
+          moduleKey: nextSlot.app.key,
+          assetId: created.assetId,
+          versionId: created.versionId,
+          rootKey: created.rootKey,
         }, null, 2),
-        toolMessage: `Created markdown file set ${parsed.label}.`,
+        toolMessage: `Created markdown slot ${[...parentPath, parsed.slotId].join(" / ")} with new content.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "create_document_viewer_slot": {
+      const parsed = parseToolArgs<{
+        parentSlotPath?: string[];
+        slotId: string;
+        title: string;
+        assetId?: string;
+        workspacePath?: string;
+        filename?: string;
+        label?: string;
+      }>(toolCall.arguments);
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      if (!parsed.assetId && !parsed.workspacePath) {
+        throw new Error("Provide either assetId or workspacePath.");
+      }
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const entry = findModuleEntry(registryEntries, "modules/document-viewer");
+      if (!entry) throw new Error("Published module not found: modules/document-viewer");
+
+      let docMeta: { key: string; filename: string; bucket?: string; assetId?: string; versionId?: string };
+      if (parsed.assetId) {
+        const ddb = await getDdbClient();
+        const assets = await listAssets({ ddb, tableName: assetsTable, projectId });
+        const asset = assets.find((item) => item.assetId === parsed.assetId);
+        if (!asset) throw new Error(`Project asset not found: ${parsed.assetId}`);
+        const version = getCurrentAssetVersion(asset);
+        docMeta = {
+          key: version.key,
+          filename: asset.label || basename(version.key),
+          bucket: version.bucket,
+          assetId: asset.assetId,
+          versionId: version.versionId,
+        };
+      } else {
+        if (!bridge) throw new Error("Local agent bridge is not configured.");
+        const workspaceFile = await callBridge<{ content: string }>(bridge, "read_workspace_file", {
+          path: parsed.workspacePath,
+          encoding: "base64",
+        });
+        const bytes = Uint8Array.from(atob(workspaceFile.content), (ch) => ch.charCodeAt(0));
+        const filename = parsed.filename ?? basename(parsed.workspacePath!);
+        const created = await createProjectAssetFromBytes({
+          getS3Client,
+          getDdbClient,
+          assetsTable,
+          projectId,
+          bucket: configBucket,
+          label: parsed.label ?? filename,
+          filename,
+          bytes,
+          mimeType: guessMimeType(filename, "application/pdf"),
+          meta: {
+            kind: "file",
+            path: filename,
+            sourceWorkspacePath: parsed.workspacePath,
+            moduleInstanceId: parsed.slotId,
+            moduleType: "module-document-viewer",
+          },
+        });
+        docMeta = {
+          key: created.key,
+          filename,
+          bucket: created.bucket,
+          assetId: created.assetId,
+          versionId: created.versionId,
+        };
+      }
+
+      const parentPath = parsed.parentSlotPath ?? [];
+      const nextSlot: ChildSlot = {
+        slotId: parsed.slotId,
+        app: { bucket: entry.bundleBucket, key: entry.bundlePath },
+        meta: {
+          title: parsed.title,
+          doc: docMeta,
+        },
+      };
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parentPath,
+          slot: nextSlot,
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: [...parentPath, parsed.slotId],
+          doc: docMeta,
+        }, null, 2),
+        toolMessage: `Created document viewer slot ${[...parentPath, parsed.slotId].join(" / ")}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "create_task_tracker_slot": {
+      const parsed = parseToolArgs<{
+        parentSlotPath?: string[];
+        slotId: string;
+        title: string;
+        tasks?: Array<Partial<TaskRecord> & { title: string }>;
+      }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const entry = findModuleEntry(registryEntries, "modules/task-tracker");
+      if (!entry) throw new Error("Published module not found: modules/task-tracker");
+      const parentPath = parsed.parentSlotPath ?? [];
+      const nextSlot: ChildSlot = {
+        slotId: parsed.slotId,
+        app: { bucket: entry.bundleBucket, key: entry.bundlePath },
+        meta: { title: parsed.title },
+      };
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parentPath,
+          slot: nextSlot,
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      const slotConfig: ModuleConfig = { id: parsed.slotId, app: nextSlot.app, meta: nextSlot.meta };
+      const { storage, store } = await loadTaskTrackerStore(getS3Client, slotConfig, configBucket, configPath, projectId);
+      const created = (parsed.tasks ?? []).map((task) => defaultTaskRecord(userEmail, {
+        title: task.title,
+        description: task.description ?? "",
+        notes: task.notes ?? "",
+        status: task.status ?? "open",
+        priority: task.priority ?? "normal",
+        assignee: task.assignee,
+        tags: task.tags ?? [],
+        repeatable: task.repeatable ?? false,
+      }));
+      if (created.length) {
+        await saveTaskTrackerStore(getS3Client, storage, { ...store, tasks: [...created, ...store.tasks] });
+      }
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: [...parentPath, parsed.slotId],
+          createdTaskIds: created.map((task) => task.id),
+        }, null, 2),
+        toolMessage: `Created task tracker slot ${[...parentPath, parsed.slotId].join(" / ")}${created.length ? ` with ${created.length} initial task${created.length === 1 ? "" : "s"}` : ""}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "create_documentation_slot": {
+      const parsed = parseToolArgs<{
+        parentSlotPath?: string[];
+        slotId: string;
+        title: string;
+        pages?: Array<{ title: string; content?: string; action?: LinkAction; afterDocTitle?: string }>;
+      }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const entry = findModuleEntry(registryEntries, "modules/documentation-viewer");
+      if (!entry) throw new Error("Published module not found: modules/documentation-viewer");
+      const parentPath = parsed.parentSlotPath ?? [];
+      const nextSlot: ChildSlot = {
+        slotId: parsed.slotId,
+        app: { bucket: entry.bundleBucket, key: entry.bundlePath },
+        meta: { title: parsed.title },
+      };
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parentPath,
+          slot: nextSlot,
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      const slotConfig: ModuleConfig = { id: parsed.slotId, app: { bucket: configBucket, key: entry.bundlePath }, meta: { title: parsed.title } };
+      const { storage, manifest, contents } = await loadDocumentationSlotState(getS3Client, slotConfig);
+      let workingManifest = manifest;
+      let workingContents = {
+        ...contents,
+        [manifest.rootDocId]: contents[manifest.rootDocId] ?? `# ${parsed.title}\n\n`,
+      };
+      const createdDocIds: string[] = [];
+      const titleMap = new Map<string, string>([[workingManifest.docs[workingManifest.rootDocId].title, workingManifest.rootDocId]]);
+      for (const page of parsed.pages ?? []) {
+        const currentDocId = page.afterDocTitle ? titleMap.get(page.afterDocTitle) ?? workingManifest.rootDocId : workingManifest.rootDocId;
+        const created = createLinkedPage(workingManifest, workingContents, currentDocId, page.title, page.action ?? "child");
+        workingManifest = created.manifest;
+        workingContents = {
+          ...created.contents,
+          [created.newDocId]: page.content ?? created.contents[created.newDocId] ?? `# ${page.title}\n\n`,
+        };
+        createdDocIds.push(created.newDocId);
+        titleMap.set(page.title, created.newDocId);
+      }
+      await persistDocumentationSlotState({
+        getS3Client,
+        storage,
+        previousManifest: manifest,
+        nextManifest: workingManifest,
+        contents: workingContents,
+      });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: [...parentPath, parsed.slotId],
+          rootDocId: workingManifest.rootDocId,
+          createdDocIds,
+          manifestKey: storage.manifestKey,
+          pagesPrefix: storage.pagesPrefix,
+        }, null, 2),
+        toolMessage: `Created documentation slot ${[...parentPath, parsed.slotId].join(" / ")}${createdDocIds.length ? ` with ${createdDocIds.length} starter page${createdDocIds.length === 1 ? "" : "s"}` : ""}.`,
+        mutatedWorkspace: true,
       };
     }
 
