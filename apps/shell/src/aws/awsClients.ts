@@ -52,8 +52,48 @@ function isLocalBucket(bucket?: string): boolean {
 // ---------------------------------------------------------------------------
 
 let remoteDdbClient: DynamoDBDocumentClient | null = null;
-let localDdbClient: DynamoDBDocumentClient | null = null;
 const s3ClientCache = new Map<string, S3Client>(); // keyed by endpoint URL
+
+async function getLocalS3ClockOffset(endpoint: string): Promise<number> {
+  return readEndpointClockOffset(endpoint, "[awsClients] Local S3");
+}
+
+async function getLocalDdbClockOffset(endpoint: string): Promise<number> {
+  return readEndpointClockOffset(endpoint, "[awsClients] Local DynamoDB");
+}
+
+async function readEndpointClockOffset(endpoint: string, label: string): Promise<number> {
+  void endpoint;
+  // Browser CORS may hide MinIO/DynamoDB's Date header, and MinIO returns 400
+  // for HEAD /. In local dev, the same-origin Vite server is on the host clock
+  // and its Date header is visible without creating noisy console errors.
+  const appHostOffset = await readDateHeaderClockOffset(window.location.origin);
+  if (appHostOffset !== null) {
+    logClockOffset(`${label} via app host`, appHostOffset);
+    return appHostOffset;
+  }
+
+  return 0;
+}
+
+async function readDateHeaderClockOffset(url: string): Promise<number | null> {
+  try {
+    const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+    const dateHeader = response.headers.get("date");
+    if (!dateHeader) return null;
+    const serverMs = Date.parse(dateHeader);
+    if (!Number.isFinite(serverMs)) return null;
+    return serverMs - Date.now();
+  } catch {
+    return null;
+  }
+}
+
+function logClockOffset(label: string, offset: number): void {
+  if (Math.abs(offset) > 30_000) {
+    console.warn(`${label} clock offset detected: ${Math.round(offset / 1000)}s`);
+  }
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function installAutoResetOnAuthError(client: { middlewareStack: any }) {
@@ -98,17 +138,16 @@ export function getAwsClients(): AwsClients {
       const useLocal = import.meta.env.DEV && !!localDdbEndpoint;
 
       if (useLocal) {
-        if (!localDdbClient) {
-          const raw = new DynamoDBClient({
-            region: localRegion ?? "us-east-1",
-            endpoint: localDdbEndpoint,
-            credentials: localCredentials ?? { accessKeyId: "local", secretAccessKey: "local" },
-          });
-          localDdbClient = DynamoDBDocumentClient.from(raw, {
-            marshallOptions: { removeUndefinedValues: true },
-          });
-        }
-        return localDdbClient;
+        const systemClockOffset = await getLocalDdbClockOffset(localDdbEndpoint);
+        const raw = new DynamoDBClient({
+          region: localRegion ?? "us-east-1",
+          endpoint: localDdbEndpoint,
+          credentials: localCredentials ?? { accessKeyId: "local", secretAccessKey: "local" },
+          systemClockOffset,
+        });
+        return DynamoDBDocumentClient.from(raw, {
+          marshallOptions: { removeUndefinedValues: true },
+        });
       }
 
       const { config } = useConfigStore.getState();
@@ -138,18 +177,20 @@ export function getAwsClients(): AwsClients {
       const useLocal = import.meta.env.DEV && !!localS3Endpoint && isLocalBucket(bucket);
       const cacheKey = useLocal ? `local:${localS3Endpoint}` : "remote";
 
-      if (s3ClientCache.has(cacheKey)) {
+      if (!useLocal && s3ClientCache.has(cacheKey)) {
         return s3ClientCache.get(cacheKey)!;
       }
 
       let client: S3Client;
 
       if (useLocal) {
+        const systemClockOffset = await getLocalS3ClockOffset(localS3Endpoint);
         client = new S3Client({
           region: localRegion ?? "us-east-1",
           endpoint: localS3Endpoint,
           credentials: localCredentials ?? { accessKeyId: "local", secretAccessKey: "local" },
           forcePathStyle: true, // required for MinIO
+          systemClockOffset,
           // MinIO drops the connection (rather than returning a clean error) for the
           // x-amz-checksum-* headers the browser SDK adds automatically to PUT requests.
           // Disable automatic checksum calculation for local dev only.
@@ -170,7 +211,9 @@ export function getAwsClients(): AwsClients {
         installAutoResetOnAuthError(client);
       }
 
-      s3ClientCache.set(cacheKey, client);
+      if (!useLocal) {
+        s3ClientCache.set(cacheKey, client);
+      }
       return client;
     },
   };

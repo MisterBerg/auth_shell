@@ -61,13 +61,20 @@ export async function loadBundle(
   getS3Client: (bucket?: string) => Promise<S3Client>,
   exportName: string = "default"
 ): Promise<React.ComponentType<ModuleProps>> {
-  const s3 = await getS3Client(bucket);
-  const resp = await s3.send(new GetObjectCommand({
-    Bucket: bucket,
-    Key: key,
-    ResponseCacheControl: "no-store",
-  }));
-  const jsCode = await resp.Body!.transformToString("utf-8");
+  const jsCode = await withLoadContext(
+    `bundle ${bucket}/${key}`,
+    async () => {
+      const localText = await readLocalObjectText(bucket, key);
+      if (localText !== null) return localText;
+      const s3 = await getS3Client(bucket);
+      const resp = await s3.send(new GetObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        ResponseCacheControl: "no-store",
+      }));
+      return resp.Body!.transformToString("utf-8");
+    }
+  );
   const rawModule = await loadIife(jsCode);
 
   const Component = rawModule[exportName] as React.ComponentType<ModuleProps> | undefined;
@@ -95,12 +102,19 @@ export async function loadModule(
   onResourcesLoaded?: (resources: Resource[]) => void
 ): Promise<LoadedModule> {
   // Step 1: fetch config
-  const configS3 = await getS3Client(configBucket);
-  const configResp = await configS3.send(
-    new GetObjectCommand({ Bucket: configBucket, Key: configPath, ResponseCacheControl: "no-store" })
+  const configResp = await withLoadContext(
+    `root config ${configBucket}/${configPath}`,
+    async () => {
+      const localText = await readLocalObjectText(configBucket, configPath);
+      if (localText !== null) return localText;
+      const configS3 = await getS3Client(configBucket);
+      const resp = await configS3.send(
+        new GetObjectCommand({ Bucket: configBucket, Key: configPath, ResponseCacheControl: "no-store" })
+      );
+      return resp.Body!.transformToString("utf-8");
+    }
   );
-  const configJson = await configResp.Body!.transformToString("utf-8");
-  const config: ModuleConfig = JSON.parse(configJson) as ModuleConfig;
+  const config: ModuleConfig = JSON.parse(configResp) as ModuleConfig;
 
   // Register resources lazily, before bundle load
   if (config.resources?.length && onResourcesLoaded) {
@@ -108,16 +122,23 @@ export async function loadModule(
   }
 
   // Step 2: fetch and run bundle
-  const s3 = await getS3Client(config.app.bucket);
-  const bundleResp = await s3.send(
-    new GetObjectCommand({
-      Bucket: config.app.bucket,
-      Key: config.app.key,
-      ResponseCacheControl: "no-store",
-    })
+  const bundleResp = await withLoadContext(
+    `root bundle ${config.id} ${config.app.bucket}/${config.app.key}`,
+    async () => {
+      const localText = await readLocalObjectText(config.app.bucket, config.app.key);
+      if (localText !== null) return localText;
+      const s3 = await getS3Client(config.app.bucket);
+      const resp = await s3.send(
+        new GetObjectCommand({
+          Bucket: config.app.bucket,
+          Key: config.app.key,
+          ResponseCacheControl: "no-store",
+        })
+      );
+      return resp.Body!.transformToString("utf-8");
+    }
   );
-  const jsCode = await bundleResp.Body!.transformToString("utf-8");
-  const rawModule = await loadIife(jsCode);
+  const rawModule = await loadIife(bundleResp);
 
   const exportName = config.app.exportName ?? "default";
   const Component = rawModule[exportName] as React.ComponentType<ModuleProps> | undefined;
@@ -131,4 +152,29 @@ export async function loadModule(
   const onExport = rawModule["onExport"] as LoadedModule["onExport"] | undefined;
 
   return { config, Component, onExport };
+}
+
+async function withLoadContext<T>(context: string, action: () => Promise<T>): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const name = error instanceof Error ? error.name : "Error";
+    throw new Error(`Failed to load ${context}: ${name}: ${message}`);
+  }
+}
+
+async function readLocalObjectText(bucket: string, key: string): Promise<string | null> {
+  const local = (window as unknown as {
+    __JeffspaceLocalS3?: { endpoint?: string; buckets?: string[] };
+  }).__JeffspaceLocalS3;
+  const endpoint = local?.endpoint?.replace(/\/$/, "");
+  if (!endpoint || !local?.buckets?.includes(bucket)) return null;
+
+  const url = `${endpoint}/${encodeURIComponent(bucket)}/${key.split("/").map(encodeURIComponent).join("/")}`;
+  const response = await fetch(`${url}?_=${Date.now()}`, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Unsigned local S3 GET failed for ${bucket}/${key}: ${response.status} ${response.statusText}`);
+  }
+  return response.text();
 }

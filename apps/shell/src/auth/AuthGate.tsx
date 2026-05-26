@@ -53,6 +53,7 @@ class ModuleErrorBoundary extends Component<
 
   render() {
     if (this.state.error) {
+      const message = formatLoadError(this.state.error as Error);
       return (
         <div
           style={{
@@ -71,7 +72,7 @@ class ModuleErrorBoundary extends Component<
               whiteSpace: "pre-wrap",
             }}
           >
-            {(this.state.error as Error).message}
+            {message}
           </pre>
         </div>
       );
@@ -79,6 +80,23 @@ class ModuleErrorBoundary extends Component<
 
     return this.props.children;
   }
+}
+
+function formatLoadError(error: Error): string {
+  const message = error.message || String(error);
+  if (isClockSkewError(message)) {
+    return [
+      message,
+      "",
+      "This usually means the browser/client clock and the S3 service clock differ too much for AWS request signing.",
+      "Check the OS date/time on the machine running this browser, then restart the local stack if you are using local Podman services.",
+    ].join("\n");
+  }
+  return message;
+}
+
+function isClockSkewError(message: string): boolean {
+  return /request time.*server'?s time|RequestTimeTooSkewed|RequestExpired|Signature not yet current/i.test(message);
 }
 
 function getRuntimeEnv(): PublicRuntimeEnv {
@@ -104,20 +122,21 @@ function isLocalBucket(runtimeEnv: PublicRuntimeEnv, bucket?: string): boolean {
   return Boolean(bucket) && runtimeEnv.localBuckets.includes(bucket!);
 }
 
-function getS3Client(
+async function getS3Client(
   bucket: string | undefined,
   awsCredentialProvider: () => Promise<AwsCredentials>,
   runtimeEnv: PublicRuntimeEnv
-): S3Client {
+): Promise<S3Client> {
   const useLocal =
     import.meta.env.DEV && !!runtimeEnv.localS3Endpoint && isLocalBucket(runtimeEnv, bucket);
 
   const cacheKey = useLocal ? `local:${runtimeEnv.localS3Endpoint}` : "remote";
   const cached = s3ClientCache.get(cacheKey);
-  if (cached) return cached;
+  if (cached && !useLocal) return cached;
 
   let client: S3Client;
   if (useLocal) {
+    const systemClockOffset = await getLocalS3ClockOffset(runtimeEnv.localS3Endpoint!);
     client = new S3Client({
       region: runtimeEnv.localRegion ?? "us-east-1",
       endpoint: runtimeEnv.localS3Endpoint,
@@ -128,6 +147,7 @@ function getS3Client(
           }
         : { accessKeyId: "local", secretAccessKey: "local" },
       forcePathStyle: true,
+      systemClockOffset,
       requestChecksumCalculation: "WHEN_REQUIRED",
       responseChecksumValidation: "WHEN_REQUIRED",
     });
@@ -139,8 +159,44 @@ function getS3Client(
     client = new S3Client(config);
   }
 
-  s3ClientCache.set(cacheKey, client);
+  if (!useLocal) {
+    s3ClientCache.set(cacheKey, client);
+  }
   return client;
+}
+
+async function getLocalS3ClockOffset(endpoint: string): Promise<number> {
+  return readLocalS3ClockOffset(endpoint);
+}
+
+async function readLocalS3ClockOffset(endpoint: string): Promise<number> {
+  void endpoint;
+  const appHostOffset = await readDateHeaderClockOffset(window.location.origin);
+  if (appHostOffset !== null) {
+    logClockOffset("[AuthGate] Local S3 via app host", appHostOffset);
+    return appHostOffset;
+  }
+
+  return 0;
+}
+
+async function readDateHeaderClockOffset(url: string): Promise<number | null> {
+  try {
+    const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+    const dateHeader = response.headers.get("date");
+    if (!dateHeader) return null;
+    const serverMs = Date.parse(dateHeader);
+    if (!Number.isFinite(serverMs)) return null;
+    return serverMs - Date.now();
+  } catch {
+    return null;
+  }
+}
+
+function logClockOffset(label: string, offset: number): void {
+  if (Math.abs(offset) > 30_000) {
+    console.warn(`${label} clock offset detected: ${Math.round(offset / 1000)}s`);
+  }
 }
 
 function loadIife(jsCode: string): Promise<Record<string, unknown>> {
@@ -180,15 +236,33 @@ async function loadProtectedShellCore(
   awsCredentialProvider: () => Promise<AwsCredentials>,
   runtimeEnv: PublicRuntimeEnv
 ): Promise<ProtectedShellCoreComponent> {
-  const s3 = getS3Client(CONFIG.shellCoreBundle.bucket, awsCredentialProvider, runtimeEnv);
-  const response = await s3.send(
-    new GetObjectCommand({
-      Bucket: CONFIG.shellCoreBundle.bucket,
-      Key: CONFIG.shellCoreBundle.key,
-      ResponseCacheControl: "no-store",
-    })
-  );
-  const jsCode = await response.Body!.transformToString("utf-8");
+  let jsCode: string;
+  try {
+    const localText = await readLocalObjectText(
+      CONFIG.shellCoreBundle.bucket,
+      CONFIG.shellCoreBundle.key,
+      runtimeEnv,
+    );
+    if (localText !== null) {
+      jsCode = localText;
+    } else {
+      const s3 = await getS3Client(CONFIG.shellCoreBundle.bucket, awsCredentialProvider, runtimeEnv);
+      const response = await s3.send(
+        new GetObjectCommand({
+          Bucket: CONFIG.shellCoreBundle.bucket,
+          Key: CONFIG.shellCoreBundle.key,
+          ResponseCacheControl: "no-store",
+        })
+      );
+      jsCode = await response.Body!.transformToString("utf-8");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const name = error instanceof Error ? error.name : "Error";
+    throw new Error(
+      `Failed to load protected shell core bundle ${CONFIG.shellCoreBundle.bucket}/${CONFIG.shellCoreBundle.key}: ${name}: ${message}`
+    );
+  }
   const rawModule = await loadIife(jsCode);
   const Component = rawModule["default"] as ProtectedShellCoreComponent | undefined;
 
@@ -199,6 +273,24 @@ async function loadProtectedShellCore(
   }
 
   return Component;
+}
+
+async function readLocalObjectText(
+  bucket: string,
+  key: string,
+  runtimeEnv: PublicRuntimeEnv,
+): Promise<string | null> {
+  if (!import.meta.env.DEV || !runtimeEnv.localS3Endpoint || !isLocalBucket(runtimeEnv, bucket)) {
+    return null;
+  }
+
+  const endpoint = runtimeEnv.localS3Endpoint.replace(/\/$/, "");
+  const url = `${endpoint}/${encodeURIComponent(bucket)}/${key.split("/").map(encodeURIComponent).join("/")}`;
+  const response = await fetch(`${url}?_=${Date.now()}`, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Unsigned local S3 GET failed for ${bucket}/${key}: ${response.status} ${response.statusText}`);
+  }
+  return response.text();
 }
 
 export const AuthGate: React.FC = () => {

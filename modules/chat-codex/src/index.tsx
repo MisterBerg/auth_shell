@@ -40,6 +40,7 @@ type ChatMeta = {
 type AgentBridgeDefaults = {
   url?: string;
   token?: string;
+  installBaseUrl?: string;
 };
 
 type ChatMessage = {
@@ -153,6 +154,14 @@ type BridgeStatus = {
   browseStartPath?: string;
 };
 
+type BridgeHealth = {
+  status: string;
+  name?: string;
+  protocolVersion?: number;
+  capabilities?: string[];
+  requiresPairingToken?: boolean;
+};
+
 type BridgeListResult = {
   root: string;
   recursive: boolean;
@@ -162,6 +171,21 @@ type BridgeListResult = {
     kind: "file" | "directory";
     sizeBytes?: number;
   }>;
+};
+
+type BridgeAppspaceOperation = {
+  id: string;
+  operation: string;
+  args: Record<string, unknown>;
+  status: "queued" | "completed" | "failed";
+  createdAt: string;
+  updatedAt: string;
+};
+
+type BridgeAppspaceOperationsResult = {
+  sessionId: string;
+  count: number;
+  operations: BridgeAppspaceOperation[];
 };
 
 type PendingContinuation = {
@@ -255,6 +279,17 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     type: "function",
+    name: "get_appspace_context",
+    description: "Return the current browser appspace context snapshot that is also published to the local bridge when enabled.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
     name: "get_root_config",
     description: "Return the full active root config JSON so the agent can inspect exact structure and module metadata.",
     parameters: {
@@ -320,6 +355,21 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         filename: { type: "string" },
         mimeType: { type: "string" },
         meta: { type: "object", additionalProperties: true },
+      },
+      required: ["workspacePath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "export_project_asset_to_workspace",
+    description: "Export a central project asset to a file in the local bridge workspace so the local runtime can inspect or modify it.",
+    parameters: {
+      type: "object",
+      properties: {
+        assetId: { type: "string" },
+        path: { type: "string" },
+        workspacePath: { type: "string" },
       },
       required: ["workspacePath"],
       additionalProperties: false,
@@ -404,6 +454,22 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         encoding: { type: "string", enum: ["utf8", "base64"] },
       },
       required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "write_workspace_file",
+    description: "Write a file through the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        content: { type: "string" },
+        encoding: { type: "string", enum: ["utf8", "base64"] },
+        mode: { type: "string", enum: ["overwrite", "append"] },
+      },
+      required: ["path", "content"],
       additionalProperties: false,
     },
   },
@@ -656,6 +722,10 @@ function buildBridgeWorkspaceRootKey(projectId: string, moduleId: string) {
   return `auth-shell:chat-codex:${projectId}:${moduleId}:bridge-workspace-root`;
 }
 
+function buildBridgeEnabledKey(projectId: string, moduleId: string) {
+  return `auth-shell:chat-codex:${projectId}:${moduleId}:bridge-enabled`;
+}
+
 function safeReadLocalStorage(key: string): string {
   try {
     return window.localStorage.getItem(key) ?? "";
@@ -823,6 +893,15 @@ function guessMimeType(filename: string, fallback = "application/octet-stream"):
   if (lower.endsWith(".xml")) return "application/xml";
   if (lower.endsWith(".pdf")) return "application/pdf";
   return fallback;
+}
+
+function arrayBufferToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(i, i + chunkSize));
+  }
+  return btoa(binary);
 }
 
 async function createProjectAssetFromBytes(args: {
@@ -1168,6 +1247,27 @@ async function getBridgeStatus(bridge: BridgeConfig): Promise<BridgeStatus> {
   return callBridge<BridgeStatus>(bridge, "get_bridge_status");
 }
 
+async function getBridgeHealth(url: string): Promise<BridgeHealth> {
+  const response = await fetch(`${url.replace(/\/$/, "")}/health`);
+  const payload = (await response.json()) as { ok?: boolean; result?: BridgeHealth; error?: string };
+  if (!response.ok || !payload.ok || !payload.result) {
+    throw new Error(payload.error || `Runtime health check failed: ${response.status}`);
+  }
+  return payload.result;
+}
+
+function getInstallBaseUrl(defaults: AgentBridgeDefaults): string {
+  return defaults.installBaseUrl?.trim().replace(/\/$/, "") || "/downloads/agent-runtime";
+}
+
+function installHref(baseUrl: string, platform: "windows" | "macos" | "linux"): string {
+  const filename =
+    platform === "windows" ? "jeffspace-agent-runtime-windows-x64.msi" :
+    platform === "macos" ? "jeffspace-agent-runtime-macos-universal.pkg" :
+    "jeffspace-agent-runtime-linux-x64.AppImage";
+  return `${baseUrl}/${filename}`;
+}
+
 async function loadWorkspaceContext(getS3Client: ReturnType<typeof useAwsS3Client>, configBucket: string, configPath: string, projectId: string): Promise<WorkspaceContext> {
   const s3 = await getS3Client(configBucket);
   const object = await s3.send(new GetObjectCommand({ Bucket: configBucket, Key: configPath }));
@@ -1175,6 +1275,95 @@ async function loadWorkspaceContext(getS3Client: ReturnType<typeof useAwsS3Clien
   const rootConfig = JSON.parse(text) as ModuleConfig;
   const resources = collectResources(rootConfig);
   return { projectId, configBucket, configPath, rootConfig, resources };
+}
+
+async function buildAppspaceContextSnapshot(args: {
+  config: ModuleConfig;
+  projectId: string;
+  configBucket: string;
+  configPath: string;
+  getS3Client: ReturnType<typeof useAwsS3Client>;
+  getDdbClient: ReturnType<typeof useAwsDdbClient>;
+  assetsTable?: string;
+  loadedResources: ReadonlyMap<string, Resource>;
+  registryEntries: ModuleRegistryEntry[];
+  bridgeWorkspaceRoot?: string;
+}) {
+  const context = await loadWorkspaceContext(args.getS3Client, args.configBucket, args.configPath, args.projectId);
+  const slots = buildSlotTree(context.rootConfig.children);
+  let assets: Array<Record<string, unknown>> = [];
+
+  if (args.assetsTable) {
+    const ddb = await args.getDdbClient();
+    const records = await listAssets({ ddb, tableName: args.assetsTable, projectId: args.projectId });
+    assets = records.map((asset) => {
+      const version = getCurrentAssetVersion(asset);
+      return {
+        assetId: asset.assetId,
+        label: asset.label,
+        bucket: version.bucket,
+        key: version.key,
+        versionId: version.versionId,
+        mimeType: version.mimeType,
+        sizeBytes: version.sizeBytes,
+        meta: asset.meta ?? {},
+      };
+    });
+  }
+
+  return {
+    schemaVersion: 1,
+    project: {
+      projectId: args.projectId,
+      configBucket: args.configBucket,
+      configPath: args.configPath,
+      rootModuleId: context.rootConfig.id,
+      rootBundleKey: context.rootConfig.app.key,
+      title: typeof context.rootConfig.meta?.["title"] === "string" ? context.rootConfig.meta["title"] : undefined,
+    },
+    activeModule: {
+      moduleId: args.config.id,
+      bundleKey: args.config.app.key,
+      label: typeof args.config.meta?.["title"] === "string" ? args.config.meta["title"] : undefined,
+      meta: args.config.meta ?? {},
+    },
+    slots,
+    assets,
+    resources: [...args.loadedResources.values()].map((resource) => ({
+      id: resource.id,
+      label: resource.label,
+      type: resource.type,
+      bucket: resource.bucket,
+      key: resource.key,
+      table: resource.table,
+      mimeType: resource.mimeType,
+      meta: resource.meta ?? {},
+    })),
+    availableModules: args.registryEntries.map((entry) => ({
+      moduleName: entry.moduleName,
+      displayName: entry.displayName,
+      description: entry.description,
+      category: entry.category,
+      pickerGroup: entry.pickerGroup,
+      bundleBucket: entry.bundleBucket,
+      bundlePath: entry.bundlePath,
+      latestVersion: entry.latestVersion,
+    })),
+    bridge: {
+      workspaceRoot: args.bridgeWorkspaceRoot || undefined,
+    },
+    capabilities: {
+      browserAgentCanExecuteAppspaceOperations: true,
+      bridgeCanQueueAppspaceOperations: true,
+      bridgeCanReadSyncedAppspaceContext: true,
+    },
+    appspaceOperations: TOOL_DEFINITIONS.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    })),
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function collectResources(config: ModuleConfig): Resource[] {
@@ -1271,6 +1460,24 @@ async function executeTool(args: {
       return {
         output: JSON.stringify(summary, null, 2),
         toolMessage: `Read workspace summary for ${projectId}.`,
+      };
+    }
+
+    case "get_appspace_context": {
+      const snapshot = await buildAppspaceContextSnapshot({
+        config,
+        projectId,
+        configBucket,
+        configPath,
+        getS3Client,
+        getDdbClient,
+        assetsTable,
+        loadedResources,
+        registryEntries,
+      });
+      return {
+        output: JSON.stringify(snapshot, null, 2),
+        toolMessage: "Loaded the browser appspace context snapshot.",
       };
     }
 
@@ -1428,6 +1635,53 @@ async function executeTool(args: {
       return {
         output: JSON.stringify({ status: "ok", workspacePath: parsed.workspacePath, ...created }, null, 2),
         toolMessage: `Imported workspace file ${parsed.workspacePath} as a project asset.`,
+      };
+    }
+
+    case "export_project_asset_to_workspace": {
+      if (!bridge) throw new Error("Local agent bridge is not configured.");
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      const parsed = parseToolArgs<{ assetId?: string; path?: string; workspacePath: string }>(toolCall.arguments);
+      const ddb = await getDdbClient();
+      const assets = await listAssets({ ddb, tableName: assetsTable, projectId });
+      const selected = parsed.assetId
+        ? assets.find((asset) => asset.assetId === parsed.assetId)
+        : parsed.path
+          ? assets.find((asset) => {
+              const version = getCurrentAssetVersion(asset);
+              return version.key === parsed.path || asset.label === parsed.path;
+            })
+          : undefined;
+
+      if (!selected) {
+        throw new Error("Project asset not found. Provide an assetId or exact asset path.");
+      }
+
+      const version = getCurrentAssetVersion(selected);
+      const s3 = await getS3Client(version.bucket);
+      const object = await s3.send(new GetObjectCommand({
+        Bucket: version.bucket,
+        Key: version.key,
+      }));
+      const bytes = await object.Body!.transformToByteArray();
+      const content = arrayBufferToBase64(bytes);
+      const result = await callBridge<unknown>(bridge, "write_workspace_file", {
+        path: parsed.workspacePath,
+        content,
+        encoding: "base64",
+        mode: "overwrite",
+      });
+
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          assetId: selected.assetId,
+          label: selected.label,
+          source: { bucket: version.bucket, key: version.key, mimeType: version.mimeType },
+          workspacePath: parsed.workspacePath,
+          bridgeResult: result,
+        }, null, 2),
+        toolMessage: `Exported project asset ${selected.label} to ${parsed.workspacePath}.`,
       };
     }
 
@@ -1948,16 +2202,23 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const bridgeUrlKey = useMemo(() => buildBridgeStorageKey(projectId, config.id, "url"), [projectId, config.id]);
   const bridgeTokenKey = useMemo(() => buildBridgeStorageKey(projectId, config.id, "token"), [projectId, config.id]);
   const bridgeWorkspaceRootKey = useMemo(() => buildBridgeWorkspaceRootKey(projectId, config.id), [projectId, config.id]);
+  const bridgeEnabledKey = useMemo(() => buildBridgeEnabledKey(projectId, config.id), [projectId, config.id]);
+  const bridgeAppspaceSessionId = useMemo(() => `appspace:${projectId}:${config.id}`, [projectId, config.id]);
 
   const meta = (config.meta as ChatMeta | undefined) ?? {};
   const title = meta.title?.trim() || DEFAULT_TITLE;
   const model = meta.model?.trim() || DEFAULT_MODEL;
   const systemPrompt = meta.systemPrompt?.trim() || DEFAULT_PROMPT;
+  const bridgeDefaults = useMemo(() => readBridgeDefaults(), []);
+  const installBaseUrl = useMemo(() => getInstallBaseUrl(bridgeDefaults), [bridgeDefaults]);
 
   const [apiKey, setApiKey] = useState("");
   const [draftApiKey, setDraftApiKey] = useState("");
   const [bridgeUrl, setBridgeUrl] = useState("");
   const [bridgeToken, setBridgeToken] = useState("");
+  const [localRuntimeEnabled, setLocalRuntimeEnabled] = useState(false);
+  const [bridgeHealth, setBridgeHealth] = useState<BridgeHealth | null>(null);
+  const [bridgeCheckLoading, setBridgeCheckLoading] = useState(false);
   const [bridgeWorkspaceRoot, setBridgeWorkspaceRoot] = useState("");
   const [draftBridgeUrl, setDraftBridgeUrl] = useState("");
   const [draftBridgeToken, setDraftBridgeToken] = useState("");
@@ -2005,16 +2266,18 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }, [chatSessionKey]);
 
   useEffect(() => {
-    const defaults = readBridgeDefaults();
-    const storedUrl = safeReadLocalStorage(bridgeUrlKey) || defaults.url || "";
-    const storedToken = safeReadLocalStorage(bridgeTokenKey) || defaults.token || "";
+    const storedUrl = safeReadLocalStorage(bridgeUrlKey) || bridgeDefaults.url || "";
+    const storedToken = safeReadLocalStorage(bridgeTokenKey) || bridgeDefaults.token || "";
     const storedWorkspaceRoot = safeReadLocalStorage(bridgeWorkspaceRootKey) || "";
+    const storedEnabled = safeReadLocalStorage(bridgeEnabledKey) === "true";
     setBridgeUrl(storedUrl);
     setBridgeToken(storedToken);
+    setLocalRuntimeEnabled(storedEnabled);
+    setBridgeHealth(null);
     setBridgeWorkspaceRoot(storedWorkspaceRoot);
     setDraftBridgeUrl(storedUrl);
     setDraftBridgeToken(storedToken);
-  }, [bridgeTokenKey, bridgeUrlKey, bridgeWorkspaceRootKey]);
+  }, [bridgeDefaults, bridgeEnabledKey, bridgeTokenKey, bridgeUrlKey, bridgeWorkspaceRootKey]);
 
   useEffect(() => {
     setMetaDraft({ title, model, systemPrompt });
@@ -2036,10 +2299,137 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }, [chatSessionKey, composer, hydratedSessionKey, messages, pendingContinuation]);
 
   const connectionLabel = apiKey ? maskKey(apiKey) : "Not connected";
-  const bridgeLabel = bridgeUrl ? `${bridgeUrl} · ${maskBridgeToken(bridgeToken)}` : "Not connected";
+  const activeBridge = localRuntimeEnabled && bridgeUrl.trim() && bridgeToken.trim()
+    ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
+    : null;
+  const bridgeLabel = localRuntimeEnabled
+    ? bridgeUrl
+      ? `${bridgeUrl} · ${maskBridgeToken(bridgeToken)}`
+      : "Enabled, not configured"
+    : "Disabled";
   const canSend = !!apiKey.trim() && !!composer.trim() && !busy;
   const canSaveSettings = !!metaDraft.title.trim() && !!metaDraft.model.trim() && !!metaDraft.systemPrompt.trim() && !busy;
   const continuationPending = Boolean(pendingContinuation);
+
+  async function syncBridgeAppspaceContext(bridge: BridgeConfig | null = activeBridge) {
+    if (!bridge) return;
+    const snapshot = await buildAppspaceContextSnapshot({
+      config,
+      projectId,
+      configBucket,
+      configPath,
+      getS3Client,
+      getDdbClient,
+      assetsTable,
+      loadedResources: resources,
+      registryEntries,
+      bridgeWorkspaceRoot,
+    });
+    await callBridge(bridge, "sync_appspace_context", {
+      sessionId: bridgeAppspaceSessionId,
+      context: snapshot,
+    });
+  }
+
+  async function executeBrowserWorkspaceOperation(
+    operation: string,
+    params: Record<string, unknown>,
+    bridge: BridgeConfig | null = activeBridge,
+  ): Promise<ToolExecutionResult> {
+    return executeTool({
+      toolCall: {
+        type: "function_call",
+        call_id: `bridge_${Date.now()}`,
+        name: operation,
+        arguments: JSON.stringify(params),
+      },
+      config,
+      projectId,
+      configBucket,
+      configPath,
+      getS3Client,
+      getDdbClient,
+      assetsTable,
+      loadedResources: resources,
+      registryEntries,
+      bridge,
+    });
+  }
+
+  async function processQueuedBridgeAppspaceOperations(bridge: BridgeConfig | null = activeBridge) {
+    if (!bridge) return;
+    const queued = await callBridge<BridgeAppspaceOperationsResult>(bridge, "list_appspace_operations", {
+      sessionId: bridgeAppspaceSessionId,
+      status: "queued",
+      limit: 25,
+    });
+    let mutatedWorkspace = false;
+    for (const operation of queued.operations) {
+      try {
+        const result = await executeBrowserWorkspaceOperation(operation.operation, operation.args ?? {}, bridge);
+        mutatedWorkspace = mutatedWorkspace || Boolean(result.mutatedWorkspace);
+        await callBridge(bridge, "complete_appspace_operation", {
+          sessionId: bridgeAppspaceSessionId,
+          operationId: operation.id,
+          status: "completed",
+          result: {
+            output: result.output,
+            toolMessage: result.toolMessage,
+            mutatedWorkspace: result.mutatedWorkspace,
+          },
+        });
+      } catch (error) {
+        await callBridge(bridge, "complete_appspace_operation", {
+          sessionId: bridgeAppspaceSessionId,
+          operationId: operation.id,
+          status: "failed",
+          error: (error as Error).message,
+        });
+      }
+    }
+    if (mutatedWorkspace) {
+      await syncBridgeAppspaceContext(bridge);
+      window.dispatchEvent(new Event("shell:navigate"));
+    }
+  }
+
+  useEffect(() => {
+    const bridge = activeBridge;
+    if (!bridge) return;
+    let cancelled = false;
+
+    async function tick() {
+      if (cancelled || busy) return;
+      try {
+        await syncBridgeAppspaceContext(bridge);
+        await processQueuedBridgeAppspaceOperations(bridge);
+      } catch (error) {
+        console.debug("[chat-codex] bridge appspace sync failed", {
+          message: (error as Error).message,
+        });
+      }
+    }
+
+    void tick();
+    const intervalId = window.setInterval(() => void tick(), 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    activeBridge?.url,
+    activeBridge?.token,
+    bridgeAppspaceSessionId,
+    bridgeWorkspaceRoot,
+    busy,
+    config,
+    configBucket,
+    configPath,
+    projectId,
+    assetsTable,
+    resources,
+    registryEntries,
+  ]);
 
   async function handleConnect() {
     const trimmed = draftApiKey.trim();
@@ -2060,6 +2450,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }
 
   async function handleSaveBridge() {
+    if (!localRuntimeEnabled) {
+      setConnectionError("Enable the local runtime before saving or checking a pairing token.");
+      return;
+    }
     const normalizedUrl = draftBridgeUrl.trim().replace(/\/$/, "");
     const normalizedToken = draftBridgeToken.trim();
     if (!normalizedUrl || !normalizedToken) {
@@ -2086,14 +2480,53 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     safeWriteLocalStorage(bridgeUrlKey, "");
     safeWriteLocalStorage(bridgeTokenKey, "");
     safeWriteLocalStorage(bridgeWorkspaceRootKey, "");
+    safeWriteLocalStorage(bridgeEnabledKey, "");
     setBridgeUrl("");
     setBridgeToken("");
+    setLocalRuntimeEnabled(false);
+    setBridgeHealth(null);
     setBridgeWorkspaceRoot("");
     setDraftBridgeUrl("");
     setDraftBridgeToken("");
   }
 
+  async function checkLocalRuntime(urlOverride?: string) {
+    const normalizedUrl = (urlOverride ?? (draftBridgeUrl.trim() || bridgeUrl.trim() || "http://127.0.0.1:4317")).replace(/\/$/, "");
+    setBridgeCheckLoading(true);
+    setConnectionError(undefined);
+    try {
+      const health = await getBridgeHealth(normalizedUrl);
+      setBridgeHealth(health);
+      setDraftBridgeUrl(normalizedUrl);
+      if (!bridgeUrl) {
+        setBridgeUrl(normalizedUrl);
+        safeWriteLocalStorage(bridgeUrlKey, normalizedUrl);
+      }
+    } catch (error) {
+      setBridgeHealth(null);
+      setConnectionError(
+        `Local runtime was not found at ${normalizedUrl}. Install it, start it, or update the URL. ${(error as Error).message}`
+      );
+    } finally {
+      setBridgeCheckLoading(false);
+    }
+  }
+
+  function handleLocalRuntimeEnabledChange(enabled: boolean) {
+    setLocalRuntimeEnabled(enabled);
+    safeWriteLocalStorage(bridgeEnabledKey, enabled ? "true" : "");
+    if (!enabled) {
+      setBridgeBrowserOpen(false);
+      return;
+    }
+    void checkLocalRuntime();
+  }
+
   async function loadBridgeDirectory(path: string) {
+    if (!localRuntimeEnabled) {
+      setBridgeBrowserError("Enable the local runtime before browsing local folders.");
+      return;
+    }
     const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
       ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
       : bridgeUrl.trim() && bridgeToken.trim()
@@ -2123,6 +2556,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }
 
   async function openBridgeBrowser() {
+    if (!localRuntimeEnabled) {
+      setConnectionError("Check Enable local runtime before choosing a workspace root.");
+      return;
+    }
     const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
       ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
       : bridgeUrl.trim() && bridgeToken.trim()
@@ -2147,6 +2584,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }
 
   async function handleSelectBridgeWorkspaceRoot(path: string) {
+    if (!localRuntimeEnabled) {
+      setConnectionError("Enable the local runtime before changing the workspace root.");
+      return;
+    }
     const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
       ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
       : bridgeUrl.trim() && bridgeToken.trim()
@@ -2166,6 +2607,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }
 
   async function handleCreateBridgeFolder() {
+    if (!localRuntimeEnabled) {
+      setBridgeBrowserError("Enable the local runtime before creating local folders.");
+      return;
+    }
     const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
       ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
       : bridgeUrl.trim() && bridgeToken.trim()
@@ -2375,20 +2820,23 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     try {
       const controller = new AbortController();
       runAbortRef.current = controller;
-      const bridge = bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+      const bridge = activeBridge;
+      await syncBridgeAppspaceContext(bridge);
+      await processQueuedBridgeAppspaceOperations(bridge);
       const contextBits: string[] = [
         systemPrompt,
         "You are running inside a browser-based project workspace shell.",
         "Prefer calling tools before making assumptions about project structure or available files/modules.",
+        "The browser agent and local runtime share the same appspace operation names. When the local runtime is enabled, it can read the synced appspace context from the bridge and queue appspace operations for the browser to execute.",
         "When the user asks about information 'in here' or app documentation, start with project assets and registered resources before the local bridge workspace unless they explicitly ask for local files.",
         `Current project ID: ${projectId}.`,
         `Current module ID: ${config.id}.`,
         assetsTable ? `Project asset table is available as ${assetsTable}.` : "Project asset table is not configured.",
         `Loaded resource count: ${resources.size}.`,
         `Published module count: ${registryEntries.length}.`,
-        bridge ? `Local bridge is connected with workspace root ${bridgeWorkspaceRoot || "unknown"}.` : "Local bridge is not connected.",
+        bridge
+          ? `Local runtime is enabled with workspace root ${bridgeWorkspaceRoot || "unknown"}.`
+          : "Local runtime is disabled for this project/module. Do not use local filesystem, shell, Python, or PDF bridge tools unless the user enables it in settings.",
         user?.email ? `Signed-in user: ${user.email}.` : undefined,
       ].filter((value): value is string => Boolean(value));
 
@@ -2455,9 +2903,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     try {
       const controller = new AbortController();
       runAbortRef.current = controller;
-      const bridge = bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+      const bridge = activeBridge;
+      await syncBridgeAppspaceContext(bridge);
+      await processQueuedBridgeAppspaceOperations(bridge);
       const session = await runAgentSession({
         initialInputItems: pending.inputItems,
         contextBits: pending.contextBits,
@@ -2577,8 +3025,19 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             {connectionError && <div style={{ fontSize: "0.74rem", color: C.danger }}>{connectionError}</div>}
           </div>
 
-          <div style={{ display: "grid", gap: "0.35rem" }}>
-            <label style={labelStyle}>Local bridge</label>
+          <div style={{ display: "grid", gap: "0.45rem" }}>
+            <label style={labelStyle}>Local runtime</label>
+            <label style={{ display: "flex", alignItems: "flex-start", gap: "0.55rem", fontSize: "0.82rem", lineHeight: 1.45, color: C.text }}>
+              <input
+                type="checkbox"
+                checked={localRuntimeEnabled}
+                onChange={(event) => handleLocalRuntimeEnabledChange(event.currentTarget.checked)}
+                style={{ marginTop: 3 }}
+              />
+              <span>
+                Enable local runtime for this project. This allows the agent to use local files, commands, Python tools, and future native Codex runtime features after pairing.
+              </span>
+            </label>
             <input
               value={draftBridgeUrl}
               onChange={(event) => setDraftBridgeUrl(event.currentTarget.value)}
@@ -2593,20 +3052,43 @@ export default function ChatCodexModule({ config }: ModuleProps) {
               style={inputStyle}
             />
             <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap" }}>
+              <button
+                onClick={() => void checkLocalRuntime()}
+                style={ghostButtonStyle}
+                disabled={!localRuntimeEnabled || bridgeCheckLoading}
+              >
+                {bridgeCheckLoading ? "Checking..." : "Check Runtime"}
+              </button>
               <button onClick={handleSaveBridge} style={primaryButtonStyle}>
-                Save Bridge
+                Save Pairing Token
               </button>
               {(bridgeUrl || bridgeToken) && (
                 <button onClick={handleForgetBridge} style={dangerButtonStyle}>
-                  Forget Bridge
+                  Forget Runtime
                 </button>
               )}
             </div>
             <div style={{ fontSize: "0.72rem", color: C.muted }}>
-              Used for local file access, command execution, and host-side analysis tools.
+              Disabled means no local runtime calls are made, even if the service is installed or a token is saved.
             </div>
+            {bridgeHealth ? (
+              <div style={{ fontSize: "0.72rem", color: C.muted }}>
+                Runtime found: {bridgeHealth.name ?? "local runtime"} · protocol {bridgeHealth.protocolVersion ?? "unknown"} · capabilities {(bridgeHealth.capabilities ?? []).join(", ") || "none reported"}
+              </div>
+            ) : (
+              <div style={{ display: "grid", gap: "0.35rem", padding: "0.65rem 0.75rem", border: `1px solid ${C.border}`, borderRadius: 10, background: "#071321" }}>
+                <div style={{ fontSize: "0.76rem", color: C.muted }}>
+                  If the runtime is not installed, download it for your platform, run the installer, then return here and check again.
+                </div>
+                <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap" }}>
+                  <a href={installHref(installBaseUrl, "windows")} style={linkButtonStyle}>Windows</a>
+                  <a href={installHref(installBaseUrl, "macos")} style={linkButtonStyle}>macOS</a>
+                  <a href={installHref(installBaseUrl, "linux")} style={linkButtonStyle}>Linux</a>
+                </div>
+              </div>
+            )}
             <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap", alignItems: "center" }}>
-              <button onClick={() => void openBridgeBrowser()} style={primaryButtonStyle}>
+              <button onClick={() => void openBridgeBrowser()} style={primaryButtonStyle} disabled={!localRuntimeEnabled}>
                 Set Workspace Root
               </button>
               <span style={{ fontSize: "0.72rem", color: C.muted }}>
@@ -2847,6 +3329,20 @@ const dangerButtonStyle: CSSProperties = {
   fontSize: "0.78rem",
   padding: "0.6rem 0.95rem",
   cursor: "pointer",
+};
+
+const linkButtonStyle: CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  border: `1px solid ${C.border}`,
+  borderRadius: 999,
+  background: "transparent",
+  color: C.accent,
+  fontWeight: 700,
+  fontSize: "0.76rem",
+  padding: "0.45rem 0.8rem",
+  textDecoration: "none",
 };
 
 function bubbleStyle(role: ChatMessage["role"]): CSSProperties {

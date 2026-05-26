@@ -15,6 +15,14 @@ win["__ReactDOMClient"] = ReactDOMClient;
 win["__AgentBridgeDefaults"] = {
   url: import.meta.env.VITE_AGENT_BRIDGE_URL ?? "",
   token: import.meta.env.VITE_AGENT_BRIDGE_TOKEN ?? "",
+  installBaseUrl: import.meta.env.VITE_AGENT_RUNTIME_INSTALL_BASE_URL ?? "",
+};
+win["__JeffspaceLocalS3"] = {
+  endpoint: import.meta.env.VITE_LOCAL_S3_ENDPOINT ?? "",
+  buckets: (import.meta.env.VITE_LOCAL_BUCKETS ?? "")
+    .split(",")
+    .map((value: string) => value.trim())
+    .filter(Boolean),
 };
 
 const rootElement = document.getElementById("root");

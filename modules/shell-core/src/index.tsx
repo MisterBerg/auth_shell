@@ -96,6 +96,7 @@ class ModuleErrorBoundary extends Component<
 
   render() {
     if (this.state.error) {
+      const message = formatLoadError(this.state.error as Error);
       return (
         <div
           style={{
@@ -114,7 +115,7 @@ class ModuleErrorBoundary extends Component<
               whiteSpace: "pre-wrap",
             }}
           >
-            {(this.state.error as Error).message}
+            {message}
           </pre>
         </div>
       );
@@ -122,6 +123,23 @@ class ModuleErrorBoundary extends Component<
 
     return this.props.children;
   }
+}
+
+function formatLoadError(error: Error): string {
+  const message = error.message || String(error);
+  if (isClockSkewError(message)) {
+    return [
+      message,
+      "",
+      "This usually means the browser/client clock and the S3 service clock differ too much for AWS request signing.",
+      "Check the OS date/time on the machine running this browser, then restart the local stack if you are using local Podman services.",
+    ].join("\n");
+  }
+  return message;
+}
+
+function isClockSkewError(message: string): boolean {
+  return /request time.*server'?s time|RequestTimeTooSkewed|RequestExpired|Signature not yet current/i.test(message);
 }
 
 function getModuleLocationFromUrl(): ModuleLocation | null {
@@ -188,30 +206,36 @@ function createAwsClients(
   signOut: () => void
 ) {
   let remoteDdbClient: DynamoDBDocumentClient | null = null;
-  let localDdbClient: DynamoDBDocumentClient | null = null;
   const s3ClientCache = new Map<string, S3Client>();
+
+  const getLocalS3ClockOffset = async (endpoint: string): Promise<number> => {
+    return readLocalS3ClockOffset(endpoint);
+  };
+
+  const getLocalDdbClockOffset = async (endpoint: string): Promise<number> => {
+    return readEndpointClockOffset(endpoint, "[ShellCore] Local DynamoDB");
+  };
 
   return {
     getDdbDocClient: async () => {
       const useLocal = runtimeEnv.isLocalDev && Boolean(runtimeEnv.localDdbEndpoint);
 
       if (useLocal) {
-        if (!localDdbClient) {
-          const raw = new DynamoDBClient({
-            region: runtimeEnv.localRegion ?? "us-east-1",
-            endpoint: runtimeEnv.localDdbEndpoint,
-            credentials: runtimeEnv.localAccessKeyId
-              ? {
-                  accessKeyId: runtimeEnv.localAccessKeyId,
-                  secretAccessKey: runtimeEnv.localSecretAccessKey ?? "",
-                }
-              : { accessKeyId: "local", secretAccessKey: "local" },
-          });
-          localDdbClient = DynamoDBDocumentClient.from(raw, {
-            marshallOptions: { removeUndefinedValues: true },
-          });
-        }
-        return localDdbClient;
+        const systemClockOffset = await getLocalDdbClockOffset(runtimeEnv.localDdbEndpoint!);
+        const raw = new DynamoDBClient({
+          region: runtimeEnv.localRegion ?? "us-east-1",
+          endpoint: runtimeEnv.localDdbEndpoint,
+          credentials: runtimeEnv.localAccessKeyId
+            ? {
+                accessKeyId: runtimeEnv.localAccessKeyId,
+                secretAccessKey: runtimeEnv.localSecretAccessKey ?? "",
+              }
+            : { accessKeyId: "local", secretAccessKey: "local" },
+          systemClockOffset,
+        });
+        return DynamoDBDocumentClient.from(raw, {
+          marshallOptions: { removeUndefinedValues: true },
+        });
       }
 
       if (!remoteDdbClient) {
@@ -235,11 +259,12 @@ function createAwsClients(
 
       const cacheKey = useLocal ? `local:${runtimeEnv.localS3Endpoint}` : "remote";
       const cached = s3ClientCache.get(cacheKey);
-      if (cached) return cached;
+      if (cached && !useLocal) return cached;
 
       let client: S3Client;
 
       if (useLocal) {
+        const systemClockOffset = await getLocalS3ClockOffset(runtimeEnv.localS3Endpoint!);
         client = new S3Client({
           region: runtimeEnv.localRegion ?? "us-east-1",
           endpoint: runtimeEnv.localS3Endpoint,
@@ -250,6 +275,7 @@ function createAwsClients(
               }
             : { accessKeyId: "local", secretAccessKey: "local" },
           forcePathStyle: true,
+          systemClockOffset,
           requestChecksumCalculation: "WHEN_REQUIRED",
           responseChecksumValidation: "WHEN_REQUIRED",
         });
@@ -262,10 +288,46 @@ function createAwsClients(
         installAutoResetOnAuthError(client, signOut);
       }
 
-      s3ClientCache.set(cacheKey, client);
+      if (!useLocal) {
+        s3ClientCache.set(cacheKey, client);
+      }
       return client;
     },
   };
+}
+
+async function readLocalS3ClockOffset(endpoint: string): Promise<number> {
+  return readEndpointClockOffset(endpoint, "[ShellCore] Local S3");
+}
+
+async function readEndpointClockOffset(endpoint: string, label: string): Promise<number> {
+  void endpoint;
+  const appHostOffset = await readDateHeaderClockOffset(window.location.origin);
+  if (appHostOffset !== null) {
+    logClockOffset(`${label} via app host`, appHostOffset);
+    return appHostOffset;
+  }
+
+  return 0;
+}
+
+async function readDateHeaderClockOffset(url: string): Promise<number | null> {
+  try {
+    const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+    const dateHeader = response.headers.get("date");
+    if (!dateHeader) return null;
+    const serverMs = Date.parse(dateHeader);
+    if (!Number.isFinite(serverMs)) return null;
+    return serverMs - Date.now();
+  } catch {
+    return null;
+  }
+}
+
+function logClockOffset(label: string, offset: number): void {
+  if (Math.abs(offset) > 30_000) {
+    console.warn(`${label} clock offset detected: ${Math.round(offset / 1000)}s`);
+  }
 }
 
 function ShellAuthProvider({

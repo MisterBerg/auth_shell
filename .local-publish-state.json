@@ -1,20 +1,20 @@
 {
   "workspaces": {
-    "layouts/top-left": "70ad000db2e539962af47f627c6a19d7d88504e1e0f50cb7bd97a65ca1c2c896",
-    "layouts/tabs-top": "53f4c6da4ab24f07400a87fbf6a2de95a9c4c1642294277c56409ecab004dab3",
-    "layouts/tabs-left": "79e65afb8c8e496d60590e3b06e79565d4cf88f19e31b1a681e42c4783d2fe2d",
-    "layouts/left-right-columns": "32fd1fef9ad16eb9b50ef8ec11eb58f32b1d7de40e8d934e1eb42bb3eedf2ce4",
-    "modules/webview": "d8b375680cf060df5717df4b71eae4595804d8ae0bcdac7a612887b963e6fae5",
-    "modules/oauth-badge": "0ca01a1b205a6bb3b94ecce46998b2b1bf4b442add1e308dabf100e02e98b389",
-    "modules/markdown-viewer": "ec36f929abadad06dc6a9519356e613fefc31600529fcf250f93bed0076c6692",
-    "modules/document-viewer": "2d551173d9a556e3056d0c7c27984bd812ea1f231520626410f1719e1c639ceb",
-    "modules/documentation-viewer": "ceb71f9eebf6f7dcc47632cf06901bb53cea85e1355f6796c148bf1935cebbaf",
-    "modules/links": "4d9db782e80aab7dc7f5e8b3724f084cc71037cf15eac510c15ca0e16d33db49",
-    "modules/serial-display": "facf9d1e13160f2e5c0d550e2310e53e84f31f7263ed8ce5ff9ccde78e8c08bc",
-    "modules/task-tracker": "30d32d46abc105d4b4891a5086e424d50e3470f31ce0e520e0586a7009caee89",
-    "modules/kicad-board-viewer": "21fde8265cb719bb2f5712c116e2865d9d59b4d5e0897f3d385eb8c8cb29f19e",
-    "modules/shell-core": "80d9d11ae36727cb4273ce207d822b76f4296f4eaeff4ae31bc3c75d888101b8",
-    "apps/landing": "6d8c3281acc478aff4d4efcfd107a45762e6deaf7eab76ff280e02f090f100dd",
-    "modules/chat-codex": "4a2695b50b089c2c75cb468bc5949c5996daba73fb9c13aa747ed64eb6328b12"
+    "layouts/top-left": "d3164759de735867ba67eaa2db32f4fe8bbd18e25c15d4129e2f7c85fe328038",
+    "layouts/tabs-top": "d4d16ca929680bfc3b4f984b12147575a01111033b0d72a838fabaf5fa2019ad",
+    "layouts/tabs-left": "8725cc12a353e75243fb599f2c91c077f05ed5f7dd6df9f836f3a4408424ea3d",
+    "layouts/left-right-columns": "946b15e9fa73ae9117d1067457647c204a8de2d10d125a0dd1a05c95bae34507",
+    "modules/webview": "3f08e7bce12888eec42049ab17526a9b9c77f42f1b4402d67634df8d0d490f6c",
+    "modules/oauth-badge": "4dd6a32b93983107542a62f75d9b1d6b595229b7e5da37f39ea0fd5cdc1228c1",
+    "modules/markdown-viewer": "fb17eb1f4117e0ed7a2d63d6d9431c6cd9bce988d0fb33ea6719443311a32622",
+    "modules/document-viewer": "8b1c248b94c06b3d2c0290792e38440448875930f4c370404da49d701be16658",
+    "modules/documentation-viewer": "be68ab575f34b71958159d6c4c3fc0165a95e60bb421eb343b4b00bc496907d2",
+    "modules/links": "1feec2dba22920a54f71b2d7424c34044ff7af549b75554cee82570c11640ff1",
+    "modules/serial-display": "2868ecbe111be6b7180f3278f4b716d260a14a045ce2f2e601ec3628f94a8a7a",
+    "modules/task-tracker": "fe7b2fdf6dc8dd6b7bfe7ceb60950357b69a8daa4983619c622d277f763c1e00",
+    "modules/kicad-board-viewer": "bfca0f2d0b7925001bf0bb0d867487e6df8f70367e5269a3504fc9358f1db9c9",
+    "modules/shell-core": "11a4323b989ca0ae621df5487d867679df50372a83178d20f303a26d0aa038dc",
+    "apps/landing": "6eaf8c713b6f556b05e6c481daed1be4e958181c6e7f52cfd7c68430e2b091f3",
+    "modules/chat-codex": "f8729dc06c4e9d44dc028c7f932b370e09d2fe656dd385b436a69552e389d119"
   }
 }

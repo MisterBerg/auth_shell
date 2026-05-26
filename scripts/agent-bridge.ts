@@ -36,6 +36,34 @@ const allowedOrigins = new Set(
     .map((value) => value.trim())
     .filter(Boolean)
 );
+const PROTOCOL_VERSION = 1;
+const CAPABILITIES = [
+  "filesystem",
+  "shell",
+  "python",
+  "pdf_text",
+  "workspace_root",
+  "appspace_context",
+  "appspace_operation_queue",
+];
+
+type AppspaceOperation = {
+  id: string;
+  operation: string;
+  args: Record<string, unknown>;
+  status: "queued" | "completed" | "failed";
+  createdAt: string;
+  updatedAt: string;
+  result?: unknown;
+  error?: string;
+};
+
+type AppspaceSession = {
+  sessionId: string;
+  updatedAt: string;
+  context: Record<string, unknown>;
+  operations: AppspaceOperation[];
+};
 
 type PythonAllowlistEntry = {
   version: string;
@@ -100,6 +128,8 @@ type CommandResult = {
   stderr: string;
 };
 
+const appspaceSessions = new Map<string, AppspaceSession>();
+
 if (!TOKEN) {
   throw new Error("AGENT_BRIDGE_TOKEN is required.");
 }
@@ -115,35 +145,23 @@ createServer(async (req, res) => {
     }
 
     validateOrigin(req);
-    validateToken(req);
 
     if (req.method === "GET" && req.url === "/health") {
       sendJson(res, 200, {
         ok: true,
         result: {
           status: "ok",
-          workspaceRoot,
-          browseStartPath: defaultBrowseRoot,
-          methods: [
-            "get_bridge_status",
-            "set_workspace_root",
-            "list_workspace_files",
-            "create_directory",
-            "read_workspace_file",
-            "write_workspace_file",
-            "run_workspace_command",
-            "get_python_environment",
-            "check_python_dependencies",
-            "install_python_dependencies",
-            "run_python_script",
-            "extract_pdf_text",
-          ],
+          name: "Jeffspace local agent bridge",
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: CAPABILITIES,
+          requiresPairingToken: true,
         },
       } satisfies RpcSuccess);
       return;
     }
 
     if (req.method === "POST" && req.url === "/rpc") {
+      validateToken(req);
       const body = (await readJson(req)) as RpcRequest;
       const result = await runRpc(body);
       sendJson(res, 200, { ok: true, result } satisfies RpcSuccess);
@@ -186,6 +204,18 @@ async function runRpc(body: RpcRequest): Promise<unknown> {
       return runPythonScript(body.params);
     case "extract_pdf_text":
       return extractPdfText(body.params);
+    case "sync_appspace_context":
+      return syncAppspaceContext(body.params);
+    case "get_appspace_context":
+      return getAppspaceContext(body.params);
+    case "search_appspace_assets":
+      return searchAppspaceAssets(body.params);
+    case "queue_appspace_operation":
+      return queueAppspaceOperation(body.params);
+    case "list_appspace_operations":
+      return listAppspaceOperations(body.params);
+    case "complete_appspace_operation":
+      return completeAppspaceOperation(body.params);
     default:
       throw new Error(`Unsupported RPC method: ${body.method ?? "unknown"}`);
   }
@@ -211,7 +241,10 @@ function validateOrigin(req: IncomingMessage): void {
 
 function isAllowedOrigin(origin: string): boolean {
   if (allowedOrigins.has(origin)) return true;
-  return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(origin);
+  return (
+    /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(origin) ||
+    /^https:\/\/[a-z0-9-]+\.cloudfront\.net$/i.test(origin)
+  );
 }
 
 function validateToken(req: IncomingMessage): void {
@@ -252,6 +285,162 @@ function getBridgeStatus(): unknown {
     workspaceRoot,
     pythonRoot: pythonStateRoot,
     browseStartPath: defaultBrowseRoot,
+    appspaceSessions: [...appspaceSessions.values()].map((session) => ({
+      sessionId: session.sessionId,
+      updatedAt: session.updatedAt,
+      queuedOperationCount: session.operations.filter((operation) => operation.status === "queued").length,
+    })),
+  };
+}
+
+function readSessionId(params: Record<string, unknown> = {}, fallbackLatest = true): string {
+  const raw = typeof params["sessionId"] === "string" ? params["sessionId"].trim() : "";
+  if (raw) return raw;
+  if (fallbackLatest) {
+    const latest = [...appspaceSessions.values()]
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+    if (latest) return latest.sessionId;
+  }
+  throw new Error("sessionId is required.");
+}
+
+function getSession(params: Record<string, unknown> = {}, fallbackLatest = true): AppspaceSession {
+  const sessionId = readSessionId(params, fallbackLatest);
+  const session = appspaceSessions.get(sessionId);
+  if (!session) {
+    throw new Error(`No appspace session is registered for ${sessionId}.`);
+  }
+  return session;
+}
+
+function readRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function syncAppspaceContext(params: Record<string, unknown> = {}): unknown {
+  const sessionId = readSessionId(params, false);
+  const context = readRecord(params["context"], "context");
+  const now = new Date().toISOString();
+  const existing = appspaceSessions.get(sessionId);
+  const operations = existing?.operations ?? [];
+  appspaceSessions.set(sessionId, {
+    sessionId,
+    updatedAt: now,
+    context,
+    operations,
+  });
+  return {
+    status: "ok",
+    sessionId,
+    updatedAt: now,
+    queuedOperationCount: operations.filter((operation) => operation.status === "queued").length,
+  };
+}
+
+function getAppspaceContext(params: Record<string, unknown> = {}): unknown {
+  const session = getSession(params);
+  return {
+    sessionId: session.sessionId,
+    updatedAt: session.updatedAt,
+    context: session.context,
+  };
+}
+
+function searchAppspaceAssets(params: Record<string, unknown> = {}): unknown {
+  const session = getSession(params);
+  const query = typeof params["query"] === "string" ? params["query"].trim().toLowerCase() : "";
+  const limit = clampNumber(params["limit"], 1, 200, 25);
+  const assets = Array.isArray(session.context["assets"])
+    ? session.context["assets"] as unknown[]
+    : [];
+  const matches = assets
+    .map((asset) => {
+      const text = JSON.stringify(asset).toLowerCase();
+      let score = query ? 0 : 1;
+      if (query && text.includes(query)) score += 25;
+      for (const token of query.split(/\s+/).filter(Boolean)) {
+        if (text.includes(token)) score += 10;
+      }
+      return { asset, score };
+    })
+    .filter((entry) => !query || entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((entry) => entry.asset);
+
+  return {
+    sessionId: session.sessionId,
+    query,
+    count: matches.length,
+    assets: matches,
+  };
+}
+
+function queueAppspaceOperation(params: Record<string, unknown> = {}): unknown {
+  const session = getSession(params);
+  const operation = typeof params["operation"] === "string" ? params["operation"].trim() : "";
+  if (!operation) {
+    throw new Error("operation is required.");
+  }
+  const opArgs = params["args"] === undefined ? {} : readRecord(params["args"], "args");
+  const now = new Date().toISOString();
+  const queued: AppspaceOperation = {
+    id: `op_${Date.now()}_${randomUUID()}`,
+    operation,
+    args: opArgs,
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+  };
+  session.operations.push(queued);
+  return {
+    status: "queued",
+    sessionId: session.sessionId,
+    operationId: queued.id,
+    operation,
+  };
+}
+
+function listAppspaceOperations(params: Record<string, unknown> = {}): unknown {
+  const session = getSession(params);
+  const status = typeof params["status"] === "string" ? params["status"] : "";
+  const limit = clampNumber(params["limit"], 1, 200, 50);
+  const operations = session.operations
+    .filter((operation) => !status || operation.status === status)
+    .slice(-limit);
+  return {
+    sessionId: session.sessionId,
+    count: operations.length,
+    operations,
+  };
+}
+
+function completeAppspaceOperation(params: Record<string, unknown> = {}): unknown {
+  const session = getSession(params, false);
+  const operationId = typeof params["operationId"] === "string" ? params["operationId"].trim() : "";
+  if (!operationId) {
+    throw new Error("operationId is required.");
+  }
+  const operation = session.operations.find((item) => item.id === operationId);
+  if (!operation) {
+    throw new Error(`No queued appspace operation found for ${operationId}.`);
+  }
+  const status = params["status"] === "failed" ? "failed" : "completed";
+  operation.status = status;
+  operation.updatedAt = new Date().toISOString();
+  if (status === "failed") {
+    operation.error = typeof params["error"] === "string" ? params["error"] : "Operation failed.";
+  } else {
+    operation.result = params["result"];
+  }
+  return {
+    status: "ok",
+    sessionId: session.sessionId,
+    operationId,
+    operationStatus: operation.status,
   };
 }
 

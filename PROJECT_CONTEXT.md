@@ -414,6 +414,44 @@ So the system is not just an asset index; it is a writable project knowledge lay
 
 The agent should operate through stable objects and project graph updates, not through guessed S3 paths.
 
+### Agent Runtime Direction
+
+Keep both agent modes:
+- browser-native agent mode for any signed-in user, including CloudFront-only use where no local service exists
+- local runtime mode for users who explicitly install and enable a local service
+
+The browser-native agent can use project APIs, central assets, module registry data, and project config mutation tools. It remains intentionally limited for local filesystem, shell, Python, PDF extraction, PTY, and eventual native Codex runtime behavior.
+
+The local runtime/bridge is an explicit permission boundary:
+- default state is disabled
+- the UI must require the user to check `Enable local runtime for this project`
+- installed service detection happens only after the user enables or manually checks it
+- installation is initiated through visible platform download links; the browser must not silently install or start software
+- saved pairing tokens do not imply the runtime is enabled for the current project/module
+- when disabled, the browser agent must not call local runtime or bridge APIs
+
+Current first-pass local runtime behavior:
+- `scripts/agent-bridge.ts` exposes unauthenticated `GET /health` for safe install/detection only
+- privileged `POST /rpc` calls still require the bearer token
+- default CORS allows localhost and CloudFront distribution origins; custom production domains must be added through `AGENT_BRIDGE_ALLOWED_ORIGINS`
+- the Chat Codex module stores local runtime enablement separately from URL/token/workspace root
+- `run:local` can inject bridge defaults, but the UI still requires project-scoped enablement before use
+
+Planned native Codex runtime behavior:
+- add a separate local `codex-runtime` service or evolve the bridge into one
+- browser UI becomes an agent console that can select browser-native or local runtime backends
+- local runtime owns real Codex session lifecycle, PTY/process control, approvals, filesystem, shell, Python, and project APIs
+- browser streams events, displays approvals/tool output, and falls back to browser-native mode when the runtime is unavailable
+
+Current shared browser/bridge agent API direction:
+- the browser agent remains primary for appspace awareness because it can see project config, loaded modules, assets, resources, and CloudFront-only state
+- when the bridge is explicitly enabled and paired, the browser publishes an appspace context snapshot to the bridge
+- the local runtime can read/search that bridge-held appspace snapshot and queue appspace operations for the browser to execute
+- queued appspace operations use the same operation names as browser-agent tools so browser and local runtime capabilities stay aligned
+- the bridge is treated as trusted once the user enables it; the queue exists because browser appspace state and AWS credentials live in the browser, not because the local runtime is untrusted
+- asset transfer is bidirectional: local files can be imported into central project assets, and central project assets can be exported into the local workspace
+- response handling from the local runtime should stay conversational/freeform; structure belongs mainly at the operation/API boundary
+
 ## Project Graph
 
 Over time, the data layer needs to cover both:
@@ -471,16 +509,22 @@ Implemented today:
 - Markdown Viewer upload to central project assets
 - Document Viewer upload to central project assets
 - Document Viewer project-PDF picker backed by the central asset table
+- browser-native Chat Codex module with project asset/config tools
+- local agent bridge with explicit UI enablement, tokened privileged RPC, and tokenless health check
+- bridge appspace session APIs: sync context, get context, search synced assets, queue/list/complete appspace operations
+- Chat Codex bridge sync/poll loop so local-runtime queued appspace operations execute through the same browser tool path
 
 Not implemented yet:
 - shared project data broker
 - typed data source registry
-- agent-writable project data APIs
+- native local Codex runtime service
+- installer artifacts for the local runtime downloads
 - scheduler module
 
 Partially implemented:
 - stable asset references across modules: Markdown Viewer creates file-set/file assets and Document Viewer can select PDF file assets from the same project
 - browse/search: current PDF picker searches labels, paths, version metadata, asset metadata, and parent file-set labels; a reusable broker-level browser is still future work
+- agent-writable project data APIs: Chat Codex can list/create/read/export/import assets and create/update/remove nested slots; browser tools and bridge-queued operations now share the same operation names, but a formal shared broker package is still future work
 
 Markdown Viewer first asset behavior:
 - creates one `file-set` asset for the reachable markdown tree
@@ -497,12 +541,13 @@ Document Viewer first asset behavior:
 
 ## Recommended Implementation Order
 
-1. Add the browser-local shared project data broker
-2. Promote the Document Viewer PDF picker into a reusable asset/source picker
-3. Add typed data source support for structured module data
-4. Update task tracker to publish a typed task-date view
-5. Build scheduler on top of that data layer
-6. Add agent-facing project mutation APIs for creating nested modules and wiring asset/source references
+1. Add native local Codex runtime execution behind the existing explicit enable/pairing boundary
+2. Promote the Chat Codex operation executor into a shared browser broker package
+3. Expand bridge appspace operations for asset import/export, module creation, nested module edits, and runtime result reconciliation
+4. Promote the Document Viewer PDF picker into a reusable asset/source picker
+5. Add typed data source support for structured module data
+6. Update task tracker to publish a typed task-date view
+7. Build scheduler on top of that data layer
 
 ## Open Decisions
 
@@ -518,3 +563,25 @@ Document Viewer first asset behavior:
 - Current auth model depends on Cognito Identity Pool claim-based authorization
 - Cloud publish and shell deploy were successfully run before this handoff
 - This file is intended to be the source of truth for the next PC/session so the original shared-local-data intent is not lost again
+
+## Local Appspace Lab
+
+The local `jeffdevelopment-dev` project has been expanded from the bare seed into an appspace lab:
+- root module: `layout-top-left`
+- top bar: `module-links` plus `module-oauth-badge`
+- Command Center nav: `layout-tabs-top` containing Chat Codex, Task Tracker, and Links
+- Documentation nav: `layout-tabs-left` containing Markdown Viewer, Document Viewer, and Documentation Viewer
+- Engineering Tools nav: `layout-left-right-columns` containing nested tab layouts for KiCad, Serial Display, Webview, and tool links
+
+The lab also seeds central assets under `project-assets`:
+- `asset_appspace_docs_set`: markdown file-set manifest
+- markdown child files for README/runtime/hierarchy notes
+- `asset_appspace_sample_pdf`: sample PDF shared by Markdown Viewer and Document Viewer
+
+The Documentation Viewer tab also has an editable native documentation tree:
+- manifest: `projects/jeffdevelopment-dev/documentation/documentation-index/manifest.json`
+- pages prefix: `projects/jeffdevelopment-dev/documentation/documentation-index/pages`
+- root page: `Appspace Lab Documentation`
+- child pages cover overview, browser/local runtime, bridge operation queue, shared assets, module hierarchy, and local testing notes
+
+This project is meant to exercise nested module creation, shared assets, cross-module asset references, and browser/bridge agent operation flows.
