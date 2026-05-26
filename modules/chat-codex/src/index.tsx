@@ -30,6 +30,23 @@ import {
   useUpdateSlotMeta,
   useUserProfile,
 } from "module-core";
+import {
+  assignPaths,
+  createLinkedPage,
+  getDocKey,
+  getStorageConfig,
+  loadDocumentationState,
+  moveDoc,
+  removeDoc,
+  renameDoc,
+  writeTextObject,
+  deleteObjectIfExists,
+  type ContentMap,
+  type DocumentationManifest,
+  type LinkAction,
+  type MoveDirection,
+  type StorageConfig,
+} from "../../documentation-viewer/src/model.ts";
 
 type ChatMeta = {
   title?: string;
@@ -244,6 +261,42 @@ type MarkdownFileInput = {
   mimeType?: string;
 };
 
+type TaskStatus = "open" | "in-progress" | "blocked" | "done" | "archived";
+type TaskPriority = "low" | "normal" | "high" | "urgent";
+
+type TaskAttachment = {
+  id: string;
+  name: string;
+  bucket: string;
+  key: string;
+  size: number;
+  contentType?: string;
+  uploadedAt: string;
+  uploadedBy?: string;
+};
+
+type TaskRecord = {
+  id: string;
+  title: string;
+  description: string;
+  notes: string;
+  status: TaskStatus;
+  priority: TaskPriority;
+  assignee?: string;
+  tags: string[];
+  repeatable: boolean;
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  attachments: TaskAttachment[];
+};
+
+type TaskStore = {
+  version: 1;
+  projectId: string;
+  tasks: TaskRecord[];
+};
+
 const DEFAULT_MODEL = "gpt-5.2-codex";
 const DEFAULT_TITLE = "Codex Chat";
 const TOOL_ITERATION_LIMIT = 20;
@@ -255,6 +308,7 @@ const DEFAULT_PROMPT = [
   "Use the provided workspace tools whenever project structure, assets, resources, or modules are relevant.",
   "By default, treat 'the app', 'the webapp', 'app data', 'documentation here', and similar phrases as referring to the active project configuration, project assets, and registered resources inside the web app.",
   "Prefer project assets, registered resources, and root-config information before searching the local bridge workspace unless the user explicitly says workspace, local files, repo, filesystem, or disk, or recent conversation is clearly about local workspace operations.",
+  "Prefer module-native tools for task tracker and documentation data when they are available instead of editing their backing files indirectly.",
   "Use shell commands only when no better dedicated tool is available, and pay attention to command failures.",
   "Prefer the managed Python tools for parsing, transformations, text extraction, and small file-oriented programs instead of shell-embedded Python.",
   "Only install Python packages through the dedicated dependency installer, and only when a missing dependency blocks the task.",
@@ -611,6 +665,25 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     type: "function",
+    name: "focus_slot",
+    description: "Navigate the browser to a project if needed, then scroll to and highlight a specific slot path in the current app-space.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        bucket: { type: "string" },
+        configPath: { type: "string" },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "upsert_slot",
     description: "Create or update a slot anywhere in the active app-space tree using the framework's ChildSlot structure. Parent path defaults to the root.",
     parameters: {
@@ -635,6 +708,243 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         replaceChildren: { type: "boolean" },
       },
       required: ["slotId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_task_tracker_tasks",
+    description: "List tasks from a task-tracker module slot by its full slot path.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_task_tracker_tasks",
+    description: "Create one or more tasks inside a task-tracker module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        tasks: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              description: { type: "string" },
+              notes: { type: "string" },
+              status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
+              priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+              assignee: { type: "string" },
+              tags: { type: "array", items: { type: "string" } },
+              repeatable: { type: "boolean" },
+            },
+            required: ["title"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotPath", "tasks"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_task_tracker_task",
+    description: "Update an existing task inside a task-tracker module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        taskId: { type: "string" },
+        patch: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            description: { type: "string" },
+            notes: { type: "string" },
+            status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
+            priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+            assignee: { type: "string" },
+            tags: { type: "array", items: { type: "string" } },
+            repeatable: { type: "boolean" },
+          },
+          additionalProperties: false,
+        },
+      },
+      required: ["slotPath", "taskId", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "delete_task_tracker_task",
+    description: "Delete a task from a task-tracker module slot by id.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        taskId: { type: "string" },
+      },
+      required: ["slotPath", "taskId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "attach_project_asset_to_task",
+    description: "Attach an existing central project asset version to a task-tracker task.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        taskId: { type: "string" },
+        assetId: { type: "string" },
+      },
+      required: ["slotPath", "taskId", "assetId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_documentation_tree",
+    description: "Read the manifest and page summaries for a documentation-viewer module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        includeContent: { type: "boolean" },
+        maxCharsPerDoc: { type: "integer", minimum: 200, maximum: 50000 },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_documentation_page",
+    description: "Create a child or sibling page in a documentation-viewer module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        currentDocId: { type: "string" },
+        title: { type: "string" },
+        action: { type: "string", enum: ["child", "sibling"] },
+        content: { type: "string" },
+      },
+      required: ["slotPath", "currentDocId", "title", "action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_documentation_page",
+    description: "Replace the markdown content of a documentation-viewer page.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docId: { type: "string" },
+        content: { type: "string" },
+      },
+      required: ["slotPath", "docId", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "rename_documentation_page",
+    description: "Rename a documentation-viewer page title.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docId: { type: "string" },
+        title: { type: "string" },
+      },
+      required: ["slotPath", "docId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "move_documentation_page",
+    description: "Reorder or reparent a documentation-viewer page using the module's native move directions.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docId: { type: "string" },
+        direction: { type: "string", enum: ["up", "down", "promote", "demote"] },
+      },
+      required: ["slotPath", "docId", "direction"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "delete_documentation_page",
+    description: "Delete a page from a documentation-viewer module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docId: { type: "string" },
+      },
+      required: ["slotPath", "docId"],
       additionalProperties: false,
     },
   },
@@ -902,6 +1212,167 @@ function arrayBufferToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.slice(i, i + chunkSize));
   }
   return btoa(binary);
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function makeTaskId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `task-${cryptoId}` : `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeAttachmentId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `att-${cryptoId}` : `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function dirnamePath(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx >= 0 ? path.slice(0, idx) : "";
+}
+
+async function readOptionalJsonObject<T>(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  bucket: string,
+  key: string,
+): Promise<T | null> {
+  const s3 = await getS3Client(bucket);
+  try {
+    const object = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    return JSON.parse(await object.Body!.transformToString("utf-8")) as T;
+  } catch (error: unknown) {
+    const err = error as { name?: string; $metadata?: { httpStatusCode?: number } };
+    if (err.name === "NoSuchKey" || err.name === "NotFound" || err.$metadata?.httpStatusCode === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function writeJsonObject(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  bucket: string,
+  key: string,
+  value: unknown,
+): Promise<void> {
+  const s3 = await getS3Client(bucket);
+  await s3.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: JSON.stringify(value, null, 2),
+    ContentType: "application/json",
+    CacheControl: "no-store",
+  }));
+}
+
+function getTaskTrackerStorage(slotConfig: ModuleConfig, configBucket: string, configPath: string, projectId: string) {
+  const projectDir = dirnamePath(configPath);
+  const basePrefix = projectDir ? `${projectDir}/tasks/${slotConfig.id}` : `tasks/${slotConfig.id}`;
+  return {
+    bucket: configBucket,
+    projectId,
+    basePrefix,
+    tasksKey: `${basePrefix}/tasks.json`,
+    attachmentsPrefix: `${basePrefix}/attachments`,
+  };
+}
+
+function defaultTaskRecord(userEmail?: string, partial?: Partial<TaskRecord>): TaskRecord {
+  const at = nowIso();
+  return {
+    id: partial?.id ?? makeTaskId(),
+    title: partial?.title ?? "New task",
+    description: partial?.description ?? "",
+    notes: partial?.notes ?? "",
+    status: partial?.status ?? "open",
+    priority: partial?.priority ?? "normal",
+    assignee: partial?.assignee,
+    tags: partial?.tags ?? [],
+    repeatable: partial?.repeatable ?? false,
+    createdAt: partial?.createdAt ?? at,
+    updatedAt: partial?.updatedAt ?? at,
+    createdBy: partial?.createdBy ?? userEmail,
+    attachments: partial?.attachments ?? [],
+  };
+}
+
+async function loadTaskTrackerStore(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  slotConfig: ModuleConfig,
+  configBucket: string,
+  configPath: string,
+  projectId: string,
+): Promise<{ storage: ReturnType<typeof getTaskTrackerStorage>; store: TaskStore }> {
+  const storage = getTaskTrackerStorage(slotConfig, configBucket, configPath, projectId);
+  const store = await readOptionalJsonObject<TaskStore>(getS3Client, storage.bucket, storage.tasksKey);
+  return {
+    storage,
+    store: store ?? { version: 1, projectId: storage.projectId, tasks: [] },
+  };
+}
+
+async function saveTaskTrackerStore(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  storage: ReturnType<typeof getTaskTrackerStorage>,
+  store: TaskStore,
+): Promise<void> {
+  await writeJsonObject(getS3Client, storage.bucket, storage.tasksKey, store);
+}
+
+async function loadDocumentationSlotState(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  slotConfig: ModuleConfig,
+): Promise<{ storage: StorageConfig; manifest: DocumentationManifest; contents: ContentMap }> {
+  const storage = getStorageConfig(slotConfig);
+  const s3 = await getS3Client(storage.bucket);
+  const title =
+    (slotConfig.meta?.["title"] as string | undefined) ??
+    (slotConfig.meta?.["name"] as string | undefined) ??
+    "Documentation";
+  const state = await loadDocumentationState(s3, storage, title);
+  return {
+    storage,
+    manifest: state.manifest,
+    contents: state.contents,
+  };
+}
+
+async function persistDocumentationSlotState(args: {
+  getS3Client: ReturnType<typeof useAwsS3Client>;
+  storage: StorageConfig;
+  previousManifest: DocumentationManifest;
+  nextManifest: DocumentationManifest;
+  contents: ContentMap;
+}): Promise<void> {
+  const s3 = await args.getS3Client(args.storage.bucket);
+  const previousKeys = new Set(Object.values(args.previousManifest.docs).map((doc) => getDocKey(args.storage, doc.relativePath)));
+  const nextKeys = new Set(Object.values(args.nextManifest.docs).map((doc) => getDocKey(args.storage, doc.relativePath)));
+
+  for (const doc of Object.values(args.nextManifest.docs)) {
+    await writeTextObject(
+      s3,
+      args.storage.bucket,
+      getDocKey(args.storage, doc.relativePath),
+      args.contents[doc.id] ?? "",
+      "text/markdown",
+    );
+  }
+
+  for (const staleKey of previousKeys) {
+    if (!nextKeys.has(staleKey)) {
+      await deleteObjectIfExists(s3, args.storage.bucket, staleKey);
+    }
+  }
+
+  await writeTextObject(
+    s3,
+    args.storage.bucket,
+    args.storage.manifestKey,
+    JSON.stringify(assignPaths(args.nextManifest), null, 2),
+    "application/json",
+  );
 }
 
 async function createProjectAssetFromBytes(args: {
@@ -1412,12 +1883,29 @@ function findModuleEntry(entries: ModuleRegistryEntry[], moduleName: string): Mo
   });
 }
 
+function requireSlotByPath(rootConfig: ModuleConfig, slotPath: string[]): ChildSlot {
+  const slot = findSlotInChildren(rootConfig.children, slotPath);
+  if (!slot) {
+    throw new Error(`No slot found at path ${slotPath.join(" / ")}`);
+  }
+  return slot;
+}
+
+function requireModuleAtPath(rootConfig: ModuleConfig, slotPath: string[], moduleKeyFragment: string): ChildSlot {
+  const slot = requireSlotByPath(rootConfig, slotPath);
+  if (!slot.app.key.includes(moduleKeyFragment)) {
+    throw new Error(`Slot ${slotPath.join(" / ")} is not a ${moduleKeyFragment} module.`);
+  }
+  return slot;
+}
+
 async function executeTool(args: {
   toolCall: ResponsesApiFunctionCall;
   config: ModuleConfig;
   projectId: string;
   configBucket: string;
   configPath: string;
+  userEmail?: string;
   getS3Client: ReturnType<typeof useAwsS3Client>;
   getDdbClient: ReturnType<typeof useAwsDdbClient>;
   assetsTable?: string;
@@ -1431,6 +1919,7 @@ async function executeTool(args: {
     projectId,
     configBucket,
     configPath,
+    userEmail,
     getS3Client,
     getDdbClient,
     assetsTable,
@@ -2019,6 +2508,418 @@ async function executeTool(args: {
       };
     }
 
+    case "focus_slot": {
+      const parsed = parseToolArgs<{ slotPath: string[]; bucket?: string; configPath?: string }>(toolCall.arguments);
+      if ((parsed.bucket && !parsed.configPath) || (!parsed.bucket && parsed.configPath)) {
+        throw new Error("bucket and configPath must be provided together when navigating to another project.");
+      }
+      try {
+        window.sessionStorage.setItem("auth-shell:pending-slot-focus", parsed.slotPath.join("/"));
+      } catch {
+        // ignore storage issues and rely on immediate event delivery
+      }
+      if (parsed.bucket && parsed.configPath) {
+        const url = new URL(window.location.href);
+        url.searchParams.set("bucket", parsed.bucket);
+        url.searchParams.set("config", parsed.configPath);
+        history.pushState(null, "", url.toString());
+        window.dispatchEvent(new Event("shell:navigate"));
+      }
+      window.dispatchEvent(new CustomEvent("shell:focus-slot", { detail: { slotPath: parsed.slotPath } }));
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          navigatedToProject: Boolean(parsed.bucket && parsed.configPath),
+        }, null, 2),
+        toolMessage: `Focused slot ${parsed.slotPath.join(" / ")}.`,
+      };
+    }
+
+    case "list_task_tracker_tasks": {
+      const parsed = parseToolArgs<{ slotPath: string[] }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
+      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      return {
+        output: JSON.stringify({
+          slotPath: parsed.slotPath,
+          bucket: storage.bucket,
+          tasksKey: storage.tasksKey,
+          count: store.tasks.length,
+          tasks: store.tasks,
+        }, null, 2),
+        toolMessage: `Listed ${store.tasks.length} task-tracker tasks.`,
+      };
+    }
+
+    case "create_task_tracker_tasks": {
+      const parsed = parseToolArgs<{
+        slotPath: string[];
+        tasks: Array<Partial<TaskRecord> & { title: string }>;
+      }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
+      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const created = parsed.tasks.map((task) => defaultTaskRecord(userEmail, {
+        title: task.title,
+        description: task.description ?? "",
+        notes: task.notes ?? "",
+        status: task.status ?? "open",
+        priority: task.priority ?? "normal",
+        assignee: task.assignee,
+        tags: task.tags ?? [],
+        repeatable: task.repeatable ?? false,
+      }));
+      const nextStore: TaskStore = { ...store, tasks: [...created, ...store.tasks] };
+      await saveTaskTrackerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          createdTaskIds: created.map((task) => task.id),
+          taskCount: nextStore.tasks.length,
+        }, null, 2),
+        toolMessage: `Created ${created.length} task${created.length === 1 ? "" : "s"} in ${parsed.slotPath.join(" / ")}.`,
+      };
+    }
+
+    case "update_task_tracker_task": {
+      const parsed = parseToolArgs<{
+        slotPath: string[];
+        taskId: string;
+        patch: Partial<TaskRecord>;
+      }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
+      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const existing = store.tasks.find((task) => task.id === parsed.taskId);
+      if (!existing) throw new Error(`Task not found: ${parsed.taskId}`);
+      const nextStore: TaskStore = {
+        ...store,
+        tasks: store.tasks.map((task) => (
+          task.id === parsed.taskId
+            ? { ...task, ...parsed.patch, updatedAt: nowIso() }
+            : task
+        )),
+      };
+      await saveTaskTrackerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          taskId: parsed.taskId,
+        }, null, 2),
+        toolMessage: `Updated task ${parsed.taskId}.`,
+      };
+    }
+
+    case "delete_task_tracker_task": {
+      const parsed = parseToolArgs<{ slotPath: string[]; taskId: string }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
+      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const existing = store.tasks.find((task) => task.id === parsed.taskId);
+      if (!existing) throw new Error(`Task not found: ${parsed.taskId}`);
+      const s3 = await getS3Client(storage.bucket);
+      await Promise.all(existing.attachments.map((attachment) =>
+        deleteObjectIfExists(s3, attachment.bucket, attachment.key)
+      ));
+      const nextStore: TaskStore = {
+        ...store,
+        tasks: store.tasks.filter((task) => task.id !== parsed.taskId),
+      };
+      await saveTaskTrackerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          taskId: parsed.taskId,
+        }, null, 2),
+        toolMessage: `Deleted task ${parsed.taskId}.`,
+      };
+    }
+
+    case "attach_project_asset_to_task": {
+      const parsed = parseToolArgs<{ slotPath: string[]; taskId: string; assetId: string }>(toolCall.arguments);
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
+      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const existing = store.tasks.find((task) => task.id === parsed.taskId);
+      if (!existing) throw new Error(`Task not found: ${parsed.taskId}`);
+      const ddb = await getDdbClient();
+      const assets = await listAssets({ ddb, tableName: assetsTable, projectId });
+      const asset = assets.find((item) => item.assetId === parsed.assetId);
+      if (!asset) throw new Error(`Project asset not found: ${parsed.assetId}`);
+      const version = getCurrentAssetVersion(asset);
+      const attachment: TaskAttachment = {
+        id: makeAttachmentId(),
+        name: asset.label || basename(version.key),
+        bucket: version.bucket,
+        key: version.key,
+        size: version.sizeBytes ?? 0,
+        contentType: version.mimeType,
+        uploadedAt: nowIso(),
+        uploadedBy: userEmail,
+      };
+      const nextStore: TaskStore = {
+        ...store,
+        tasks: store.tasks.map((task) => (
+          task.id === parsed.taskId
+            ? { ...task, attachments: [...task.attachments, attachment], updatedAt: nowIso() }
+            : task
+        )),
+      };
+      await saveTaskTrackerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          taskId: parsed.taskId,
+          attachment,
+        }, null, 2),
+        toolMessage: `Attached asset ${parsed.assetId} to task ${parsed.taskId}.`,
+      };
+    }
+
+    case "read_documentation_tree": {
+      const parsed = parseToolArgs<{ slotPath: string[]; includeContent?: boolean; maxCharsPerDoc?: number }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-documentation-viewer");
+      const slotConfig: ModuleConfig = {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      };
+      const { storage, manifest, contents } = await loadDocumentationSlotState(getS3Client, slotConfig);
+      const maxCharsPerDoc = Math.max(200, Math.min(parsed.maxCharsPerDoc ?? 12000, 50000));
+      const docs = Object.values(manifest.docs).map((doc) => ({
+        id: doc.id,
+        title: doc.title,
+        parentId: doc.parentId,
+        children: doc.children,
+        slug: doc.slug,
+        relativePath: doc.relativePath,
+        content: parsed.includeContent ? (contents[doc.id] ?? "").slice(0, maxCharsPerDoc) : undefined,
+        contentPreview: (contents[doc.id] ?? "").slice(0, 600),
+      }));
+      return {
+        output: JSON.stringify({
+          slotPath: parsed.slotPath,
+          storage,
+          rootDocId: manifest.rootDocId,
+          docs,
+        }, null, 2),
+        toolMessage: `Read documentation tree for ${parsed.slotPath.join(" / ")}.`,
+      };
+    }
+
+    case "create_documentation_page": {
+      const parsed = parseToolArgs<{
+        slotPath: string[];
+        currentDocId: string;
+        title: string;
+        action: LinkAction;
+        content?: string;
+      }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-documentation-viewer");
+      const slotConfig: ModuleConfig = {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      };
+      const { storage, manifest, contents } = await loadDocumentationSlotState(getS3Client, slotConfig);
+      if (!manifest.docs[parsed.currentDocId]) {
+        throw new Error(`Documentation page not found: ${parsed.currentDocId}`);
+      }
+      const created = createLinkedPage(manifest, contents, parsed.currentDocId, parsed.title, parsed.action);
+      const nextContents = {
+        ...created.contents,
+        [created.newDocId]: parsed.content ?? created.contents[created.newDocId] ?? `# ${parsed.title}\n\n`,
+      };
+      await persistDocumentationSlotState({
+        getS3Client,
+        storage,
+        previousManifest: manifest,
+        nextManifest: created.manifest,
+        contents: nextContents,
+      });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          docId: created.newDocId,
+          relativePath: created.manifest.docs[created.newDocId]?.relativePath,
+        }, null, 2),
+        toolMessage: `Created documentation page ${parsed.title}.`,
+      };
+    }
+
+    case "update_documentation_page": {
+      const parsed = parseToolArgs<{ slotPath: string[]; docId: string; content: string }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-documentation-viewer");
+      const slotConfig: ModuleConfig = {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      };
+      const { storage, manifest } = await loadDocumentationSlotState(getS3Client, slotConfig);
+      if (!manifest.docs[parsed.docId]) {
+        throw new Error(`Documentation page not found: ${parsed.docId}`);
+      }
+      const s3 = await getS3Client(storage.bucket);
+      await writeTextObject(s3, storage.bucket, getDocKey(storage, manifest.docs[parsed.docId].relativePath), parsed.content, "text/markdown");
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          docId: parsed.docId,
+        }, null, 2),
+        toolMessage: `Updated documentation page ${parsed.docId}.`,
+      };
+    }
+
+    case "rename_documentation_page": {
+      const parsed = parseToolArgs<{ slotPath: string[]; docId: string; title: string }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-documentation-viewer");
+      const slotConfig: ModuleConfig = {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      };
+      const { storage, manifest, contents } = await loadDocumentationSlotState(getS3Client, slotConfig);
+      if (!manifest.docs[parsed.docId]) {
+        throw new Error(`Documentation page not found: ${parsed.docId}`);
+      }
+      const nextManifest = renameDoc(manifest, parsed.docId, parsed.title);
+      await persistDocumentationSlotState({
+        getS3Client,
+        storage,
+        previousManifest: manifest,
+        nextManifest,
+        contents,
+      });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          docId: parsed.docId,
+          title: parsed.title,
+        }, null, 2),
+        toolMessage: `Renamed documentation page ${parsed.docId}.`,
+      };
+    }
+
+    case "move_documentation_page": {
+      const parsed = parseToolArgs<{ slotPath: string[]; docId: string; direction: MoveDirection }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-documentation-viewer");
+      const slotConfig: ModuleConfig = {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      };
+      const { storage, manifest, contents } = await loadDocumentationSlotState(getS3Client, slotConfig);
+      if (!manifest.docs[parsed.docId]) {
+        throw new Error(`Documentation page not found: ${parsed.docId}`);
+      }
+      const nextManifest = moveDoc(manifest, parsed.docId, parsed.direction);
+      await persistDocumentationSlotState({
+        getS3Client,
+        storage,
+        previousManifest: manifest,
+        nextManifest,
+        contents,
+      });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          docId: parsed.docId,
+          direction: parsed.direction,
+        }, null, 2),
+        toolMessage: `Moved documentation page ${parsed.docId} ${parsed.direction}.`,
+      };
+    }
+
+    case "delete_documentation_page": {
+      const parsed = parseToolArgs<{ slotPath: string[]; docId: string }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-documentation-viewer");
+      const slotConfig: ModuleConfig = {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      };
+      const { storage, manifest, contents } = await loadDocumentationSlotState(getS3Client, slotConfig);
+      if (!manifest.docs[parsed.docId]) {
+        throw new Error(`Documentation page not found: ${parsed.docId}`);
+      }
+      const removed = removeDoc(manifest, contents, parsed.docId);
+      await persistDocumentationSlotState({
+        getS3Client,
+        storage,
+        previousManifest: manifest,
+        nextManifest: removed.manifest,
+        contents: removed.contents,
+      });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          docId: parsed.docId,
+          nextSelectedId: removed.nextSelectedId,
+        }, null, 2),
+        toolMessage: `Deleted documentation page ${parsed.docId}.`,
+      };
+    }
+
     case "upsert_slot": {
       const parsed = parseToolArgs<GenericSlotToolArgs>(toolCall.arguments);
       const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
@@ -2266,17 +3167,26 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }, [chatSessionKey]);
 
   useEffect(() => {
-    const storedUrl = safeReadLocalStorage(bridgeUrlKey) || bridgeDefaults.url || "";
-    const storedToken = safeReadLocalStorage(bridgeTokenKey) || bridgeDefaults.token || "";
+    const storedUrl = safeReadLocalStorage(bridgeUrlKey);
+    const storedToken = safeReadLocalStorage(bridgeTokenKey);
     const storedWorkspaceRoot = safeReadLocalStorage(bridgeWorkspaceRootKey) || "";
     const storedEnabled = safeReadLocalStorage(bridgeEnabledKey) === "true";
+    const resolvedUrl = bridgeDefaults.url || storedUrl || "";
+    const resolvedToken = bridgeDefaults.token || storedToken || "";
     setBridgeUrl(storedUrl);
-    setBridgeToken(storedToken);
+    setBridgeUrl(resolvedUrl);
+    setBridgeToken(resolvedToken);
     setLocalRuntimeEnabled(storedEnabled);
     setBridgeHealth(null);
     setBridgeWorkspaceRoot(storedWorkspaceRoot);
-    setDraftBridgeUrl(storedUrl);
-    setDraftBridgeToken(storedToken);
+    setDraftBridgeUrl(resolvedUrl);
+    setDraftBridgeToken(resolvedToken);
+    if (bridgeDefaults.url) {
+      safeWriteLocalStorage(bridgeUrlKey, bridgeDefaults.url);
+    }
+    if (bridgeDefaults.token) {
+      safeWriteLocalStorage(bridgeTokenKey, bridgeDefaults.token);
+    }
   }, [bridgeDefaults, bridgeEnabledKey, bridgeTokenKey, bridgeUrlKey, bridgeWorkspaceRootKey]);
 
   useEffect(() => {
@@ -2343,11 +3253,12 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         name: operation,
         arguments: JSON.stringify(params),
       },
-      config,
-      projectId,
-      configBucket,
-      configPath,
-      getS3Client,
+          config,
+          projectId,
+          configBucket,
+          configPath,
+          userEmail: user?.email?.toLowerCase(),
+          getS3Client,
       getDdbClient,
       assetsTable,
       loadedResources: resources,

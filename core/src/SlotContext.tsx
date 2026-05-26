@@ -8,6 +8,7 @@ import { createContext } from "react";
  */
 export type SlotContextValue = {
   slotId: string;
+  slotPath: string[];
   updateSlotMeta: (newMeta: Record<string, unknown>) => Promise<void>;
   updateSlotChildren: (children: import("./types.ts").ChildSlot[]) => Promise<void>;
 };

@@ -20,8 +20,15 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
   const registerResources = useRegisterResources();
   const { editMode } = useEditMode();
   const parentSlotCtx = useContext(SlotContext); // non-null when this SlotContainer is itself nested
+  const slotPath = useMemo(
+    () => [...(parentSlotCtx?.slotPath ?? []), slot.slotId],
+    [parentSlotCtx?.slotPath, slot.slotId]
+  );
   const [showPicker, setShowPicker] = useState(false);
   const [swapError, setSwapError] = useState<string | undefined>();
+  const [isFocused, setIsFocused] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const pendingFocusKey = "auth-shell:pending-slot-focus";
 
   const slotConfig: ModuleConfig = {
     id: slot.slotId,
@@ -153,12 +160,54 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
     </React.Suspense>
   );
 
-  const slotContextValue = { slotId: slot.slotId, updateSlotMeta, updateSlotChildren };
+  React.useEffect(() => {
+    let timer: number | undefined;
+    const applyFocus = () => {
+      wrapperRef.current?.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+      setIsFocused(true);
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(() => setIsFocused(false), 2200);
+    };
+    const handler = (event: Event) => {
+      const custom = event as CustomEvent<{ slotPath?: string[] }>;
+      const targetPath = custom.detail?.slotPath ?? [];
+      if (targetPath.join("/") !== slotPath.join("/")) return;
+      applyFocus();
+    };
+
+    try {
+      const pending = window.sessionStorage.getItem(pendingFocusKey);
+      if (pending === slotPath.join("/")) {
+        window.sessionStorage.removeItem(pendingFocusKey);
+        window.setTimeout(() => applyFocus(), 60);
+      }
+    } catch {
+      // ignore storage issues
+    }
+
+    window.addEventListener("shell:focus-slot", handler as EventListener);
+    return () => {
+      if (timer) window.clearTimeout(timer);
+      window.removeEventListener("shell:focus-slot", handler as EventListener);
+    };
+  }, [slotPath]);
+
+  const wrapperStyle: React.CSSProperties = {
+    position: "relative",
+    height: "100%",
+    minHeight: 0,
+    outline: editMode ? "1px dashed #3b82f6" : isFocused ? "2px solid #14b8a6" : "none",
+    outlineOffset: isFocused ? 2 : 0,
+    boxShadow: isFocused ? "0 0 0 3px rgba(20,184,166,0.28)" : undefined,
+    transition: "outline-color 180ms ease, box-shadow 180ms ease",
+  };
+
+  const slotContextValue = { slotId: slot.slotId, slotPath, updateSlotMeta, updateSlotChildren };
 
   if (editMode) {
     return (
       <SlotContext value={slotContextValue}>
-        <div style={{ position: "relative", outline: "1px dashed #3b82f6", height: "100%" }}>
+        <div ref={wrapperRef} data-slot-path={slotPath.join("/")} style={wrapperStyle}>
           {content}
           <div style={{ position: "absolute", top: 4, right: 4, display: "flex", gap: 4, zIndex: 10 }}>
             <button
@@ -211,7 +260,9 @@ export function SlotContainer({ slot, parentConfig, onSlotUpdated, onSlotRemoved
 
   return (
     <SlotContext value={slotContextValue}>
-      {content}
+      <div ref={wrapperRef} data-slot-path={slotPath.join("/")} style={wrapperStyle}>
+        {content}
+      </div>
     </SlotContext>
   );
 }
