@@ -308,7 +308,7 @@ const DEFAULT_PROMPT = [
   "Use the provided workspace tools whenever project structure, assets, resources, or modules are relevant.",
   "By default, treat 'the app', 'the webapp', 'app data', 'documentation here', and similar phrases as referring to the active project configuration, project assets, and registered resources inside the web app.",
   "Prefer project assets, registered resources, and root-config information before searching the local bridge workspace unless the user explicitly says workspace, local files, repo, filesystem, or disk, or recent conversation is clearly about local workspace operations.",
-  "Prefer module-native tools for task tracker and documentation data when they are available instead of editing their backing files indirectly.",
+  "Prefer module-native tools for task tracker, documentation, markdown, document-viewer, links, and webview data when they are available instead of editing their backing files indirectly.",
   "Use shell commands only when no better dedicated tool is available, and pay attention to command failures.",
   "Prefer the managed Python tools for parsing, transformations, text extraction, and small file-oriented programs instead of shell-embedded Python.",
   "Only install Python packages through the dedicated dependency installer, and only when a missing dependency blocks the task.",
@@ -565,6 +565,168 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
       },
       required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_markdown_slot",
+    description: "Read the current markdown-viewer slot content, including its file-set manifest and truncated file contents.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        maxCharsPerFile: { type: "integer", minimum: 200, maximum: 50000 },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "replace_markdown_slot_content",
+    description: "Replace a markdown-viewer slot's backing file set in one operation by creating a fresh asset version and rewiring the slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        title: { type: "string" },
+        entryPath: { type: "string" },
+        files: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              content: { type: "string" },
+              mimeType: { type: "string" },
+            },
+            required: ["path", "content"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotPath", "entryPath", "files"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_links_slot",
+    description: "Create a links module slot with an initial set of links.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        links: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              text: { type: "string" },
+              url: { type: "string" },
+            },
+            required: ["text", "url"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotId", "title", "links"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "set_links_slot_items",
+    description: "Replace the configured links inside a links module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        links: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              text: { type: "string" },
+              url: { type: "string" },
+            },
+            required: ["text", "url"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotPath", "links"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_webview_slot",
+    description: "Create a webview slot with an initial URL.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        url: { type: "string" },
+      },
+      required: ["slotId", "title", "url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "set_webview_url",
+    description: "Update the URL inside a webview slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        url: { type: "string" },
+      },
+      required: ["slotPath", "url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "replace_document_viewer_asset",
+    description: "Replace the configured document in a document-viewer slot using either an existing asset or a local workspace file import.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        assetId: { type: "string" },
+        workspacePath: { type: "string" },
+        filename: { type: "string" },
+        label: { type: "string" },
+      },
+      required: ["slotPath"],
       additionalProperties: false,
     },
   },
@@ -1316,6 +1478,12 @@ function guessMimeType(filename: string, fallback = "application/octet-stream"):
   return fallback;
 }
 
+function normalizeExternalUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
 function arrayBufferToBase64(bytes: Uint8Array): string {
   let binary = "";
   const chunkSize = 0x8000;
@@ -1376,6 +1544,16 @@ async function writeJsonObject(
     ContentType: "application/json",
     CacheControl: "no-store",
   }));
+}
+
+async function readTextObject(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  bucket: string,
+  key: string,
+): Promise<string> {
+  const s3 = await getS3Client(bucket);
+  const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  return response.Body!.transformToString("utf-8");
 }
 
 function getTaskTrackerStorage(slotConfig: ModuleConfig, configBucket: string, configPath: string, projectId: string) {
@@ -1648,6 +1826,83 @@ async function createMarkdownFileSetAsset(args: {
     prefix: filesPrefix,
     rootKey: `${filesPrefix}/${args.entryPath}`,
     fileCount: args.files.length,
+  };
+}
+
+async function readMarkdownSlotState(args: {
+  getS3Client: ReturnType<typeof useAwsS3Client>;
+  slot: ChildSlot;
+  configBucket: string;
+  maxCharsPerFile?: number;
+}) {
+  const meta = (args.slot.meta ?? {}) as Record<string, unknown>;
+  const bucket = typeof meta["bucket"] === "string" && meta["bucket"]
+    ? meta["bucket"]
+    : args.configBucket;
+  const rootKey = typeof meta["rootKey"] === "string" ? meta["rootKey"] : "";
+  const manifestKey = typeof meta["manifestKey"] === "string" ? meta["manifestKey"] : "";
+  const assetId = typeof meta["assetId"] === "string" ? meta["assetId"] : undefined;
+  const versionId = typeof meta["versionId"] === "string" ? meta["versionId"] : undefined;
+  const maxCharsPerFile = Math.max(200, Math.min(args.maxCharsPerFile ?? 12000, 50000));
+
+  if (!rootKey) {
+    throw new Error(`Markdown slot ${args.slot.slotId} does not have a rootKey configured.`);
+  }
+
+  const files: Array<{
+    path: string;
+    key: string;
+    mimeType?: string;
+    assetId?: string;
+    versionId?: string;
+    content: string;
+    contentPreview: string;
+  }> = [];
+
+  let entryPath = basename(rootKey);
+  let prefix = dirnamePath(rootKey);
+
+  if (manifestKey) {
+    const manifest = JSON.parse(await readTextObject(args.getS3Client, bucket, manifestKey)) as {
+      entryPath?: string;
+      files?: Array<{ path?: string; key?: string; mimeType?: string; assetId?: string; versionId?: string }>;
+    };
+    entryPath = manifest.entryPath || entryPath;
+    if (Array.isArray(manifest.files)) {
+      for (const file of manifest.files) {
+        if (!file?.path || !file?.key) continue;
+        const content = await readTextObject(args.getS3Client, bucket, file.key);
+        files.push({
+          path: file.path,
+          key: file.key,
+          mimeType: file.mimeType,
+          assetId: file.assetId,
+          versionId: file.versionId,
+          content: content.slice(0, maxCharsPerFile),
+          contentPreview: content.slice(0, 600),
+        });
+      }
+    }
+  } else {
+    const content = await readTextObject(args.getS3Client, bucket, rootKey);
+    files.push({
+      path: basename(rootKey),
+      key: rootKey,
+      mimeType: guessMimeType(rootKey, "text/plain"),
+      content: content.slice(0, maxCharsPerFile),
+      contentPreview: content.slice(0, 600),
+    });
+  }
+
+  return {
+    bucket,
+    prefix,
+    rootKey,
+    manifestKey: manifestKey || undefined,
+    assetId,
+    versionId,
+    entryPath,
+    files,
   };
 }
 
@@ -2694,6 +2949,334 @@ async function executeTool(args: {
           pagesPrefix: storage.pagesPrefix,
         }, null, 2),
         toolMessage: `Created documentation slot ${[...parentPath, parsed.slotId].join(" / ")}${createdDocIds.length ? ` with ${createdDocIds.length} starter page${createdDocIds.length === 1 ? "" : "s"}` : ""}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "read_markdown_slot": {
+      const parsed = parseToolArgs<{ slotPath: string[]; maxCharsPerFile?: number }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-markdown-viewer");
+      const state = await readMarkdownSlotState({
+        getS3Client,
+        slot,
+        configBucket,
+        maxCharsPerFile: parsed.maxCharsPerFile,
+      });
+      return {
+        output: JSON.stringify({
+          slotPath: parsed.slotPath,
+          ...state,
+        }, null, 2),
+        toolMessage: `Read markdown slot ${parsed.slotPath.join(" / ")}.`,
+      };
+    }
+
+    case "replace_markdown_slot_content": {
+      const parsed = parseToolArgs<{
+        slotPath: string[];
+        title?: string;
+        entryPath: string;
+        files: MarkdownFileInput[];
+      }>(toolCall.arguments);
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-markdown-viewer");
+      const title = parsed.title?.trim()
+        || (typeof slot.meta?.["title"] === "string" ? slot.meta["title"] as string : "")
+        || (typeof slot.meta?.["tabName"] === "string" ? slot.meta["tabName"] as string : "")
+        || slot.slotId;
+      const created = await createMarkdownFileSetAsset({
+        getS3Client,
+        getDdbClient,
+        assetsTable,
+        projectId,
+        bucket: configBucket,
+        label: title,
+        entryPath: parsed.entryPath,
+        files: parsed.files,
+        moduleInstanceId: slot.slotId,
+      });
+      const nextMeta = {
+        ...(slot.meta ?? {}),
+        title,
+        tabName: title,
+        prefix: created.prefix,
+        rootKey: created.rootKey,
+        bucket: created.bucket,
+        assetId: created.assetId,
+        versionId: created.versionId,
+        manifestKey: created.manifestKey,
+      };
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parsed.slotPath.slice(0, -1),
+          slot: {
+            ...slot,
+            meta: nextMeta,
+          },
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          assetId: created.assetId,
+          versionId: created.versionId,
+          rootKey: created.rootKey,
+        }, null, 2),
+        toolMessage: `Replaced markdown content for ${parsed.slotPath.join(" / ")}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "create_links_slot": {
+      const parsed = parseToolArgs<{
+        parentSlotPath?: string[];
+        slotId: string;
+        title: string;
+        links: Array<{ text: string; url: string }>;
+      }>(toolCall.arguments);
+      const links = parsed.links
+        .map((link) => ({
+          text: link.text.trim(),
+          url: normalizeExternalUrl(link.url),
+        }))
+        .filter((link) => link.text && link.url);
+      if (!links.length) throw new Error("At least one valid link is required.");
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const entry = findModuleEntry(registryEntries, "modules/links");
+      if (!entry) throw new Error("Published module not found: modules/links");
+      const parentPath = parsed.parentSlotPath ?? [];
+      const nextSlot: ChildSlot = {
+        slotId: parsed.slotId,
+        app: { bucket: entry.bundleBucket, key: entry.bundlePath },
+        meta: {
+          title: parsed.title,
+          links,
+        },
+      };
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parentPath,
+          slot: nextSlot,
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: [...parentPath, parsed.slotId],
+          links,
+        }, null, 2),
+        toolMessage: `Created links slot ${[...parentPath, parsed.slotId].join(" / ")} with ${links.length} link${links.length === 1 ? "" : "s"}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "set_links_slot_items": {
+      const parsed = parseToolArgs<{
+        slotPath: string[];
+        links: Array<{ text: string; url: string }>;
+      }>(toolCall.arguments);
+      const links = parsed.links
+        .map((link) => ({
+          text: link.text.trim(),
+          url: normalizeExternalUrl(link.url),
+        }))
+        .filter((link) => link.text && link.url);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-links");
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parsed.slotPath.slice(0, -1),
+          slot: {
+            ...slot,
+            meta: {
+              ...(slot.meta ?? {}),
+              links,
+            },
+          },
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          links,
+        }, null, 2),
+        toolMessage: `Updated ${links.length} link${links.length === 1 ? "" : "s"} in ${parsed.slotPath.join(" / ")}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "create_webview_slot": {
+      const parsed = parseToolArgs<{
+        parentSlotPath?: string[];
+        slotId: string;
+        title: string;
+        url: string;
+      }>(toolCall.arguments);
+      const url = normalizeExternalUrl(parsed.url);
+      if (!url) throw new Error("A valid URL is required.");
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const entry = findModuleEntry(registryEntries, "modules/webview");
+      if (!entry) throw new Error("Published module not found: modules/webview");
+      const parentPath = parsed.parentSlotPath ?? [];
+      const nextSlot: ChildSlot = {
+        slotId: parsed.slotId,
+        app: { bucket: entry.bundleBucket, key: entry.bundlePath },
+        meta: {
+          title: parsed.title,
+          url,
+        },
+      };
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parentPath,
+          slot: nextSlot,
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: [...parentPath, parsed.slotId],
+          url,
+        }, null, 2),
+        toolMessage: `Created webview slot ${[...parentPath, parsed.slotId].join(" / ")}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "set_webview_url": {
+      const parsed = parseToolArgs<{ slotPath: string[]; url: string }>(toolCall.arguments);
+      const url = normalizeExternalUrl(parsed.url);
+      if (!url) throw new Error("A valid URL is required.");
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-webview");
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parsed.slotPath.slice(0, -1),
+          slot: {
+            ...slot,
+            meta: {
+              ...(slot.meta ?? {}),
+              url,
+            },
+          },
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          url,
+        }, null, 2),
+        toolMessage: `Updated webview URL for ${parsed.slotPath.join(" / ")}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "replace_document_viewer_asset": {
+      const parsed = parseToolArgs<{
+        slotPath: string[];
+        assetId?: string;
+        workspacePath?: string;
+        filename?: string;
+        label?: string;
+      }>(toolCall.arguments);
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      if (!parsed.assetId && !parsed.workspacePath) {
+        throw new Error("Provide either assetId or workspacePath.");
+      }
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-document-viewer");
+
+      let docMeta: { key: string; filename: string; bucket?: string; assetId?: string; versionId?: string };
+      if (parsed.assetId) {
+        const ddb = await getDdbClient();
+        const assets = await listAssets({ ddb, tableName: assetsTable, projectId });
+        const asset = assets.find((item) => item.assetId === parsed.assetId);
+        if (!asset) throw new Error(`Project asset not found: ${parsed.assetId}`);
+        const version = getCurrentAssetVersion(asset);
+        docMeta = {
+          key: version.key,
+          filename: asset.label || basename(version.key),
+          bucket: version.bucket,
+          assetId: asset.assetId,
+          versionId: version.versionId,
+        };
+      } else {
+        if (!bridge) throw new Error("Local agent bridge is not configured.");
+        const workspaceFile = await callBridge<{ content: string }>(bridge, "read_workspace_file", {
+          path: parsed.workspacePath,
+          encoding: "base64",
+        });
+        const bytes = Uint8Array.from(atob(workspaceFile.content), (ch) => ch.charCodeAt(0));
+        const filename = parsed.filename ?? basename(parsed.workspacePath!);
+        const created = await createProjectAssetFromBytes({
+          getS3Client,
+          getDdbClient,
+          assetsTable,
+          projectId,
+          bucket: configBucket,
+          label: parsed.label ?? filename,
+          filename,
+          bytes,
+          mimeType: guessMimeType(filename, "application/pdf"),
+          meta: {
+            kind: "file",
+            path: filename,
+            sourceWorkspacePath: parsed.workspacePath,
+            moduleInstanceId: slot.slotId,
+            moduleType: "module-document-viewer",
+          },
+        });
+        docMeta = {
+          key: created.key,
+          filename,
+          bucket: created.bucket,
+          assetId: created.assetId,
+          versionId: created.versionId,
+        };
+      }
+
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parsed.slotPath.slice(0, -1),
+          slot: {
+            ...slot,
+            meta: {
+              ...(slot.meta ?? {}),
+              doc: docMeta,
+            },
+          },
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          doc: docMeta,
+        }, null, 2),
+        toolMessage: `Replaced document for ${parsed.slotPath.join(" / ")}.`,
         mutatedWorkspace: true,
       };
     }
