@@ -16,6 +16,7 @@
     "modules/documentation-viewer",
     "modules/links",
     "modules/task-tracker",
+    "modules/work-manager",
     "modules/kicad-board-viewer",
     "modules/serial-display",
     "modules/shell-core",

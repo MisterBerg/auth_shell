@@ -8,13 +8,14 @@
     "modules/oauth-badge": "5e8bce85e744ee2851a02e55cfdfe5bba336de6605a1abbae9824a4da069cd64",
     "modules/markdown-viewer": "0fa022d9e3e8970bd6c58d75dabf1f48e60efdbc32b457a456216fa2048ddaf2",
     "modules/document-viewer": "1749d8912f4307158c35675ffa1de71596acddc046592d9d758f5c1952b79157",
-    "modules/documentation-viewer": "40a2c18852ff97b263f3511f22e6c65a27f1443090e2ccf9402c4018d85cd8b1",
+    "modules/documentation-viewer": "40b2ab295f22abf91a95dfea5e6bad0e5de8397d8ffae7884b5ebfea725a6a3d",
     "modules/links": "86c90a66d75a1cc6029dd6a12fc6adac234c9a5fb2e2f9dac1cfc8a92312f3a8",
     "modules/serial-display": "adac340154209797b5c4fe7c84cf6bffe8a7f81e7cf574d08873c593e1fa36c3",
     "modules/task-tracker": "0f787b3a81dd09e34cf247bf8e8e977fcf3a032379ab6201c56892a96b2330e3",
     "modules/kicad-board-viewer": "8182c85010f795f91d193737d0d4cf2cb1233c2c79f4e8d67d79a72d1795b20e",
     "modules/shell-core": "671d93c5dc40471d18ccfa799f4986bbc9eb6bcd1b7fae47a976756cc56a71ae",
     "apps/landing": "fa9296e0e37ad774a89efb3739c07b3c7c899290c19cc155aef5b6549ab0b0f8",
-    "modules/chat-codex": "74cc7fa127ece7307290475d0d1ccb132ddb12d21b464bf0685bf6c3d71b4fe4"
+    "modules/chat-codex": "74cc7fa127ece7307290475d0d1ccb132ddb12d21b464bf0685bf6c3d71b4fe4",
+    "modules/work-manager": "f06b15701607e608a150355aea2752f2b401e2b9a7104b53c1ed150cd675f051"
   }
 }
