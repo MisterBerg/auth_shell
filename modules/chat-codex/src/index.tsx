@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent } from "react";
-import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type {
@@ -297,6 +297,56 @@ type TaskStore = {
   tasks: TaskRecord[];
 };
 
+type WorkKind = "task" | "event" | "task-event" | "milestone";
+type WorkStatus = "open" | "in-progress" | "blocked" | "done" | "archived";
+type WorkPriority = "low" | "normal" | "high" | "urgent";
+
+type WorkAttachment = {
+  id: string;
+  name: string;
+  bucket: string;
+  key: string;
+  size: number;
+  contentType?: string;
+  uploadedAt: string;
+  uploadedBy?: string;
+};
+
+type WorkItem = {
+  id: string;
+  kind: WorkKind;
+  title: string;
+  description: string;
+  notes: string;
+  status: WorkStatus;
+  priority: WorkPriority;
+  assignee?: string;
+  tags: string[];
+  repeatable: boolean;
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  attachments: WorkAttachment[];
+  startAt?: string;
+  durationDays?: number;
+  allDay: boolean;
+  location?: string;
+  progress: number;
+  dependencies: string[];
+  lane?: string;
+};
+
+type WorkStore = {
+  version: 1;
+  projectId: string;
+  items: WorkItem[];
+};
+
+type WorkItemInput = Partial<WorkItem> & {
+  title: string;
+  dependencyTitles?: string[];
+};
+
 const DEFAULT_MODEL = "gpt-5.2-codex";
 const DEFAULT_TITLE = "Codex Chat";
 const TOOL_ITERATION_LIMIT = 20;
@@ -318,6 +368,56 @@ const DEFAULT_PROMPT = [
   "When changing the workspace, explain what you changed and why.",
   "Do not claim a change happened unless the tool call succeeded.",
 ].join(" ");
+
+const WORK_ITEM_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    kind: { type: "string", enum: ["task", "event", "task-event", "milestone"] },
+    title: { type: "string" },
+    description: { type: "string" },
+    notes: { type: "string" },
+    status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
+    priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+    assignee: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    repeatable: { type: "boolean" },
+    startAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+    durationDays: { type: "integer", minimum: 0 },
+    allDay: { type: "boolean" },
+    location: { type: "string" },
+    progress: { type: "number", minimum: 0, maximum: 100 },
+    dependencies: { type: "array", items: { type: "string" }, description: "Work item ids this item depends on." },
+    dependencyTitles: { type: "array", items: { type: "string" }, description: "Dependency titles to resolve to ids during this operation." },
+    lane: { type: "string" },
+  },
+  required: ["title"],
+  additionalProperties: false,
+} as const;
+
+const WORK_ITEM_PATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: { type: "string", enum: ["task", "event", "task-event", "milestone"] },
+    title: { type: "string" },
+    description: { type: "string" },
+    notes: { type: "string" },
+    status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
+    priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+    assignee: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    repeatable: { type: "boolean" },
+    startAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
+    durationDays: { type: "integer", minimum: 0 },
+    allDay: { type: "boolean" },
+    location: { type: "string" },
+    progress: { type: "number", minimum: 0, maximum: 100 },
+    dependencies: { type: "array", items: { type: "string" } },
+    dependencyTitles: { type: "array", items: { type: "string" } },
+    lane: { type: "string" },
+  },
+  additionalProperties: false,
+} as const;
 
 const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
@@ -565,6 +665,144 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
       },
       required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_work_manager_slot",
+    description: "Create a work-manager slot and optionally seed it with schedule items, milestones, dependencies, lanes, dates, and progress.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        items: {
+          type: "array",
+          items: WORK_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_work_manager_items",
+    description: "List work items from a work-manager module slot by its full slot path. Supports text filtering over titles, notes, tags, lanes, assignees, and dependencies.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        query: { type: "string" },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_work_manager_items",
+    description: "Create one or more work-manager schedule items. Dependencies can be provided by id or by title.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        items: {
+          type: "array",
+          minItems: 1,
+          items: WORK_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["slotPath", "items"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_work_manager_item",
+    description: "Update a work-manager item by id. Dependencies can be provided by id or by title.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        itemId: { type: "string" },
+        patch: WORK_ITEM_PATCH_SCHEMA,
+      },
+      required: ["slotPath", "itemId", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "delete_work_manager_item",
+    description: "Delete a work-manager item by id and remove that id from other items' dependency lists. Set deleteAttachments to also delete attached S3 objects.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        itemId: { type: "string" },
+        deleteAttachments: { type: "boolean" },
+      },
+      required: ["slotPath", "itemId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "attach_project_asset_to_work_item",
+    description: "Attach an existing central project asset version to a work-manager item.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        itemId: { type: "string" },
+        assetId: { type: "string" },
+      },
+      required: ["slotPath", "itemId", "assetId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "replace_work_manager_items",
+    description: "Replace or upsert the complete work-manager schedule from structured items. Use replaceExisting=true only when intentionally replacing the whole schedule.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        replaceExisting: { type: "boolean" },
+        items: {
+          type: "array",
+          items: WORK_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["slotPath", "items"],
       additionalProperties: false,
     },
   },
@@ -1550,6 +1788,11 @@ function makeAttachmentId(): string {
   return cryptoId ? `att-${cryptoId}` : `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function makeWorkId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `work-${cryptoId}` : `work-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function dirnamePath(path: string): string {
   const idx = path.lastIndexOf("/");
   return idx >= 0 ? path.slice(0, idx) : "";
@@ -1651,6 +1894,122 @@ async function saveTaskTrackerStore(
   store: TaskStore,
 ): Promise<void> {
   await writeJsonObject(getS3Client, storage.bucket, storage.tasksKey, store);
+}
+
+function getWorkManagerStorage(slotConfig: ModuleConfig, configBucket: string, configPath: string, projectId: string) {
+  const projectDir = dirnamePath(configPath);
+  const basePrefix = projectDir ? `${projectDir}/work/${slotConfig.id}` : `work/${slotConfig.id}`;
+  return {
+    bucket: configBucket,
+    projectId,
+    basePrefix,
+    storeKey: `${basePrefix}/store.json`,
+    attachmentsPrefix: `${basePrefix}/attachments`,
+  };
+}
+
+function normalizeWorkDate(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new Error("startAt must be a string.");
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? new Date(`${value}T00:00:00`)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error(`Invalid startAt date: ${value}`);
+  return date.toISOString();
+}
+
+function normalizeWorkItem(args: {
+  input: WorkItemInput;
+  existing?: WorkItem;
+  userEmail?: string;
+  titleToId: Map<string, string>;
+}): WorkItem {
+  const at = nowIso();
+  const kind = args.input.kind ?? args.existing?.kind ?? "task";
+  const hasDependencyPatch = args.input.dependencies !== undefined || args.input.dependencyTitles !== undefined;
+  const rawDependencies = [
+    ...(hasDependencyPatch ? (args.input.dependencies ?? []) : (args.existing?.dependencies ?? [])),
+    ...(args.input.dependencyTitles ?? []).map((title) => {
+      const id = args.titleToId.get(title.trim().toLowerCase());
+      if (!id) throw new Error(`Dependency title not found: ${title}`);
+      return id;
+    }),
+  ];
+  const id = args.input.id ?? args.existing?.id ?? makeWorkId();
+  const dependencies = [...new Set(rawDependencies.filter((depId) => depId && depId !== id))];
+  const startAt = "startAt" in args.input
+    ? normalizeWorkDate(args.input.startAt)
+    : args.existing?.startAt;
+  const durationDays = kind === "milestone"
+    ? 0
+    : Math.max(1, Number(args.input.durationDays ?? args.existing?.durationDays ?? 1));
+  return {
+    id,
+    kind,
+    title: args.input.title ?? args.existing?.title ?? "New task",
+    description: args.input.description ?? args.existing?.description ?? "",
+    notes: args.input.notes ?? args.existing?.notes ?? "",
+    status: args.input.status ?? args.existing?.status ?? "open",
+    priority: args.input.priority ?? args.existing?.priority ?? (kind === "milestone" ? "high" : "normal"),
+    assignee: args.input.assignee ?? args.existing?.assignee,
+    tags: args.input.tags ?? args.existing?.tags ?? [],
+    repeatable: args.input.repeatable ?? args.existing?.repeatable ?? false,
+    createdAt: args.existing?.createdAt ?? args.input.createdAt ?? at,
+    updatedAt: at,
+    createdBy: args.existing?.createdBy ?? args.input.createdBy ?? args.userEmail,
+    attachments: args.input.attachments ?? args.existing?.attachments ?? [],
+    startAt,
+    durationDays,
+    allDay: args.input.allDay ?? args.existing?.allDay ?? true,
+    location: args.input.location ?? args.existing?.location,
+    progress: Math.max(0, Math.min(100, Number(args.input.progress ?? args.existing?.progress ?? 0))),
+    dependencies,
+    lane: args.input.lane ?? args.existing?.lane ?? "",
+  };
+}
+
+function buildWorkTitleMap(existing: WorkItem[], inputs: WorkItemInput[]): Map<string, string> {
+  const titleToId = new Map<string, string>();
+  for (const item of existing) {
+    titleToId.set(item.title.trim().toLowerCase(), item.id);
+  }
+  for (const input of inputs) {
+    if (input.title?.trim()) {
+      titleToId.set(input.title.trim().toLowerCase(), input.id!);
+    }
+  }
+  return titleToId;
+}
+
+function prepareWorkInputs(inputs: WorkItemInput[]): WorkItemInput[] {
+  return inputs.map((input) => ({
+    ...input,
+    id: input.id ?? makeWorkId(),
+  }));
+}
+
+async function loadWorkManagerStore(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  slotConfig: ModuleConfig,
+  configBucket: string,
+  configPath: string,
+  projectId: string,
+): Promise<{ storage: ReturnType<typeof getWorkManagerStorage>; store: WorkStore }> {
+  const storage = getWorkManagerStorage(slotConfig, configBucket, configPath, projectId);
+  const store = await readOptionalJsonObject<WorkStore>(getS3Client, storage.bucket, storage.storeKey);
+  return {
+    storage,
+    store: store ?? { version: 1, projectId: storage.projectId, items: [] },
+  };
+}
+
+async function saveWorkManagerStore(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  storage: ReturnType<typeof getWorkManagerStorage>,
+  store: WorkStore,
+): Promise<void> {
+  await writeJsonObject(getS3Client, storage.bucket, storage.storeKey, store);
 }
 
 async function loadDocumentationSlotState(
@@ -3002,6 +3361,273 @@ async function executeTool(args: {
         }, null, 2),
         toolMessage: `Created documentation slot ${[...parentPath, parsed.slotId].join(" / ")}${createdDocIds.length ? ` with ${createdDocIds.length} starter page${createdDocIds.length === 1 ? "" : "s"}` : ""}.`,
         mutatedWorkspace: true,
+      };
+    }
+
+    case "create_work_manager_slot": {
+      const parsed = parseToolArgs<{
+        parentSlotPath?: string[];
+        slotId: string;
+        title: string;
+        items?: WorkItemInput[];
+      }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const entry = findModuleEntry(registryEntries, "modules/work-manager") ?? findModuleEntry(registryEntries, "module-work-manager");
+      if (!entry) throw new Error("Published module not found: module-work-manager");
+      const parentPath = parsed.parentSlotPath ?? [];
+      const nextSlot: ChildSlot = {
+        slotId: parsed.slotId,
+        app: { bucket: entry.bundleBucket, key: entry.bundlePath },
+        meta: {
+          title: parsed.title,
+          tabName: parsed.title,
+        },
+      };
+      const updatedRoot: ModuleConfig = {
+        ...context.rootConfig,
+        children: upsertSlotAtPath({
+          children: context.rootConfig.children,
+          parentSlotPath: parentPath,
+          slot: nextSlot,
+        }),
+      };
+      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
+
+      const slotConfig: ModuleConfig = { id: parsed.slotId, app: nextSlot.app, meta: nextSlot.meta };
+      const { storage } = await loadWorkManagerStore(getS3Client, slotConfig, configBucket, configPath, projectId);
+      const prepared = prepareWorkInputs(parsed.items ?? []);
+      const titleToId = buildWorkTitleMap([], prepared);
+      const items = prepared.map((input) => normalizeWorkItem({ input, userEmail, titleToId }));
+      await saveWorkManagerStore(getS3Client, storage, { version: 1, projectId, items });
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: [...parentPath, parsed.slotId],
+          moduleKey: nextSlot.app.key,
+          workStoreKey: storage.storeKey,
+          createdItemIds: items.map((item) => item.id),
+        }, null, 2),
+        toolMessage: `Created work-manager slot ${[...parentPath, parsed.slotId].join(" / ")} with ${items.length} item${items.length === 1 ? "" : "s"}.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "list_work_manager_items": {
+      const parsed = parseToolArgs<{ slotPath: string[]; query?: string }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-work-manager");
+      const { storage, store } = await loadWorkManagerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const itemsById = new Map(store.items.map((item) => [item.id, item]));
+      const items = store.items
+        .map((item) => ({
+          ...item,
+          dependencyTitles: item.dependencies.map((depId) => itemsById.get(depId)?.title ?? depId),
+        }))
+        .filter((item) => matchesQuery(JSON.stringify(item), parsed.query ?? ""));
+      return {
+        output: JSON.stringify({
+          slotPath: parsed.slotPath,
+          bucket: storage.bucket,
+          storeKey: storage.storeKey,
+          count: items.length,
+          totalCount: store.items.length,
+          items,
+        }, null, 2),
+        toolMessage: `Listed ${items.length} work-manager item${items.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "create_work_manager_items": {
+      const parsed = parseToolArgs<{ slotPath: string[]; items: WorkItemInput[] }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-work-manager");
+      const { storage, store } = await loadWorkManagerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const prepared = prepareWorkInputs(parsed.items);
+      const titleToId = buildWorkTitleMap(store.items, prepared);
+      const created = prepared.map((input) => normalizeWorkItem({ input, userEmail, titleToId }));
+      const nextStore: WorkStore = { ...store, items: [...created, ...store.items] };
+      await saveWorkManagerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          createdItemIds: created.map((item) => item.id),
+          itemCount: nextStore.items.length,
+        }, null, 2),
+        toolMessage: `Created ${created.length} work item${created.length === 1 ? "" : "s"} in ${parsed.slotPath.join(" / ")}.`,
+      };
+    }
+
+    case "update_work_manager_item": {
+      const parsed = parseToolArgs<{ slotPath: string[]; itemId: string; patch: Partial<WorkItemInput> }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-work-manager");
+      const { storage, store } = await loadWorkManagerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const existing = store.items.find((item) => item.id === parsed.itemId);
+      if (!existing) throw new Error(`Work item not found: ${parsed.itemId}`);
+      const input = { ...parsed.patch, id: existing.id, title: parsed.patch.title ?? existing.title } as WorkItemInput;
+      const titleToId = buildWorkTitleMap(store.items, [input]);
+      const updated = normalizeWorkItem({ input, existing, userEmail, titleToId });
+      const nextStore: WorkStore = {
+        ...store,
+        items: store.items.map((item) => item.id === parsed.itemId ? updated : item),
+      };
+      await saveWorkManagerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          item: updated,
+        }, null, 2),
+        toolMessage: `Updated work item ${parsed.itemId}.`,
+      };
+    }
+
+    case "delete_work_manager_item": {
+      const parsed = parseToolArgs<{ slotPath: string[]; itemId: string; deleteAttachments?: boolean }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-work-manager");
+      const { storage, store } = await loadWorkManagerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const existing = store.items.find((item) => item.id === parsed.itemId);
+      if (!existing) throw new Error(`Work item not found: ${parsed.itemId}`);
+      if (parsed.deleteAttachments) {
+        const s3 = await getS3Client(storage.bucket);
+        await Promise.all(existing.attachments.map((attachment) =>
+          s3.send(new DeleteObjectCommand({ Bucket: attachment.bucket, Key: attachment.key })).catch(() => undefined)
+        ));
+      }
+      const nextStore: WorkStore = {
+        ...store,
+        items: store.items
+          .filter((item) => item.id !== parsed.itemId)
+          .map((item) => ({ ...item, dependencies: item.dependencies.filter((depId) => depId !== parsed.itemId) })),
+      };
+      await saveWorkManagerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          itemId: parsed.itemId,
+          itemCount: nextStore.items.length,
+        }, null, 2),
+        toolMessage: `Deleted work item ${parsed.itemId}.`,
+      };
+    }
+
+    case "attach_project_asset_to_work_item": {
+      const parsed = parseToolArgs<{ slotPath: string[]; itemId: string; assetId: string }>(toolCall.arguments);
+      if (!assetsTable) throw new Error("Project asset table is not configured.");
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-work-manager");
+      const { storage, store } = await loadWorkManagerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const existing = store.items.find((item) => item.id === parsed.itemId);
+      if (!existing) throw new Error(`Work item not found: ${parsed.itemId}`);
+      const ddb = await getDdbClient();
+      const assets = await listAssets({ ddb, tableName: assetsTable, projectId });
+      const asset = assets.find((item) => item.assetId === parsed.assetId);
+      if (!asset) throw new Error(`Project asset not found: ${parsed.assetId}`);
+      const version = getCurrentAssetVersion(asset);
+      const attachment: WorkAttachment = {
+        id: makeAttachmentId(),
+        name: asset.label || basename(version.key),
+        bucket: version.bucket,
+        key: version.key,
+        size: version.sizeBytes ?? 0,
+        contentType: version.mimeType,
+        uploadedAt: nowIso(),
+        uploadedBy: userEmail,
+      };
+      const nextStore: WorkStore = {
+        ...store,
+        items: store.items.map((item) => (
+          item.id === parsed.itemId
+            ? { ...item, attachments: [...item.attachments, attachment], updatedAt: nowIso() }
+            : item
+        )),
+      };
+      await saveWorkManagerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          itemId: parsed.itemId,
+          attachment,
+        }, null, 2),
+        toolMessage: `Attached asset ${parsed.assetId} to work item ${parsed.itemId}.`,
+      };
+    }
+
+    case "replace_work_manager_items": {
+      const parsed = parseToolArgs<{ slotPath: string[]; replaceExisting?: boolean; items: WorkItemInput[] }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-work-manager");
+      const { storage, store } = await loadWorkManagerStore(getS3Client, {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      }, configBucket, configPath, projectId);
+      const baseItems = parsed.replaceExisting ? [] : store.items;
+      const prepared = parsed.items.map((input) => {
+        const existing = input.id
+          ? baseItems.find((item) => item.id === input.id)
+          : baseItems.find((item) => item.title.trim().toLowerCase() === input.title.trim().toLowerCase());
+        return { ...input, id: input.id ?? existing?.id ?? makeWorkId() };
+      });
+      const titleToId = buildWorkTitleMap(baseItems, prepared);
+      const updatedById = new Map<string, WorkItem>();
+      for (const input of prepared) {
+        const existing = baseItems.find((item) => item.id === input.id);
+        updatedById.set(input.id!, normalizeWorkItem({ input, existing, userEmail, titleToId }));
+      }
+      const nextItems = parsed.replaceExisting
+        ? prepared.map((input) => updatedById.get(input.id!)!)
+        : [
+            ...prepared.map((input) => updatedById.get(input.id!)!),
+            ...baseItems.filter((item) => !updatedById.has(item.id)),
+          ];
+      const nextStore: WorkStore = { ...store, items: nextItems };
+      await saveWorkManagerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({
+          status: "ok",
+          slotPath: parsed.slotPath,
+          replaceExisting: Boolean(parsed.replaceExisting),
+          itemCount: nextStore.items.length,
+          upsertedItemIds: prepared.map((item) => item.id),
+        }, null, 2),
+        toolMessage: `${parsed.replaceExisting ? "Replaced" : "Upserted"} ${prepared.length} work item${prepared.length === 1 ? "" : "s"} in ${parsed.slotPath.join(" / ")}.`,
       };
     }
 
