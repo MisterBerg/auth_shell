@@ -490,19 +490,30 @@ function chooseScaleMode(dayWidth: number, totalDays: number): ScaleMode {
   return "months";
 }
 
-function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom: number): string {
+function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom: number, includeLabels = false): string {
   const dayWidth = Math.max(3, Math.min(120, 28 * zoom));
   const scaleMode = chooseScaleMode(dayWidth, spec.dayCount);
-  const svgWidth = spec.dayCount * dayWidth + 20;
+  const chartWidth = spec.dayCount * dayWidth + 20;
+  const labelWidth = includeLabels ? Math.max(320, spec.labelWidth) : 0;
+  const svgWidth = labelWidth + chartWidth;
   const svgHeight = spec.headerHeight + spec.rows.length * spec.rowHeight + 20;
   const lines: string[] = [];
 
   lines.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}" role="img" aria-label="Work manager gantt chart">`);
   lines.push(`<rect width="${svgWidth}" height="${svgHeight}" fill="#0b1525"/>`);
+  if (includeLabels) {
+    lines.push(`<clipPath id="work-label-task-clip"><rect x="111" y="0" width="${labelWidth - 122}" height="${svgHeight}"/></clipPath>`);
+    lines.push(`<rect x="0" y="0" width="${labelWidth}" height="${svgHeight}" fill="#0d1a2e"/>`);
+    lines.push(`<rect x="0" y="0" width="${labelWidth}" height="${spec.headerHeight}" fill="#0d1a2e"/>`);
+    lines.push(`<text x="12" y="27" font-size="11" font-weight="700" fill="#9ca3af">GROUP</text>`);
+    lines.push(`<text x="122" y="27" font-size="11" font-weight="700" fill="#9ca3af">TASK</text>`);
+    lines.push(`<line x1="${labelWidth}" y1="0" x2="${labelWidth}" y2="${svgHeight}" stroke="#1a2a42" stroke-width="1"/>`);
+    lines.push(`<line x1="110" y1="0" x2="110" y2="${svgHeight}" stroke="#1a2a42" stroke-width="1"/>`);
+  }
 
   for (let i = 0; i < spec.dayCount; i += 1) {
     const date = addCalendarDays(spec.startDate, i);
-    const x = i * dayWidth;
+    const x = labelWidth + i * dayWidth;
     const weekend = date.getDay() === 0 || date.getDay() === 6;
     lines.push(`<rect x="${x}" y="0" width="${dayWidth}" height="${svgHeight}" fill="${weekend ? "#0d1a2e" : "#0b1525"}"/>`);
     lines.push(`<line x1="${x}" y1="0" x2="${x}" y2="${svgHeight}" stroke="#1a2a42" stroke-width="1"/>`);
@@ -510,7 +521,7 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
       lines.push(`<text x="${x + dayWidth / 2}" y="17" text-anchor="middle" font-size="10" fill="#9ca3af">${escapeXml(date.toLocaleDateString(undefined, { month: "short", day: "numeric" }))}</text>`);
     }
   }
-  lines.push(`<line x1="${spec.dayCount * dayWidth}" y1="0" x2="${spec.dayCount * dayWidth}" y2="${svgHeight}" stroke="#1a2a42" stroke-width="1"/>`);
+  lines.push(`<line x1="${labelWidth + spec.dayCount * dayWidth}" y1="0" x2="${labelWidth + spec.dayCount * dayWidth}" y2="${svgHeight}" stroke="#1a2a42" stroke-width="1"/>`);
 
   if (scaleMode !== "days") {
     let cursor = 0;
@@ -528,7 +539,7 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
         if (!same) break;
         span += 1;
       }
-      const x = cursor * dayWidth;
+      const x = labelWidth + cursor * dayWidth;
       lines.push(`<text x="${x + span * dayWidth / 2}" y="17" text-anchor="middle" font-size="10" fill="#9ca3af">${escapeXml(label)}</text>`);
       cursor += span;
     }
@@ -537,15 +548,23 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
   spec.rows.forEach((row, index) => {
     const y = spec.headerHeight + index * spec.rowHeight;
     const selected = row.item.id === selectedItemId;
-    const laneText = row.lane !== "Default" ? ` · ${row.lane}` : "";
+    const previous = spec.rows[index - 1];
+    const firstInGroup = !previous || previous.lane !== row.lane;
     const startOffset = calendarDaysBetween(spec.startDate, row.start);
     const duration = row.isMilestone ? 0 : Math.max(1, calendarDaysBetween(startOfDay(row.start), startOfDay(row.end)) + 1);
-    const barX = startOffset * dayWidth + 4;
+    const barX = labelWidth + startOffset * dayWidth + 4;
     const barY = y + 10;
     const barWidth = row.isMilestone ? 16 : Math.max(18, duration * dayWidth - 8);
     const barColor = kindColor(row.item.kind);
-    lines.push(`<rect x="0" y="${y}" width="${svgWidth}" height="${spec.rowHeight}" fill="${index % 2 === 0 ? "#0b1525" : "#0a1322"}"/>`);
-    if (selected) lines.push(`<rect x="0" y="${y}" width="${svgWidth}" height="${spec.rowHeight}" fill="rgba(59,130,246,0.12)"/>`);
+    lines.push(`<rect x="${labelWidth}" y="${y}" width="${chartWidth}" height="${spec.rowHeight}" fill="${index % 2 === 0 ? "#0b1525" : "#0a1322"}"/>`);
+    if (includeLabels) {
+      lines.push(`<rect x="0" y="${y}" width="${labelWidth}" height="${spec.rowHeight}" fill="${selected ? "rgba(59,130,246,0.12)" : index % 2 === 0 ? "#0b1525" : "#0a1322"}"/>`);
+      if (firstInGroup) lines.push(`<line x1="0" y1="${y}" x2="${labelWidth}" y2="${y}" stroke="#28415f" stroke-width="2"/>`);
+      lines.push(`<text x="12" y="${y + 25}" font-size="12" font-weight="700" fill="${firstInGroup ? "#cbd5e1" : "transparent"}">${firstInGroup ? escapeXml(row.lane) : ""}</text>`);
+      lines.push(`<text x="122" y="${y + 18}" font-size="13" font-weight="700" fill="#e5e7eb" clip-path="url(#work-label-task-clip)">${escapeXml(row.item.title)}</text>`);
+      lines.push(`<text x="122" y="${y + 34}" font-size="11" fill="#6b7280" clip-path="url(#work-label-task-clip)">${escapeXml(`${row.item.kind} · ${row.item.status}`)}</text>`);
+    }
+    if (selected) lines.push(`<rect x="${labelWidth}" y="${y}" width="${chartWidth}" height="${spec.rowHeight}" fill="rgba(59,130,246,0.12)"/>`);
     lines.push(`<line x1="0" y1="${y + spec.rowHeight}" x2="${svgWidth}" y2="${y + spec.rowHeight}" stroke="#1a2a42" stroke-width="1"/>`);
 
     if (row.isMilestone) {
@@ -562,13 +581,13 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
 
   const byId = new Map(spec.rows.map((row, index) => [row.item.id, { row, index }]));
   spec.rows.forEach((row, index) => {
-    const dependentStartX = calendarDaysBetween(spec.startDate, row.start) * dayWidth + 4;
+    const dependentStartX = labelWidth + calendarDaysBetween(spec.startDate, row.start) * dayWidth + 4;
     const dependentY = spec.headerHeight + index * spec.rowHeight + 20;
     row.item.dependencies.forEach((depId) => {
       const dependency = byId.get(depId);
       if (!dependency) return;
       const dependencyWidth = dependency.row.isMilestone ? 16 : Math.max(18, (calendarDaysBetween(startOfDay(dependency.row.start), startOfDay(dependency.row.end)) + 1) * dayWidth - 8);
-      const sourceX = calendarDaysBetween(spec.startDate, dependency.row.start) * dayWidth + 4 + dependencyWidth;
+      const sourceX = labelWidth + calendarDaysBetween(spec.startDate, dependency.row.start) * dayWidth + 4 + dependencyWidth;
       const sourceY = spec.headerHeight + dependency.index * spec.rowHeight + 20;
       const bendX = sourceX + 10;
       lines.push(`<path d="M ${sourceX} ${sourceY} L ${bendX} ${sourceY} L ${bendX} ${dependentY} L ${dependentStartX} ${dependentY}" fill="none" stroke="#93c5fd" stroke-width="1.5"/>`);
@@ -578,7 +597,7 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
 
   const todayOffset = calendarDaysBetween(spec.startDate, startOfDay(new Date()));
   if (todayOffset >= 0 && todayOffset <= spec.dayCount) {
-    const todayX = todayOffset * dayWidth + dayWidth / 2;
+    const todayX = labelWidth + todayOffset * dayWidth + dayWidth / 2;
     lines.push(`<line x1="${todayX}" y1="0" x2="${todayX}" y2="${svgHeight}" stroke="#ef4444" stroke-width="2" stroke-dasharray="6 5"/>`);
   }
 
@@ -890,18 +909,20 @@ export default function WorkManager({ config }: ModuleProps) {
   }, [ganttSpec, project.projectId]);
 
   const exportSvg = useCallback(() => {
-    if (!ganttSvg) return;
-    downloadText(`work-${project.projectId}-${new Date().toISOString().slice(0, 10)}.svg`, ganttSvg, "image/svg+xml;charset=utf-8");
-  }, [ganttSvg, project.projectId]);
+    if (!ganttSpec) return;
+    const labeledSvg = buildChartSvg(ganttSpec, selectedItemId ?? undefined, zoom, true);
+    downloadText(`work-${project.projectId}-${new Date().toISOString().slice(0, 10)}.svg`, labeledSvg, "image/svg+xml;charset=utf-8");
+  }, [ganttSpec, project.projectId, selectedItemId, zoom]);
 
   const exportPng = useCallback(async () => {
-    if (!ganttSvg) return;
+    if (!ganttSpec) return;
     try {
-      await exportSvgAsPng(ganttSvg, `work-${project.projectId}-${new Date().toISOString().slice(0, 10)}.png`);
+      const labeledSvg = buildChartSvg(ganttSpec, selectedItemId ?? undefined, zoom, true);
+      await exportSvgAsPng(labeledSvg, `work-${project.projectId}-${new Date().toISOString().slice(0, 10)}.png`);
     } catch (pngError: unknown) {
       setError((pngError as Error).message);
     }
-  }, [ganttSvg, project.projectId]);
+  }, [ganttSpec, project.projectId, selectedItemId, zoom]);
 
   const importItems = useCallback(async (file: File | undefined) => {
     if (!file) return;
