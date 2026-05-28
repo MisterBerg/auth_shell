@@ -1127,6 +1127,49 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     type: "function",
+    name: "search_documentation_content",
+    description: "Search titles and markdown content inside a documentation-viewer module slot and return matching pages with snippets.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        query: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+        maxSnippetChars: { type: "integer", minimum: 80, maximum: 4000 },
+      },
+      required: ["slotPath", "query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_documentation_pages",
+    description: "Read specific documentation-viewer pages by doc id, including full or truncated content.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docIds: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        maxCharsPerDoc: { type: "integer", minimum: 200, maximum: 50000 },
+      },
+      required: ["slotPath", "docIds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "create_documentation_page",
     description: "Create a child or sibling page in a documentation-viewer module slot.",
     parameters: {
@@ -3746,6 +3789,111 @@ async function executeTool(args: {
           docs,
         }, null, 2),
         toolMessage: `Read documentation tree for ${parsed.slotPath.join(" / ")}.`,
+      };
+    }
+
+    case "search_documentation_content": {
+      const parsed = parseToolArgs<{ slotPath: string[]; query: string; limit?: number; maxSnippetChars?: number }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-documentation-viewer");
+      const slotConfig: ModuleConfig = {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      };
+      const { storage, manifest, contents } = await loadDocumentationSlotState(getS3Client, slotConfig);
+      const query = parsed.query.trim().toLowerCase();
+      const limit = Math.max(1, Math.min(parsed.limit ?? 20, 100));
+      const maxSnippetChars = Math.max(80, Math.min(parsed.maxSnippetChars ?? 500, 4000));
+      if (!query) {
+        throw new Error("query is required.");
+      }
+      const terms = query.split(/\s+/).filter(Boolean);
+      const matches = Object.values(manifest.docs)
+        .map((doc) => {
+          const content = contents[doc.id] ?? "";
+          const haystack = `${doc.title}\n${content}`.toLowerCase();
+          let score = haystack.includes(query) ? 50 : 0;
+          for (const term of terms) {
+            if (haystack.includes(term)) score += 10;
+          }
+          const firstHit = terms
+            .map((term) => haystack.indexOf(term))
+            .filter((idx) => idx >= 0)
+            .sort((a, b) => a - b)[0] ?? (haystack.indexOf(query) >= 0 ? haystack.indexOf(query) : -1);
+          let snippet = "";
+          if (firstHit >= 0) {
+            const start = Math.max(0, firstHit - Math.floor(maxSnippetChars / 3));
+            const end = Math.min(content.length, start + maxSnippetChars);
+            snippet = content.slice(start, end);
+          } else {
+            snippet = content.slice(0, maxSnippetChars);
+          }
+          return {
+            id: doc.id,
+            title: doc.title,
+            kind: doc.kind ?? "page",
+            parentId: doc.parentId,
+            relativePath: doc.relativePath,
+            score,
+            snippet,
+          };
+        })
+        .filter((entry) => entry.score > 0)
+        .sort((a, b) => b.score - a.score || a.title.localeCompare(b.title))
+        .slice(0, limit);
+      return {
+        output: JSON.stringify({
+          slotPath: parsed.slotPath,
+          storage,
+          query: parsed.query,
+          count: matches.length,
+          matches,
+        }, null, 2),
+        toolMessage: `Searched documentation content for "${parsed.query}" in ${parsed.slotPath.join(" / ")}.`,
+      };
+    }
+
+    case "read_documentation_pages": {
+      const parsed = parseToolArgs<{ slotPath: string[]; docIds: string[]; maxCharsPerDoc?: number }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-documentation-viewer");
+      const slotConfig: ModuleConfig = {
+        id: slot.slotId,
+        app: slot.app,
+        meta: slot.meta,
+        resources: slot.resources,
+        children: slot.children,
+      };
+      const { storage, manifest, contents } = await loadDocumentationSlotState(getS3Client, slotConfig);
+      const maxCharsPerDoc = Math.max(200, Math.min(parsed.maxCharsPerDoc ?? 12000, 50000));
+      const docs = parsed.docIds.map((docId) => {
+        const doc = manifest.docs[docId];
+        if (!doc) {
+          throw new Error(`Documentation page not found: ${docId}`);
+        }
+        const content = contents[docId] ?? "";
+        return {
+          id: doc.id,
+          title: doc.title,
+          kind: doc.kind ?? "page",
+          parentId: doc.parentId,
+          children: doc.children,
+          slug: doc.slug,
+          relativePath: doc.relativePath,
+          content: content.slice(0, maxCharsPerDoc),
+          truncated: content.length > maxCharsPerDoc,
+        };
+      });
+      return {
+        output: JSON.stringify({
+          slotPath: parsed.slotPath,
+          storage,
+          docs,
+        }, null, 2),
+        toolMessage: `Read ${docs.length} documentation page${docs.length === 1 ? "" : "s"} from ${parsed.slotPath.join(" / ")}.`,
       };
     }
 

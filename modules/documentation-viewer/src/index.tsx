@@ -685,11 +685,11 @@ function buildVisibleDocTree(
     const doc = manifest.docs[docId];
     if (!doc) return [];
     const nodes = [{ id: docId, depth }];
-    if (!expanded.has(docId)) return nodes;
+      if (!expanded.has(docId)) return nodes;
     for (const childId of doc.children) nodes.push(...walk(childId, depth + 1));
     return nodes;
   };
-  return walk(manifest.rootDocId, 0);
+  return manifest.docs[manifest.rootDocId]?.children.flatMap((childId) => walk(childId, 0)) ?? [];
 }
 
 function buildSectionLandingContent(manifest: DocumentationManifest, docId: string): string {
@@ -723,8 +723,8 @@ function TreeToggle({
       disabled={!hasChildren}
       aria-label={hasChildren ? (expanded ? "Collapse section" : "Expand section") : "No child pages"}
       style={{
-        width: 18,
-        height: 18,
+        width: 20,
+        height: 20,
         border: "none",
         background: "transparent",
         color: hasChildren ? COLORS.muted : "transparent",
@@ -734,11 +734,12 @@ function TreeToggle({
         alignItems: "center",
         justifyContent: "center",
         flexShrink: 0,
-        fontSize: "0.8rem",
+        fontSize: "1rem",
+        fontWeight: 700,
         lineHeight: 1,
       }}
     >
-      {hasChildren ? (expanded ? "▾" : "▸") : "•"}
+      {hasChildren ? (expanded ? "−" : "+") : ""}
     </button>
   );
 }
@@ -1166,7 +1167,6 @@ function DocumentationPopout({
                 }}
               >
                 <TreeToggle expanded={expanded} hasChildren={hasChildren} onClick={() => toggleExpanded(id)} />
-                <span style={{ width: 6, height: 6, borderRadius: "50%", background: selected ? COLORS.accent : COLORS.muted, flexShrink: 0 }} />
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{doc.title}</span>
               </button>
             );
@@ -1912,7 +1912,6 @@ export default function DocumentationViewer({ config }: ModuleProps) {
                 }}
               >
                 <TreeToggle expanded={expanded} hasChildren={hasChildren} onClick={() => toggleExpanded(id)} />
-                <span style={{ width: 6, height: 6, borderRadius: "50%", background: selected ? COLORS.accent : COLORS.muted, flexShrink: 0 }} />
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{doc.title}</span>
               </button>
             );
