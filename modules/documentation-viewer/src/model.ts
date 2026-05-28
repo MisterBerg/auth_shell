@@ -13,6 +13,8 @@ export type StorageConfig = {
   mediaPrefix: string;
 };
 
+export type DocKind = "page" | "section";
+
 export type DocRecord = {
   id: string;
   title: string;
@@ -20,6 +22,7 @@ export type DocRecord = {
   children: string[];
   slug: string;
   relativePath: string;
+  kind?: DocKind;
   createdAt: string;
   updatedAt: string;
 };
@@ -124,6 +127,7 @@ export function createDefaultManifest(title: string): DocumentationManifest {
         children: [],
         slug: "index",
         relativePath: "index.md",
+        kind: "page",
         createdAt,
         updatedAt: createdAt,
       },
@@ -165,24 +169,31 @@ export function ensureUniqueSlug(
 export function assignPaths(manifest: DocumentationManifest): DocumentationManifest {
   const next = deepCloneManifest(manifest);
   const root = next.docs[next.rootDocId];
+  root.kind = root.kind ?? "page";
   root.slug = "index";
   root.relativePath = "index.md";
 
-  const walk = (docId: string) => {
+  const walk = (docId: string, baseDir: string) => {
     const parent = next.docs[docId];
-    const baseDir = docId === next.rootDocId ? "" : withoutExtension(parent.relativePath);
 
     for (const childId of parent.children) {
       const child = next.docs[childId];
       if (!child) continue;
+      child.kind = child.kind ?? "page";
       child.slug = ensureUniqueSlug(next, docId, child.slug || slugify(child.title), child.id);
+      if (child.kind === "section") {
+        child.relativePath = "";
+        const childDir = baseDir ? `${baseDir}/${child.slug}` : child.slug;
+        walk(childId, childDir);
+        continue;
+      }
       const filename = `${child.slug}.md`;
       child.relativePath = baseDir ? `${baseDir}/${filename}` : filename;
-      walk(childId);
+      walk(childId, withoutExtension(child.relativePath));
     }
   };
 
-  walk(next.rootDocId);
+  walk(next.rootDocId, "");
   return next;
 }
 
@@ -241,6 +252,7 @@ export function createLinkedPage(
     children: [],
     slug,
     relativePath: "",
+    kind: "page",
     createdAt,
     updatedAt: createdAt,
   };
@@ -536,6 +548,9 @@ export async function loadDocumentationState(
   const manifest = assignPaths(JSON.parse(manifestText) as DocumentationManifest);
   const contentEntries = await Promise.all(
     Object.values(manifest.docs).map(async (doc) => {
+      if ((doc.kind ?? "page") === "section" || !doc.relativePath) {
+        return [doc.id, ""] as const;
+      }
       const content =
         (await readOptionalTextObject(s3, storage.bucket, getDocKey(storage, doc.relativePath))) ??
         `# ${doc.title}\n\n`;

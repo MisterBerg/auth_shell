@@ -1636,10 +1636,19 @@ async function persistDocumentationSlotState(args: {
   contents: ContentMap;
 }): Promise<void> {
   const s3 = await args.getS3Client(args.storage.bucket);
-  const previousKeys = new Set(Object.values(args.previousManifest.docs).map((doc) => getDocKey(args.storage, doc.relativePath)));
-  const nextKeys = new Set(Object.values(args.nextManifest.docs).map((doc) => getDocKey(args.storage, doc.relativePath)));
+  const previousKeys = new Set(
+    Object.values(args.previousManifest.docs)
+      .filter((doc) => (doc.kind ?? "page") === "page" && doc.relativePath)
+      .map((doc) => getDocKey(args.storage, doc.relativePath))
+  );
+  const nextKeys = new Set(
+    Object.values(args.nextManifest.docs)
+      .filter((doc) => (doc.kind ?? "page") === "page" && doc.relativePath)
+      .map((doc) => getDocKey(args.storage, doc.relativePath))
+  );
 
   for (const doc of Object.values(args.nextManifest.docs)) {
+    if ((doc.kind ?? "page") !== "page" || !doc.relativePath) continue;
     await writeTextObject(
       s3,
       args.storage.bucket,
@@ -3721,6 +3730,7 @@ async function executeTool(args: {
       const docs = Object.values(manifest.docs).map((doc) => ({
         id: doc.id,
         title: doc.title,
+        kind: doc.kind ?? "page",
         parentId: doc.parentId,
         children: doc.children,
         slug: doc.slug,
@@ -3797,6 +3807,9 @@ async function executeTool(args: {
       const { storage, manifest } = await loadDocumentationSlotState(getS3Client, slotConfig);
       if (!manifest.docs[parsed.docId]) {
         throw new Error(`Documentation page not found: ${parsed.docId}`);
+      }
+      if ((manifest.docs[parsed.docId].kind ?? "page") === "section" || !manifest.docs[parsed.docId].relativePath) {
+        throw new Error(`Documentation section cannot be edited as a markdown page: ${parsed.docId}`);
       }
       const s3 = await getS3Client(storage.bucket);
       await writeTextObject(s3, storage.bucket, getDocKey(storage, manifest.docs[parsed.docId].relativePath), parsed.content, "text/markdown");

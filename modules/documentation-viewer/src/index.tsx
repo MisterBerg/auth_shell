@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, DependencyList, ReactNode } from "react";
 import type { ExportContext, ModuleProps } from "module-core";
 import {
   AuthProvider,
@@ -7,14 +8,16 @@ import {
   useEditMode,
   useUpdateSlotMeta,
 } from "module-core";
-import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import type { S3Client } from "@aws-sdk/client-s3";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
 import {
   assignPaths,
   createLinkedPage,
   copyObjectIfExists,
+  createDocId,
   deleteObjectIfExists,
   extractMediaRelativePaths,
   getDocKey,
@@ -28,7 +31,9 @@ import {
   renameDoc,
   removeDoc,
   rewriteDocLinksForExport,
+  slugify,
   type ContentMap,
+  type DocKind,
   type DocumentationManifest,
   type StorageConfig,
   type LinkAction,
@@ -54,6 +59,36 @@ const COLORS = {
 };
 
 const mediaBlobCache = new Map<string, string>();
+const DOC_MD_STYLE_ID = "hep-doc-md-styles";
+const DOC_MD_CSS = `
+.hep-doc-md { font-family: system-ui,-apple-system,sans-serif; font-size: 0.95rem; line-height: 1.7; color: #e5e7eb; }
+.hep-doc-md h1,.hep-doc-md h2,.hep-doc-md h3,.hep-doc-md h4 { color: #f9fafb; font-weight: 600; margin: 1.5em 0 0.5em; line-height: 1.3; }
+.hep-doc-md h1 { font-size: 1.75rem; border-bottom: 1px solid #1a2a42; padding-bottom: 0.4em; }
+.hep-doc-md h2 { font-size: 1.35rem; border-bottom: 1px solid #1a2a42; padding-bottom: 0.3em; }
+.hep-doc-md h3 { font-size: 1.1rem; }
+.hep-doc-md p { margin: 0.75em 0; }
+.hep-doc-md a { color: #60a5fa; text-decoration: underline; }
+.hep-doc-md code { background: #0a1525; border: 1px solid #1a2a42; border-radius: 4px; padding: 0.1em 0.4em; font-family: 'JetBrains Mono',Consolas,monospace; font-size: 0.85em; color: #93c5fd; }
+.hep-doc-md pre { background: #0a1525; border: 1px solid #1a2a42; border-radius: 8px; padding: 1rem 1.25rem; overflow-x: auto; margin: 1em 0; }
+.hep-doc-md pre code { background: none; border: none; padding: 0; font-size: 0.83rem; color: #d1d5db; }
+.hep-doc-md blockquote { border-left: 3px solid #3b82f6; margin: 1em 0; padding: 0.1em 0 0.1em 1.25em; color: #9ca3af; }
+.hep-doc-md table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 0.85rem; }
+.hep-doc-md th,.hep-doc-md td { border: 1px solid #1a2a42; padding: 0.45rem 0.75rem; vertical-align: top; }
+.hep-doc-md th { background: #0d1a2e; font-weight: 600; color: #93c5fd; }
+.hep-doc-md tr:nth-child(even) td { background: #080f1c; }
+.hep-doc-md ul,.hep-doc-md ol { padding-left: 1.5rem; margin: 0.5em 0; }
+.hep-doc-md li { margin: 0.25em 0; }
+.hep-doc-md hr { border: none; border-top: 1px solid #1a2a42; margin: 1.5em 0; }
+.hep-doc-md img,.hep-doc-md video { max-width: 100%; }
+`;
+
+function ensureDocumentationStyles(targetDoc: Document = document) {
+  if (targetDoc.getElementById(DOC_MD_STYLE_ID)) return;
+  const el = targetDoc.createElement("style");
+  el.id = DOC_MD_STYLE_ID;
+  el.textContent = DOC_MD_CSS;
+  targetDoc.head.appendChild(el);
+}
 
 function safeMediaName(file: File): string {
   const dot = file.name.lastIndexOf(".");
@@ -89,6 +124,53 @@ function contentTypeForPath(path: string): string {
   return types[ext] ?? "application/octet-stream";
 }
 
+function isMostlyBlankDocContent(content: string, title: string): boolean {
+  const trimmed = content.trim();
+  if (!trimmed) return true;
+  const normalizedTitle = title.trim().toLowerCase();
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 1) {
+    return lines[0].replace(/^#+\s*/, "").trim().toLowerCase() === normalizedTitle;
+  }
+  return false;
+}
+
+function replaceLeadingHeading(content: string, title: string): string {
+  if (!content.trim()) return `# ${title}\n\n`;
+  if (/^\s*#\s+/m.test(content)) {
+    return content.replace(/^\s*#\s+.*$/m, `# ${title}`);
+  }
+  return `# ${title}\n\n${content.replace(/^\s+/, "")}`;
+}
+
+function chooseImportEntryPath(markdownFiles: string[], rootDir: string): string | null {
+  if (markdownFiles.length === 0) return null;
+  const topLevel = markdownFiles.filter((path) => !path.includes("/"));
+  const rootName = rootDir.toLowerCase();
+  return (
+    topLevel.find((path) => /^readme\.mdx?$/i.test(path)) ??
+    topLevel.find((path) => /^index\.mdx?$/i.test(path)) ??
+    topLevel.find((path) => withoutFileExtension(basename(path)).toLowerCase() === rootName) ??
+    (topLevel.length === 1 ? topLevel[0] : undefined) ??
+    (markdownFiles.length === 1 ? markdownFiles[0] : undefined) ??
+    markdownFiles
+      .slice()
+      .sort((a, b) => {
+        const aDepth = a.split("/").length;
+        const bDepth = b.split("/").length;
+        if (aDepth !== bDepth) return aDepth - bDepth;
+        const aRootish = withoutFileExtension(basename(a)).toLowerCase() === rootName ? -1 : 0;
+        const bRootish = withoutFileExtension(basename(b)).toLowerCase() === rootName ? -1 : 0;
+        if (aRootish !== bRootish) return aRootish - bRootish;
+        return a.localeCompare(b);
+      })[0] ??
+    null
+  );
+}
+
 function mediaKind(path: string, contentType = contentTypeForPath(path)): "image" | "video" | "audio" | "file" {
   if (contentType.startsWith("image/")) return "image";
   if (contentType.startsWith("video/")) return "video";
@@ -96,9 +178,591 @@ function mediaKind(path: string, contentType = contentTypeForPath(path)): "image
   return "file";
 }
 
+function basename(path: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || path;
+}
+
+function withoutFileExtension(name: string): string {
+  return name.replace(/\.[^.]+$/, "");
+}
+
+function decodePathSegments(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    })
+    .join("/");
+}
+
+function resolveImportPath(basePath: string, ref: string): string {
+  const normalizedRef = decodePathSegments(ref);
+  const parts = basePath.split("/");
+  parts.pop();
+  for (const seg of normalizedRef.split("/")) {
+    if (seg === "..") parts.pop();
+    else if (seg && seg !== ".") parts.push(seg);
+  }
+  return parts.join("/");
+}
+
+function splitDirAndName(path: string): { dir: string; name: string } {
+  const normalized = path.replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  const name = parts.pop() ?? "";
+  return { dir: parts.join("/"), name };
+}
+
+function fileStem(name: string): string {
+  return name.replace(/\.[^.]+$/, "");
+}
+
+function normalizeLoose(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/%20/g, " ")
+    .replace(/[_|]+/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function extractHtmlTitle(content: string): string | null {
+  const match = content.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return match?.[1]?.trim() || null;
+}
+
+function extractMarkdownTitle(content: string, fallback: string): string {
+  const heading = content.match(/^\s*#\s+(.+?)\s*$/m)?.[1]?.trim();
+  return heading || fallback;
+}
+
+function extractLocalRefs(content: string): string[] {
+  const refs: string[] = [];
+  let m: RegExpExecArray | null;
+  const inline = /!?\[[^\]]*\]\(([^)\s"']+)/g;
+  while ((m = inline.exec(content)) !== null) {
+    const u = m[1];
+    if (u && !/^(https?:|mailto:|#|data:)/i.test(u)) refs.push(u.split(/[?#]/)[0]);
+  }
+  const refDef = /^\s*\[[^\]]+\]:\s*([^\s"'<>\n]+)/gm;
+  while ((m = refDef.exec(content)) !== null) {
+    const u = m[1];
+    if (u && !/^(https?:|mailto:|#|data:)/i.test(u)) refs.push(u.split(/[?#]/)[0]);
+  }
+  const htmlImg = /<(?:img|video|audio|source)[^>]+src=["']([^"']+)["']/gi;
+  while ((m = htmlImg.exec(content)) !== null) {
+    const u = m[1];
+    if (u && !/^(https?:|data:)/i.test(u)) refs.push(u.split(/[?#]/)[0]);
+  }
+  return refs;
+}
+
+async function resolveLocalFileRef(
+  entryPath: string,
+  ref: string,
+  fileMap: Map<string, File>,
+): Promise<{ requestedPath: string; sourcePath: string | null }> {
+  const requestedPath = resolveImportPath(entryPath, ref);
+  if (fileMap.has(requestedPath)) {
+    return { requestedPath, sourcePath: requestedPath };
+  }
+
+  const { dir, name } = splitDirAndName(requestedPath);
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  if (!ext) return { requestedPath, sourcePath: null };
+
+  const requestedStem = normalizeLoose(fileStem(name));
+  const candidates = [...fileMap.keys()].filter((path) => {
+    const candidate = splitDirAndName(path);
+    return candidate.dir === dir && candidate.name.toLowerCase().endsWith(`.${ext}`);
+  });
+
+  for (const candidatePath of candidates) {
+    const candidateName = splitDirAndName(candidatePath).name;
+    const candidateStem = normalizeLoose(fileStem(candidateName));
+    if (
+      candidateStem === requestedStem ||
+      candidateStem.includes(requestedStem) ||
+      requestedStem.includes(candidateStem)
+    ) {
+      return { requestedPath, sourcePath: candidatePath };
+    }
+  }
+
+  if (ext === "html" || ext === "htm") {
+    for (const candidatePath of candidates) {
+      const file = fileMap.get(candidatePath);
+      if (!file) continue;
+      try {
+        const title = extractHtmlTitle(await file.text());
+        if (!title) continue;
+        const normalizedTitle = normalizeLoose(title);
+        if (
+          normalizedTitle === requestedStem ||
+          normalizedTitle.includes(requestedStem) ||
+          requestedStem.includes(normalizedTitle)
+        ) {
+          return { requestedPath, sourcePath: candidatePath };
+        }
+      } catch {
+        // Ignore parse failures and keep searching.
+      }
+    }
+  }
+
+  return { requestedPath, sourcePath: null };
+}
+
+async function crawlMarkdownReachable(
+  entryPath: string,
+  fileMap: Map<string, File>,
+  reachable: Map<string, string> = new Map(),
+  visitedMarkdown: Set<string> = new Set(),
+): Promise<Map<string, string>> {
+  if (visitedMarkdown.has(entryPath) || !fileMap.has(entryPath)) return reachable;
+  visitedMarkdown.add(entryPath);
+  reachable.set(entryPath, entryPath);
+  if (/\.mdx?$/i.test(entryPath)) {
+    const content = await fileMap.get(entryPath)!.text();
+    const refs = extractLocalRefs(content);
+    for (const ref of refs) {
+      const { requestedPath, sourcePath } = await resolveLocalFileRef(entryPath, ref, fileMap);
+      if (!sourcePath) continue;
+      reachable.set(requestedPath, sourcePath);
+      if (/\.mdx?$/i.test(sourcePath)) {
+        await crawlMarkdownReachable(sourcePath, fileMap, reachable, visitedMarkdown);
+      }
+    }
+  }
+  return reachable;
+}
+
+type ImportedDocumentationData = {
+  manifest: DocumentationManifest;
+  contents: ContentMap;
+  mediaFiles: Array<{ relativePath: string; file: File }>;
+};
+
+type ImportedDraftDoc = {
+  id: string;
+  title: string;
+  parentId: string | null;
+  slug: string;
+  children: string[];
+  createdAt: string;
+  updatedAt: string;
+  importPath: string;
+  kind: DocKind;
+};
+
+function replaceImportHref(
+  href: string,
+  currentPath: string,
+  currentDocRelativePath: string,
+  pathToDocId: Map<string, string>,
+  manifest: DocumentationManifest,
+  mediaPaths: Set<string>,
+): string {
+  if (!href || /^(https?:|mailto:|data:|#)/i.test(href)) return href;
+  const base = href.split(/[?#]/)[0];
+  const suffix = href.slice(base.length);
+  const resolvedPath = resolveImportPath(currentPath, base);
+  const targetDocId = pathToDocId.get(resolvedPath);
+  if (targetDocId && manifest.docs[targetDocId]) {
+    return `#doc:${targetDocId}`;
+  }
+  if (mediaPaths.has(resolvedPath)) {
+    return `${getRelativePath(currentDocRelativePath, `media/${resolvedPath}`)}${suffix}`;
+  }
+  return href;
+}
+
+function rewriteImportedMarkdownContent(args: {
+  content: string;
+  currentPath: string;
+  currentDocRelativePath: string;
+  pathToDocId: Map<string, string>;
+  manifest: DocumentationManifest;
+  mediaPaths: Set<string>;
+}): string {
+  const replacer = (href: string) =>
+    replaceImportHref(href, args.currentPath, args.currentDocRelativePath, args.pathToDocId, args.manifest, args.mediaPaths);
+
+  return args.content
+    .replace(/(!?\[[^\]]*\]\()([^) \t\n"']+)(\))/g, (_match, prefix, href, suffix) => `${prefix}${replacer(href)}${suffix}`)
+    .replace(/^(\s*\[[^\]]+\]:\s*)([^\s"'<>\n]+)(.*)$/gm, (_match, prefix, href, suffix) => `${prefix}${replacer(href)}${suffix}`)
+    .replace(/(<(?:img|video|audio|source)[^>]+src=["'])([^"']+)(["'][^>]*>)/gi, (_match, prefix, href, suffix) => `${prefix}${replacer(href)}${suffix}`);
+}
+
+async function buildImportedDocumentationData(args: {
+  entryPath: string;
+  reachable: Map<string, string>;
+  fileMap: Map<string, File>;
+  rootTitle: string;
+}): Promise<ImportedDocumentationData> {
+  const markdownEntries = [...args.reachable.entries()]
+    .filter(([path]) => /\.mdx?$/i.test(path))
+    .sort(([a], [b]) => a.localeCompare(b));
+  const rootDir = splitDirAndName(args.entryPath).dir;
+  const mediaFiles = [...args.reachable.entries()]
+    .filter(([path]) => !/\.mdx?$/i.test(path))
+    .map(([path, sourcePath]) => ({ relativePath: path, file: args.fileMap.get(sourcePath)! }));
+
+  const representativeByDir = new Map<string, string>();
+  representativeByDir.set(rootDir, args.entryPath);
+  const markdownPathsByDir = new Map<string, string[]>();
+  for (const [path] of markdownEntries) {
+    const { dir, name } = splitDirAndName(path);
+    const bucket = markdownPathsByDir.get(dir) ?? [];
+    bucket.push(path);
+    markdownPathsByDir.set(dir, bucket);
+    if (path === args.entryPath) continue;
+    if (/^(readme|index)\.mdx?$/i.test(name) && !representativeByDir.has(dir)) {
+      representativeByDir.set(dir, path);
+    }
+  }
+
+  for (const [dir, paths] of markdownPathsByDir.entries()) {
+    if (representativeByDir.has(dir) || dir === rootDir) continue;
+    if (paths.length === 1) {
+      representativeByDir.set(dir, paths[0]);
+      continue;
+    }
+    const dirName = basename(dir).toLowerCase();
+    const sameNamed = paths.find((path) => withoutFileExtension(basename(path)).toLowerCase() === dirName);
+    if (sameNamed) {
+      representativeByDir.set(dir, sameNamed);
+    }
+  }
+
+  const allDirs = new Set<string>();
+  for (const [path] of markdownEntries) {
+    if (path === args.entryPath) continue;
+    let current = splitDirAndName(path).dir;
+    while (current && current !== rootDir) {
+      allDirs.add(current);
+      current = splitDirAndName(current).dir;
+    }
+  }
+
+  const syntheticDirIdByDir = new Map<string, string>();
+  for (const dir of [...allDirs].sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b))) {
+    if (!representativeByDir.has(dir)) {
+      syntheticDirIdByDir.set(dir, createDocId());
+    }
+  }
+
+  const docIdByPath = new Map<string, string>();
+  docIdByPath.set(args.entryPath, "root");
+  for (const [path] of markdownEntries) {
+    if (path === args.entryPath) continue;
+    docIdByPath.set(path, createDocId());
+  }
+
+  const containerDocIdForDir = (dir: string): string => {
+    if (dir === rootDir) return "root";
+    const representativePath = representativeByDir.get(dir);
+    if (representativePath) return docIdByPath.get(representativePath)!;
+    const syntheticId = syntheticDirIdByDir.get(dir);
+    if (syntheticId) return syntheticId;
+    const parentDir = splitDirAndName(dir).dir;
+    return containerDocIdForDir(parentDir);
+  };
+
+  const draftDocs = new Map<string, ImportedDraftDoc>();
+
+  for (const [dir, docId] of syntheticDirIdByDir.entries()) {
+    const title = basename(dir).replace(/[-_]/g, " ") || "Section";
+    const parentDir = splitDirAndName(dir).dir;
+    draftDocs.set(docId, {
+      id: docId,
+      title,
+      parentId: containerDocIdForDir(parentDir),
+      slug: slugify(title),
+      children: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      importPath: `${dir}/`,
+      kind: "section",
+    });
+  }
+
+  for (const [path, sourcePath] of markdownEntries) {
+    const file = args.fileMap.get(sourcePath)!;
+    const content = await file.text();
+    const stem = withoutFileExtension(basename(path)).replace(/[-_]/g, " ") || args.rootTitle;
+    const title = extractMarkdownTitle(content, stem);
+    const id = docIdByPath.get(path)!;
+    const { dir } = splitDirAndName(path);
+    let parentId: string | null = null;
+    if (path !== args.entryPath) {
+      const directoryRepresentative = representativeByDir.get(dir);
+      if (directoryRepresentative === path) {
+        parentId = containerDocIdForDir(splitDirAndName(dir).dir);
+      } else {
+        parentId = containerDocIdForDir(dir);
+      }
+    }
+    draftDocs.set(id, {
+      id,
+      title,
+      parentId,
+      slug: path === args.entryPath ? "index" : slugify(withoutFileExtension(basename(path))),
+      children: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      importPath: path,
+      kind: "page",
+    });
+  }
+
+  for (const doc of draftDocs.values()) {
+    if (doc.parentId && draftDocs.has(doc.parentId)) {
+      draftDocs.get(doc.parentId)!.children.push(doc.id);
+    }
+  }
+
+  for (const doc of draftDocs.values()) {
+    doc.children.sort((a, b) => {
+      const left = draftDocs.get(a)?.importPath ?? "";
+      const right = draftDocs.get(b)?.importPath ?? "";
+      const leftIsDir = left.endsWith("/");
+      const rightIsDir = right.endsWith("/");
+      if (leftIsDir !== rightIsDir) return leftIsDir ? -1 : 1;
+      return left.localeCompare(right);
+    });
+  }
+
+  const manifest = assignPaths({
+    version: 1,
+    rootDocId: "root",
+    docs: Object.fromEntries(
+      [...draftDocs.values()].map((doc) => [
+        doc.id,
+        {
+          id: doc.id,
+          title: doc.title,
+          parentId: doc.parentId,
+          children: doc.children,
+          slug: doc.slug,
+          relativePath: doc.id === "root" ? "index.md" : "",
+          kind: doc.id === "root" ? "page" : doc.kind,
+          createdAt: doc.createdAt,
+          updatedAt: doc.updatedAt,
+        },
+      ]),
+    ),
+  });
+
+  const contents: ContentMap = {};
+  const mediaPathSet = new Set(mediaFiles.map((file) => file.relativePath));
+
+  for (const [path, sourcePath] of markdownEntries) {
+    const file = args.fileMap.get(sourcePath)!;
+    const rawContent = await file.text();
+    const docId = docIdByPath.get(path)!;
+    contents[docId] = rewriteImportedMarkdownContent({
+      content: rawContent,
+      currentPath: path,
+      currentDocRelativePath: manifest.docs[docId].relativePath,
+      pathToDocId: docIdByPath,
+      manifest,
+      mediaPaths: mediaPathSet,
+    });
+  }
+
+  for (const doc of draftDocs.values()) {
+    if (doc.kind !== "section") continue;
+    contents[doc.id] = "";
+  }
+
+  return { manifest, contents, mediaFiles };
+}
+
+function appendImportedDocumentation(args: {
+  existingManifest: DocumentationManifest;
+  existingContents: ContentMap;
+  importedManifest: DocumentationManifest;
+  importedContents: ContentMap;
+  targetDocId: string;
+}): { manifest: DocumentationManifest; contents: ContentMap; focusDocId: string } {
+  const nextManifest = JSON.parse(JSON.stringify(args.existingManifest)) as DocumentationManifest;
+  const nextContents = { ...args.existingContents };
+  const importedRoot = args.importedManifest.docs[args.importedManifest.rootDocId];
+  const targetDoc = nextManifest.docs[args.targetDocId];
+  if (!importedRoot || !targetDoc) {
+    throw new Error("Unable to import into the selected documentation page.");
+  }
+
+  const cloneSubtree = (sourceId: string, parentId: string): string => {
+    const source = args.importedManifest.docs[sourceId];
+    const clonedId = createDocId();
+    nextManifest.docs[clonedId] = {
+      id: clonedId,
+      title: source.title,
+      parentId,
+      children: [],
+      slug: slugify(source.title),
+      relativePath: "",
+      kind: source.kind ?? "page",
+      createdAt: source.createdAt,
+      updatedAt: source.updatedAt,
+    };
+    nextContents[clonedId] =
+      (source.kind ?? "page") === "section"
+        ? ""
+        : args.importedContents[sourceId] ?? `# ${source.title}\n\n`;
+    for (const childId of source.children) {
+      const clonedChildId = cloneSubtree(childId, clonedId);
+      nextManifest.docs[clonedId].children.push(clonedChildId);
+    }
+    return clonedId;
+  };
+
+  if (isMostlyBlankDocContent(nextContents[targetDoc.id] ?? "", targetDoc.title)) {
+    nextContents[targetDoc.id] = replaceLeadingHeading(
+      args.importedContents[importedRoot.id] ?? `# ${targetDoc.title}\n\n`,
+      targetDoc.title,
+    );
+    for (const childId of importedRoot.children) {
+      const clonedChildId = cloneSubtree(childId, targetDoc.id);
+      nextManifest.docs[targetDoc.id].children.push(clonedChildId);
+    }
+    return {
+      manifest: assignPaths(nextManifest),
+      contents: nextContents,
+      focusDocId: targetDoc.id,
+    };
+  }
+
+  const importedRootId = createDocId();
+  nextManifest.docs[importedRootId] = {
+    id: importedRootId,
+    title: importedRoot.title,
+    parentId: targetDoc.id,
+    children: [],
+    slug: slugify(importedRoot.title),
+    relativePath: "",
+    kind: importedRoot.kind ?? "page",
+    createdAt: importedRoot.createdAt,
+    updatedAt: importedRoot.updatedAt,
+  };
+  nextContents[importedRootId] =
+    (importedRoot.kind ?? "page") === "section"
+      ? ""
+      : args.importedContents[importedRoot.id] ?? `# ${importedRoot.title}\n\n`;
+  for (const childId of importedRoot.children) {
+    const clonedChildId = cloneSubtree(childId, importedRootId);
+    nextManifest.docs[importedRootId].children.push(clonedChildId);
+  }
+  nextManifest.docs[targetDoc.id].children.push(importedRootId);
+
+  return {
+    manifest: assignPaths(nextManifest),
+    contents: nextContents,
+    focusDocId: importedRootId,
+  };
+}
+
+function collectExpandableDocIds(manifest: DocumentationManifest): string[] {
+  return Object.values(manifest.docs)
+    .filter((doc) => doc.children.length > 0)
+    .map((doc) => doc.id);
+}
+
+function buildVisibleDocTree(
+  manifest: DocumentationManifest,
+  expanded: ReadonlySet<string>,
+): Array<{ id: string; depth: number }> {
+  const walk = (docId: string, depth: number): Array<{ id: string; depth: number }> => {
+    const doc = manifest.docs[docId];
+    if (!doc) return [];
+    const nodes = [{ id: docId, depth }];
+    if (!expanded.has(docId)) return nodes;
+    for (const childId of doc.children) nodes.push(...walk(childId, depth + 1));
+    return nodes;
+  };
+  return walk(manifest.rootDocId, 0);
+}
+
+function buildSectionLandingContent(manifest: DocumentationManifest, docId: string): string {
+  const doc = manifest.docs[docId];
+  if (!doc) return "";
+  const childLinks = doc.children
+    .map((childId) => manifest.docs[childId])
+    .filter((child): child is DocumentationManifest["docs"][string] => Boolean(child))
+    .map((child) => `- [${child.title}](#doc:${child.id})`)
+    .join("\n");
+  return childLinks ? `# ${doc.title}\n\n${childLinks}\n` : `# ${doc.title}\n\n`;
+}
+
+function TreeToggle({
+  expanded,
+  hasChildren,
+  onClick,
+}: {
+  expanded: boolean;
+  hasChildren: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onClick();
+      }}
+      disabled={!hasChildren}
+      aria-label={hasChildren ? (expanded ? "Collapse section" : "Expand section") : "No child pages"}
+      style={{
+        width: 18,
+        height: 18,
+        border: "none",
+        background: "transparent",
+        color: hasChildren ? COLORS.muted : "transparent",
+        cursor: hasChildren ? "pointer" : "default",
+        padding: 0,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+        fontSize: "0.8rem",
+        lineHeight: 1,
+      }}
+    >
+      {hasChildren ? (expanded ? "▾" : "▸") : "•"}
+    </button>
+  );
+}
+
+async function listObjectKeysWithPrefix(s3: S3Client, bucket: string, prefix: string): Promise<string[]> {
+  const keys: string[] = [];
+  let continuationToken: string | undefined;
+  do {
+    const response = await s3.send(new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: prefix,
+      ContinuationToken: continuationToken,
+    }));
+    for (const item of response.Contents ?? []) {
+      if (item.Key) keys.push(item.Key);
+    }
+    continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return keys;
+}
+
 function useDebouncedEffect(
   effect: () => void | (() => void),
-  deps: React.DependencyList,
+  deps: DependencyList,
   delayMs: number
 ) {
   useEffect(() => {
@@ -110,7 +774,7 @@ function useDebouncedEffect(
   }, [...deps, delayMs]);
 }
 
-function centeredStyle(color = COLORS.muted): React.CSSProperties {
+function centeredStyle(color = COLORS.muted): CSSProperties {
   return {
     height: "100%",
     display: "flex",
@@ -312,7 +976,7 @@ function DocumentationLink({
   storage,
 }: {
   href?: string;
-  children?: React.ReactNode;
+  children?: ReactNode;
   manifest: DocumentationManifest;
   currentDocId: string;
   onNavigateDoc: (docId: string) => void;
@@ -372,12 +1036,16 @@ function DocumentationBody({
   onNavigateDoc: (docId: string) => void;
   storage: StorageConfig;
 }) {
+  useEffect(() => {
+    ensureDocumentationStyles();
+  }, []);
   const renderContent = currentContent.replace(/\]\(doc:\/\/([a-z0-9-]+)\)/gi, "](#doc:$1)");
 
   return (
-    <article style={{ maxWidth: 860, color: COLORS.text }}>
+    <article className="hep-doc-md" style={{ maxWidth: 860, color: COLORS.text }}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeRaw]}
         components={{
           a: (props) => (
             <DocumentationLink
@@ -389,6 +1057,11 @@ function DocumentationBody({
             >
               {props.children}
             </DocumentationLink>
+          ),
+          table: ({ children }) => (
+            <div style={{ overflowX: "auto", margin: "1rem 0" }}>
+              <table>{children}</table>
+            </div>
           ),
           img: (props) => (
             <DocumentationMedia
@@ -438,18 +1111,26 @@ function DocumentationPopout({
   storage: StorageConfig;
 }) {
   const [currentDocId, setCurrentDocId] = useState(initialDocId);
+  const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(
+    () => new Set(collectExpandableDocIds(initialManifest))
+  );
   const currentDoc = initialManifest.docs[currentDocId] ?? initialManifest.docs[initialManifest.rootDocId];
-  const currentContent = initialContents[currentDoc.id] ?? "";
+  const currentContent =
+    (currentDoc.kind ?? "page") === "section"
+      ? buildSectionLandingContent(initialManifest, currentDoc.id)
+      : initialContents[currentDoc.id] ?? "";
   const tree = useMemo(() => {
-    const walk = (docId: string, depth: number): Array<{ id: string; depth: number }> => {
-      const doc = initialManifest.docs[docId];
-      if (!doc) return [];
-      const nodes = [{ id: docId, depth }];
-      for (const childId of doc.children) nodes.push(...walk(childId, depth + 1));
-      return nodes;
-    };
-    return walk(initialManifest.rootDocId, 0);
-  }, [initialManifest]);
+    return buildVisibleDocTree(initialManifest, expandedDocIds);
+  }, [expandedDocIds, initialManifest]);
+
+  const toggleExpanded = useCallback((docId: string) => {
+    setExpandedDocIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(docId)) next.delete(docId);
+      else next.add(docId);
+      return next;
+    });
+  }, []);
 
   return (
     <div style={{ display: "flex", height: "100vh", minHeight: 0, background: COLORS.bg, color: COLORS.text, fontFamily: "system-ui, -apple-system, sans-serif" }}>
@@ -462,6 +1143,8 @@ function DocumentationPopout({
           {tree.map(({ id, depth }) => {
             const doc = initialManifest.docs[id];
             const selected = id === currentDoc.id;
+            const hasChildren = doc.children.length > 0;
+            const expanded = expandedDocIds.has(id);
             return (
               <button
                 key={id}
@@ -482,6 +1165,7 @@ function DocumentationPopout({
                   fontSize: "0.84rem",
                 }}
               >
+                <TreeToggle expanded={expanded} hasChildren={hasChildren} onClick={() => toggleExpanded(id)} />
                 <span style={{ width: 6, height: 6, borderRadius: "50%", background: selected ? COLORS.accent : COLORS.muted, flexShrink: 0 }} />
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{doc.title}</span>
               </button>
@@ -494,7 +1178,7 @@ function DocumentationPopout({
           <div>
             <div style={{ fontSize: "1rem", fontWeight: 600 }}>{currentDoc.title}</div>
             <div style={{ marginTop: "0.2rem", fontSize: "0.75rem", color: COLORS.muted, fontFamily: "monospace" }}>
-              doc://{currentDoc.id} · {currentDoc.relativePath}
+              doc://{currentDoc.id} · {(currentDoc.kind ?? "page") === "section" ? "[section]" : currentDoc.relativePath}
             </div>
           </div>
         </div>
@@ -537,9 +1221,12 @@ export default function DocumentationViewer({ config }: ModuleProps) {
   const [needsInitialPersist, setNeedsInitialPersist] = useState(false);
   const [editingLabel, setEditingLabel] = useState(false);
   const [labelDraft, setLabelDraft] = useState(rootTitle);
+  const [importingDocs, setImportingDocs] = useState(false);
+  const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mediaInputRef = useRef<HTMLInputElement>(null);
+  const importDirectoryInputRef = useRef<HTMLInputElement>(null);
   const loadedRef = useRef(false);
   const prevEditModeRef = useRef(editMode);
   const manifestRef = useRef<DocumentationManifest | null>(null);
@@ -582,6 +1269,7 @@ export default function DocumentationViewer({ config }: ModuleProps) {
         setManifest(state.manifest);
         setContents(state.contents);
         setCurrentDocId(state.manifest.rootDocId);
+        setExpandedDocIds(new Set(collectExpandableDocIds(state.manifest)));
         setNeedsInitialPersist(state.needsInitialPersist);
         loadedRef.current = true;
         setLoading(false);
@@ -621,7 +1309,7 @@ export default function DocumentationViewer({ config }: ModuleProps) {
       const targetManifest = activeManifest ?? manifestRef.current;
       if (!targetManifest) return;
       const doc = targetManifest.docs[docId];
-      if (!doc) return;
+      if (!doc || (doc.kind ?? "page") === "section" || !doc.relativePath) return;
 
       const s3 = await getS3Client(storage.bucket);
       await writeTextObject(
@@ -660,13 +1348,18 @@ export default function DocumentationViewer({ config }: ModuleProps) {
     ) => {
       const s3 = await getS3Client(storage.bucket);
       const previousKeys = new Set(
-        Object.values(previousManifest.docs).map((doc) => getDocKey(storage, doc.relativePath))
+        Object.values(previousManifest.docs)
+          .filter((doc) => (doc.kind ?? "page") === "page" && doc.relativePath)
+          .map((doc) => getDocKey(storage, doc.relativePath))
       );
       const nextKeys = new Set(
-        Object.values(nextManifest.docs).map((doc) => getDocKey(storage, doc.relativePath))
+        Object.values(nextManifest.docs)
+          .filter((doc) => (doc.kind ?? "page") === "page" && doc.relativePath)
+          .map((doc) => getDocKey(storage, doc.relativePath))
       );
 
       for (const doc of Object.values(nextManifest.docs)) {
+        if ((doc.kind ?? "page") !== "page" || !doc.relativePath) continue;
         await writeTextObject(
           s3,
           storage.bucket,
@@ -716,7 +1409,12 @@ export default function DocumentationViewer({ config }: ModuleProps) {
   }, [contents, manifest, needsInitialPersist, syncStructure]);
 
   const currentDoc = manifest?.docs[currentDocId];
-  const currentContent = currentDocId ? contents[currentDocId] ?? "" : "";
+  const currentContent =
+    currentDocId && currentDoc
+      ? (currentDoc.kind ?? "page") === "section"
+        ? buildSectionLandingContent(manifest!, currentDocId)
+        : contents[currentDocId] ?? ""
+      : "";
 
   useDebouncedEffect(
     () => {
@@ -853,6 +1551,102 @@ export default function DocumentationViewer({ config }: ModuleProps) {
     [currentContent, currentDoc, getS3Client, storage, updateCurrentContent]
   );
 
+  const importMarkdownDirectory = useCallback(
+    async (files: File[]) => {
+      if (!manifest || !currentDocId || files.length === 0) return;
+      const targetDoc = manifest.docs[currentDocId];
+      if (!targetDoc) return;
+
+      const firstPath = files[0]?.webkitRelativePath || files[0]?.name || "folder";
+      const rootDir = firstPath.split("/")[0] || "folder";
+      const fileMap = new Map<string, File>();
+
+      for (const file of files) {
+        const rawPath = file.webkitRelativePath || file.name;
+        const parts = rawPath.split("/");
+        const relativePath = parts.length > 1 ? parts.slice(1).join("/") : rawPath;
+        if (relativePath) fileMap.set(relativePath, file);
+      }
+
+      const markdownFiles = [...fileMap.keys()]
+        .filter((path) => /\.mdx?$/i.test(path))
+        .sort((a, b) => {
+          const aDepth = a.split("/").length;
+          const bDepth = b.split("/").length;
+          if (aDepth !== bDepth) return aDepth - bDepth;
+          return a.localeCompare(b);
+        });
+
+      if (markdownFiles.length === 0) {
+        setSaveState("error");
+        setStatusMessage("No .md files found in the selected folder.");
+        return;
+      }
+
+      const entryPath = chooseImportEntryPath(markdownFiles, rootDir);
+      if (!entryPath) {
+        setSaveState("error");
+        setStatusMessage("Unable to determine the markdown entry point for that folder.");
+        return;
+      }
+      if (!fileMap.has(entryPath)) {
+        setSaveState("error");
+        setStatusMessage(`Markdown entry not found: ${entryPath}`);
+        return;
+      }
+
+      setImportingDocs(true);
+      setSaveState("saving");
+      setStatusMessage(`Importing markdown from ${rootDir}...`);
+
+      try {
+        const reachable = await crawlMarkdownReachable(entryPath, fileMap);
+        const imported = await buildImportedDocumentationData({
+          entryPath,
+          reachable,
+          fileMap,
+          rootTitle,
+        });
+        const merged = appendImportedDocumentation({
+          existingManifest: manifest,
+          existingContents: contents,
+          importedManifest: imported.manifest,
+          importedContents: imported.contents,
+          targetDocId: currentDocId,
+        });
+
+        const previousManifest = manifest;
+        const s3 = await getS3Client(storage.bucket);
+        await Promise.all(
+          imported.mediaFiles.map(async ({ relativePath, file }) => {
+            const bytes = new Uint8Array(await file.arrayBuffer());
+            await writeBinaryObject(
+              s3,
+              storage.bucket,
+              getMediaKey(storage, relativePath),
+              bytes,
+              file.type || contentTypeForPath(file.name),
+            );
+          }),
+        );
+        await syncStructure(previousManifest, merged.manifest, merged.contents);
+
+        setManifest(merged.manifest);
+        setContents(merged.contents);
+        setCurrentDocId(merged.focusDocId);
+        setNeedsInitialPersist(false);
+        setSaveState("saved");
+        setStatusMessage(`Imported ${reachable.size} file${reachable.size === 1 ? "" : "s"} into ${targetDoc.title}.`);
+      } catch (importError: unknown) {
+        setSaveState("error");
+        setStatusMessage((importError as Error).message);
+      } finally {
+        setImportingDocs(false);
+      }
+    },
+    [contents, currentDocId, getS3Client, manifest, rootTitle, storage, syncStructure],
+  );
+
   const createLinkedDocument = useCallback(
     async (action: LinkAction) => {
       if (!manifest || !currentDocId) return;
@@ -966,15 +1760,26 @@ export default function DocumentationViewer({ config }: ModuleProps) {
 
   const tree = useMemo(() => {
     if (!manifest) return [] as Array<{ id: string; depth: number }>;
-    const walk = (docId: string, depth: number): Array<{ id: string; depth: number }> => {
-      const doc = manifest.docs[docId];
-      if (!doc) return [];
-      const nodes = [{ id: docId, depth }];
-      for (const childId of doc.children) nodes.push(...walk(childId, depth + 1));
-      return nodes;
-    };
-    return walk(manifest.rootDocId, 0);
+    return buildVisibleDocTree(manifest, expandedDocIds);
+  }, [expandedDocIds, manifest]);
+
+  useEffect(() => {
+    if (!manifest) return;
+    setExpandedDocIds((prev) => {
+      const next = new Set(prev);
+      for (const id of collectExpandableDocIds(manifest)) next.add(id);
+      return next;
+    });
   }, [manifest]);
+
+  const toggleExpanded = useCallback((docId: string) => {
+    setExpandedDocIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(docId)) next.delete(docId);
+      else next.add(docId);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     if (!editingLabel) {
@@ -1084,6 +1889,8 @@ export default function DocumentationViewer({ config }: ModuleProps) {
           {tree.map(({ id, depth }) => {
             const doc = manifest.docs[id];
             const selected = id === currentDocId;
+            const hasChildren = doc.children.length > 0;
+            const expanded = expandedDocIds.has(id);
             return (
               <button
                 key={id}
@@ -1104,6 +1911,7 @@ export default function DocumentationViewer({ config }: ModuleProps) {
                   fontSize: "0.84rem",
                 }}
               >
+                <TreeToggle expanded={expanded} hasChildren={hasChildren} onClick={() => toggleExpanded(id)} />
                 <span style={{ width: 6, height: 6, borderRadius: "50%", background: selected ? COLORS.accent : COLORS.muted, flexShrink: 0 }} />
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{doc.title}</span>
               </button>
@@ -1136,6 +1944,7 @@ export default function DocumentationViewer({ config }: ModuleProps) {
               <ToolbarButton onClick={() => insertBlock("- List item\n")} label="Bullet" />
               <ToolbarButton onClick={() => insertBlock("\n```ts\ncode\n```\n")} label="Code Block" />
               <ToolbarButton onClick={() => mediaInputRef.current?.click()} label="Media" />
+              <ToolbarButton onClick={() => importDirectoryInputRef.current?.click()} label={importingDocs ? "Importing..." : "Import Folder"} />
               <input
                 ref={mediaInputRef}
                 type="file"
@@ -1146,6 +1955,19 @@ export default function DocumentationViewer({ config }: ModuleProps) {
                   void uploadMediaFiles(files);
                 }}
                 style={{ display: "none" }}
+              />
+              <input
+                ref={importDirectoryInputRef}
+                type="file"
+                multiple
+                disabled={importingDocs}
+                onChange={(event) => {
+                  const files = Array.from(event.currentTarget.files ?? []);
+                  event.currentTarget.value = "";
+                  void importMarkdownDirectory(files);
+                }}
+                style={{ display: "none" }}
+                {...{ webkitdirectory: "", directory: "" }}
               />
             </div>
 
@@ -1171,7 +1993,7 @@ export default function DocumentationViewer({ config }: ModuleProps) {
               )}
             </div>
             <div style={{ marginTop: "0.2rem", fontSize: "0.75rem", color: COLORS.muted, fontFamily: "monospace" }}>
-              doc://{currentDoc.id} ? {currentDoc.relativePath}
+              doc://{currentDoc.id} · {(currentDoc.kind ?? "page") === "section" ? "[section]" : currentDoc.relativePath}
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
@@ -1270,6 +2092,7 @@ export async function onExport(ctx: ExportContext): Promise<void> {
   const copiedMedia = new Set<string>();
 
   for (const doc of Object.values(manifest.docs)) {
+    if ((doc.kind ?? "page") === "section" || !doc.relativePath) continue;
     const sourceKey = `${pagesPrefix}/${doc.relativePath}`;
     const markdown =
       (await readOptionalTextObject(ctx.s3Client as S3Client, storageBucket, sourceKey)) ??
