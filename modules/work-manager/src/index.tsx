@@ -94,6 +94,9 @@ const STATUSES: WorkStatus[] = ["open", "in-progress", "blocked", "done", "archi
 const PRIORITIES: WorkPriority[] = ["low", "normal", "high", "urgent"];
 const KINDS: WorkKind[] = ["task", "event", "task-event", "milestone"];
 const LAYOUT_KEY = "work-manager-layout";
+const DEFAULT_SPLIT_PCT = 38;
+const MIN_SPLIT_PCT = 22;
+const MAX_SPLIT_PCT = 78;
 
 const C = {
   bg: "var(--hep-bg, var(--color-bg, #080f1c))",
@@ -342,6 +345,87 @@ function sortByTimeline(items: WorkItem[]): WorkItem[] {
   });
 }
 
+function compareChartRows(a: ChartRow, b: ChartRow): number {
+  const endCompare = startOfDay(a.end).getTime() - startOfDay(b.end).getTime();
+  if (endCompare) return endCompare;
+
+  const startCompare = startOfDay(a.start).getTime() - startOfDay(b.start).getTime();
+  if (startCompare) return startCompare;
+
+  const kindCompare = kindRank(a.item.kind) - kindRank(b.item.kind);
+  if (kindCompare) return kindCompare;
+
+  return a.item.title.localeCompare(b.item.title);
+}
+
+function sortLaneChartRows(rows: ChartRow[]): ChartRow[] {
+  const rowsById = new Map(rows.map((row) => [row.item.id, row]));
+  const predecessorsById = new Map<string, Set<string>>();
+  const dependentsById = new Map<string, Set<string>>();
+
+  for (const row of rows) {
+    const predecessors = new Set(row.item.dependencies.filter((depId) => rowsById.has(depId)));
+    predecessorsById.set(row.item.id, predecessors);
+    for (const depId of predecessors) {
+      if (!dependentsById.has(depId)) dependentsById.set(depId, new Set());
+      dependentsById.get(depId)!.add(row.item.id);
+    }
+  }
+
+  const emitted = new Set<string>();
+  const ready = rows.filter((row) => (predecessorsById.get(row.item.id)?.size ?? 0) === 0).sort(compareChartRows);
+  const result: ChartRow[] = [];
+  let previousId: string | null = null;
+
+  const takeNextReady = (): ChartRow | undefined => {
+    if (previousId) {
+      const dependencyId = previousId;
+      const continuation = ready
+        .filter((row) => predecessorsById.get(row.item.id)?.has(dependencyId))
+        .sort(compareChartRows)[0];
+      if (continuation) {
+        ready.splice(ready.findIndex((row) => row.item.id === continuation.item.id), 1);
+        return continuation;
+      }
+    }
+
+    ready.sort(compareChartRows);
+    return ready.shift();
+  };
+
+  while (ready.length) {
+    const next = takeNextReady();
+    if (!next) break;
+    result.push(next);
+    emitted.add(next.item.id);
+    previousId = next.item.id;
+
+    for (const dependentId of dependentsById.get(next.item.id) ?? []) {
+      if (emitted.has(dependentId) || ready.some((row) => row.item.id === dependentId)) continue;
+      const predecessors = predecessorsById.get(dependentId) ?? new Set<string>();
+      if ([...predecessors].every((predecessorId) => emitted.has(predecessorId))) {
+        const dependent = rowsById.get(dependentId);
+        if (dependent) ready.push(dependent);
+      }
+    }
+  }
+
+  const unresolved = rows.filter((row) => !emitted.has(row.item.id)).sort(compareChartRows);
+  return [...result, ...unresolved];
+}
+
+function sortChartRows(rows: ChartRow[]): ChartRow[] {
+  const lanes = new Map<string, ChartRow[]>();
+  for (const row of rows) {
+    const key = laneRank(row.item.lane);
+    lanes.set(key, [...(lanes.get(key) ?? []), row]);
+  }
+
+  return [...lanes.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .flatMap(([, laneRows]) => sortLaneChartRows(laneRows));
+}
+
 function deriveWindow(item: WorkItem, itemsById: Map<string, WorkItem>, stack = new Set<string>()): { start: Date | null; end: Date | null; isMilestone: boolean } {
   const isMilestone = item.kind === "milestone";
   const durationDays = isMilestone ? 0 : Math.max(1, item.durationDays ?? 1);
@@ -368,10 +452,10 @@ function deriveWindow(item: WorkItem, itemsById: Map<string, WorkItem>, stack = 
 }
 
 function buildChartSpec(items: WorkItem[]): ChartSpec | null {
-  const scheduled = sortByTimeline(items.filter(isScheduledItem));
+  const scheduled = items.filter(isScheduledItem);
   if (scheduled.length === 0) return null;
   const itemsById = new Map(items.map((item) => [item.id, item]));
-  const rows = scheduled.flatMap((item) => {
+  const rows = sortChartRows(scheduled.flatMap((item) => {
     const { start, end, isMilestone } = deriveWindow(item, itemsById);
     if (!start || !end) return [];
     return {
@@ -381,10 +465,13 @@ function buildChartSpec(items: WorkItem[]): ChartSpec | null {
       lane: item.lane?.trim() || "Default",
       isMilestone,
     };
-  });
+  }));
   if (rows.length === 0) return null;
-  const minDate = rows.reduce((min, row) => row.start < min ? row.start : min, rows[0]!.start);
-  const maxDate = rows.reduce((max, row) => row.end > max ? row.end : max, rows[0]!.end);
+  const today = startOfDay(new Date());
+  const minRowDate = rows.reduce((min, row) => row.start < min ? row.start : min, rows[0]!.start);
+  const maxRowDate = rows.reduce((max, row) => row.end > max ? row.end : max, rows[0]!.end);
+  const minDate = today < minRowDate ? today : minRowDate;
+  const maxDate = today > maxRowDate ? today : maxRowDate;
   const startDate = addCalendarDays(startOfDay(minDate), -1);
   const endDate = addCalendarDays(startOfDay(maxDate), 2);
   return {
@@ -489,6 +576,12 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
     });
   });
 
+  const todayOffset = calendarDaysBetween(spec.startDate, startOfDay(new Date()));
+  if (todayOffset >= 0 && todayOffset <= spec.dayCount) {
+    const todayX = todayOffset * dayWidth + dayWidth / 2;
+    lines.push(`<line x1="${todayX}" y1="0" x2="${todayX}" y2="${svgHeight}" stroke="#ef4444" stroke-width="2" stroke-dasharray="6 5"/>`);
+  }
+
   lines.push(`</svg>`);
   return lines.join("");
 }
@@ -554,17 +647,23 @@ async function exportSvgAsPng(svgMarkup: string, filename: string): Promise<void
   }
 }
 
-function readSavedLayout(): Pick<Filters, "viewMode" | "orientation"> {
+function clampSplitPct(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_SPLIT_PCT;
+  return Math.max(MIN_SPLIT_PCT, Math.min(MAX_SPLIT_PCT, value));
+}
+
+function readSavedLayout(): Pick<Filters, "viewMode" | "orientation"> & { splitPct: number } {
   try {
     const raw = localStorage.getItem(LAYOUT_KEY);
-    if (!raw) return { viewMode: "planner", orientation: "horizontal" };
-    const parsed = JSON.parse(raw) as Partial<Pick<Filters, "viewMode" | "orientation">>;
+    if (!raw) return { viewMode: "planner", orientation: "horizontal", splitPct: DEFAULT_SPLIT_PCT };
+    const parsed = JSON.parse(raw) as Partial<Pick<Filters, "viewMode" | "orientation">> & { splitPct?: number };
     return {
       viewMode: parsed.viewMode === "tasks" || parsed.viewMode === "gantt" || parsed.viewMode === "planner" ? parsed.viewMode : "planner",
       orientation: parsed.orientation === "vertical" ? "vertical" : "horizontal",
+      splitPct: clampSplitPct(Number(parsed.splitPct ?? DEFAULT_SPLIT_PCT)),
     };
   } catch {
-    return { viewMode: "planner", orientation: "horizontal" };
+    return { viewMode: "planner", orientation: "horizontal", splitPct: DEFAULT_SPLIT_PCT };
   }
 }
 
@@ -591,6 +690,7 @@ export default function WorkManager({ config }: ModuleProps) {
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
   const [editorState, setEditorState] = useState<EditorState | null>(null);
   const [zoom, setZoom] = useState(1);
+  const [splitPct, setSplitPct] = useState(savedLayout.splitPct);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | undefined>();
@@ -667,8 +767,8 @@ export default function WorkManager({ config }: ModuleProps) {
   }, [auth.tables?.projects, currentUserEmail, getDdbClient, project.projectId]);
 
   useEffect(() => {
-    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ viewMode: filters.viewMode, orientation: filters.orientation }));
-  }, [filters.orientation, filters.viewMode]);
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify({ viewMode: filters.viewMode, orientation: filters.orientation, splitPct }));
+  }, [filters.orientation, filters.viewMode, splitPct]);
 
   const saveDraft = useCallback(async (draft: WorkItem, isNew: boolean) => {
     const normalized: WorkItem = {
@@ -899,10 +999,23 @@ export default function WorkManager({ config }: ModuleProps) {
         ) : filters.viewMode === "gantt" ? (
           <GanttPanel spec={ganttSpec} svgMarkup={ganttSvg} selectedItemId={selectedItemId} onSelect={openExisting} zoom={zoom} onZoom={setZoom} />
         ) : (
-          <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: filters.orientation === "horizontal" ? "row" : "column", gap: "0.75rem" }}>
-            <div style={{ flex: filters.orientation === "horizontal" ? "0 0 38%" : "0 0 42%", minHeight: 0, minWidth: 0 }}>
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              display: "flex",
+              flexDirection: filters.orientation === "horizontal" ? "row" : "column",
+              gap: 0,
+            }}
+          >
+            <div style={{ flex: `0 0 ${splitPct}%`, minHeight: 0, minWidth: 0 }}>
               <TaskPanel items={taskListItems} selectedItemId={selectedItemId} onSelect={openExisting} />
             </div>
+            <PlannerSplitter
+              orientation={filters.orientation}
+              value={splitPct}
+              onChange={setSplitPct}
+            />
             <div style={{ flex: 1, minHeight: 0, minWidth: 0 }}>
               <GanttPanel spec={ganttSpec} svgMarkup={ganttSvg} selectedItemId={selectedItemId} onSelect={openExisting} zoom={zoom} onZoom={setZoom} />
             </div>
@@ -979,6 +1092,95 @@ function TaskPanel({
         ))}
       </div>
     </section>
+  );
+}
+
+function PlannerSplitter({
+  orientation,
+  value,
+  onChange,
+}: {
+  orientation: SplitOrientation;
+  value: number;
+  onChange: React.Dispatch<React.SetStateAction<number>>;
+}) {
+  const dragRef = useRef<{
+    pointerId: number;
+    startClient: number;
+    startValue: number;
+    totalSize: number;
+  } | null>(null);
+  const isHorizontal = orientation === "horizontal";
+
+  const startDrag = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    const container = event.currentTarget.parentElement;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const totalSize = isHorizontal ? rect.width : rect.height;
+    if (totalSize <= 0) return;
+
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startClient: isHorizontal ? event.clientX : event.clientY,
+      startValue: value,
+      totalSize,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }, [isHorizontal, value]);
+
+  const updateDrag = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const currentClient = isHorizontal ? event.clientX : event.clientY;
+    const deltaPct = ((currentClient - drag.startClient) / drag.totalSize) * 100;
+    onChange(clampSplitPct(Math.round((drag.startValue + deltaPct) * 10) / 10));
+  }, [isHorizontal, onChange]);
+
+  const stopDrag = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragRef.current;
+    if (drag?.pointerId === event.pointerId) {
+      dragRef.current = null;
+    }
+  }, []);
+
+  return (
+    <button
+      type="button"
+      aria-label={isHorizontal ? "Resize task and Gantt columns" : "Resize task and Gantt rows"}
+      title={isHorizontal ? "Drag to resize task and Gantt columns" : "Drag to resize task and Gantt rows"}
+      onPointerDown={startDrag}
+      onPointerMove={updateDrag}
+      onPointerUp={stopDrag}
+      onPointerCancel={stopDrag}
+      onDoubleClick={() => onChange(DEFAULT_SPLIT_PCT)}
+      style={{
+        flex: "0 0 auto",
+        width: isHorizontal ? 14 : "100%",
+        height: isHorizontal ? "100%" : 14,
+        border: "none",
+        padding: 0,
+        margin: isHorizontal ? "0 0.5rem" : "0.5rem 0",
+        background: "transparent",
+        cursor: isHorizontal ? "col-resize" : "row-resize",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        touchAction: "none",
+      }}
+    >
+      <span
+        aria-hidden="true"
+        style={{
+          display: "block",
+          width: isHorizontal ? 4 : 52,
+          height: isHorizontal ? 52 : 4,
+          borderRadius: 999,
+          background: C.border,
+          boxShadow: `0 0 0 1px ${C.panel2}`,
+        }}
+      />
+    </button>
   );
 }
 
