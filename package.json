@@ -15,6 +15,7 @@
     "modules/document-viewer",
     "modules/documentation-viewer",
     "modules/links",
+    "modules/test-manager",
     "modules/task-tracker",
     "modules/work-manager",
     "modules/kicad-board-viewer",
