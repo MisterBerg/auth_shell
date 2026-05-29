@@ -273,7 +273,7 @@ function defaultItem(userEmail?: string, kind: WorkKind = "task"): WorkItem {
     createdBy: userEmail,
     attachments: [],
     startAt: undefined,
-    durationDays: kind === "milestone" ? 0 : 1,
+    durationDays: 0,
     allDay: true,
     location: undefined,
     progress: 0,
@@ -291,7 +291,7 @@ function normalizeLoadedStore(store: WorkStore | null, projectId: string): WorkS
       ...defaultItem(undefined, item.kind ?? "task"),
       ...item,
       progress: typeof item.progress === "number" ? Math.max(0, Math.min(100, item.progress)) : 0,
-      durationDays: item.kind === "milestone" ? 0 : Math.max(1, item.durationDays ?? 1),
+      durationDays: item.kind === "milestone" ? 0 : Math.max(0, item.durationDays ?? 0),
       dependencies: Array.isArray(item.dependencies) ? item.dependencies.filter(Boolean) : [],
       lane: item.lane ?? "",
     })),
@@ -315,10 +315,12 @@ function matchesFilters(item: WorkItem, filters: Filters): boolean {
 }
 
 function isScheduledItem(item: WorkItem): boolean {
+  if (item.kind !== "milestone" && Math.max(0, item.durationDays ?? 0) === 0) return false;
   return Boolean(item.startAt || item.dependencies.length);
 }
 
 function itemTimeLabel(item: WorkItem): string {
+  if (item.kind !== "milestone" && Math.max(0, item.durationDays ?? 0) === 0) return "Task list only";
   if (item.startAt && item.durationDays && item.durationDays > 0) return `${formatDate(item.startAt)} · ${item.durationDays}d`;
   if (item.startAt) return `Starts ${formatDate(item.startAt)}`;
   if (item.dependencies.length && item.durationDays && item.durationDays > 0) return `From dependencies · ${item.durationDays}d`;
@@ -428,7 +430,8 @@ function sortChartRows(rows: ChartRow[]): ChartRow[] {
 
 function deriveWindow(item: WorkItem, itemsById: Map<string, WorkItem>, stack = new Set<string>()): { start: Date | null; end: Date | null; isMilestone: boolean } {
   const isMilestone = item.kind === "milestone";
-  const durationDays = isMilestone ? 0 : Math.max(1, item.durationDays ?? 1);
+  const durationDays = isMilestone ? 0 : Math.max(0, item.durationDays ?? 0);
+  if (!isMilestone && durationDays === 0) return { start: null, end: null, isMilestone };
   if (stack.has(item.id)) return { start: null, end: null, isMilestone };
   let startDate: Date | null = null;
   if (item.startAt) {
@@ -795,7 +798,7 @@ export default function WorkManager({ config }: ModuleProps) {
       title: draft.title.trim() || "Untitled task",
       updatedAt: nowIso(),
       progress: Math.max(0, Math.min(100, Number(draft.progress) || 0)),
-      durationDays: draft.kind === "milestone" ? 0 : Math.max(1, Number(draft.durationDays) || 1),
+      durationDays: draft.kind === "milestone" ? 0 : Math.max(0, Number(draft.durationDays) || 0),
       dependencies: [...new Set(draft.dependencies.filter(Boolean))],
       lane: draft.lane?.trim() || "",
     };
@@ -938,7 +941,7 @@ export default function WorkManager({ config }: ModuleProps) {
           createdAt: at,
           updatedAt: at,
           createdBy: currentUserEmail,
-          durationDays: item.kind === "milestone" ? 0 : Math.max(1, item.durationDays ?? 1),
+          durationDays: item.kind === "milestone" ? 0 : Math.max(0, item.durationDays ?? 0),
           dependencies: Array.isArray(item.dependencies) ? item.dependencies.filter(Boolean) : [],
           progress: typeof item.progress === "number" ? Math.max(0, Math.min(100, item.progress)) : 0,
         };
@@ -1058,6 +1061,31 @@ export default function WorkManager({ config }: ModuleProps) {
           }}
           onSaveAndCreateDependency={async (draft) => {
             const saved = await saveDraft(draft, editorState.isNew);
+            const dependency = {
+              ...defaultItem(currentUserEmail, "task"),
+              id: makeId("work"),
+              title: `Dependency for ${saved.title}`,
+              lane: saved.lane || "",
+            };
+            const updatedSaved = {
+              ...saved,
+              dependencies: [...new Set([dependency.id, ...saved.dependencies])],
+              updatedAt: nowIso(),
+            };
+            const nextStore = {
+              ...store,
+              items: [
+                dependency,
+                updatedSaved,
+                ...store.items.filter((item) => item.id !== saved.id),
+              ],
+            };
+            await persist(nextStore);
+            setSelectedItemId(dependency.id);
+            setEditorState({ draft: { ...dependency, tags: [...dependency.tags], dependencies: [...dependency.dependencies], attachments: [...dependency.attachments] }, isNew: false });
+          }}
+          onSaveAndCreateDependent={async (draft) => {
+            const saved = await saveDraft(draft, editorState.isNew);
             openNew("task", { lane: saved.lane || "", dependencies: [saved.id] });
           }}
           onDelete={editorState.isNew ? undefined : async (draft) => { await deleteItem(draft); }}
@@ -1086,34 +1114,295 @@ function TaskPanel({
   selectedItemId: string | null;
   onSelect: (itemId: string) => void;
 }) {
+  const itemIdsKey = useMemo(() => items.map((item) => item.id).sort().join("|"), [items]);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
+  const tree = useMemo(() => buildMilestoneTaskGroups(items), [items]);
+
+  useEffect(() => {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      for (const itemId of tree.expandableIds) next.add(itemId);
+      return next;
+    });
+  }, [itemIdsKey, tree.expandableIds]);
+
+  const toggleExpanded = useCallback((itemId: string) => {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
+  }, []);
+
+  const renderItem = useCallback((item: WorkItem, repeated: boolean): React.ReactNode => {
+    return (
+      <button key={item.id} onClick={() => onSelect(item.id)} style={itemRowStyle(item, item.id === selectedItemId)}>
+        <span style={{ width: 8, height: 62, borderRadius: 99, background: priorityColor(item.priority), flexShrink: 0 }} />
+        <span style={{ minWidth: 0, flex: 1, textAlign: "left" }}>
+          <span style={{ display: "flex", alignItems: "center", gap: "0.45rem", flexWrap: "wrap" }}>
+            <strong style={{ fontSize: "0.95rem" }}>{item.title}</strong>
+            <Badge color={kindColor(item.kind)}>{item.kind}</Badge>
+            <Badge color={statusColor(item.status)}>{item.status}</Badge>
+            {item.kind !== "milestone" && Math.max(0, item.durationDays ?? 0) === 0 && <Badge color="#93c5fd">task list</Badge>}
+            {repeated && <Badge color="#93c5fd">linked</Badge>}
+          </span>
+          <span style={{ display: "block", marginTop: "0.25rem", color: C.muted, fontSize: "0.78rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {item.description || item.notes || "No description yet"}
+          </span>
+          <span style={{ display: "block", marginTop: "0.3rem", color: C.muted, fontSize: "0.73rem" }}>
+            {itemTimeLabel(item)} · {item.progress}% · {item.dependencies.length} deps
+          </span>
+        </span>
+      </button>
+    );
+  }, [onSelect, selectedItemId]);
+
+  const renderNode = useCallback((node: TaskDependencyNode, depth: number, path: string[]): React.ReactNode => {
+    const item = node.item;
+    const repeated = (tree.referenceCountById.get(item.id) ?? 0) > 1;
+    const cyclic = path.includes(item.id);
+    const canCollapse = item.kind === "milestone" && node.children.length > 0 && !cyclic;
+    const expanded = !canCollapse || expandedIds.has(item.id);
+    const nextPath = [...path, item.id];
+
+    return (
+      <React.Fragment key={`${path.join("/")}:${item.id}`}>
+        <div style={{ marginLeft: Math.min(depth, 8) * 30, display: "flex", alignItems: "stretch", gap: "0.35rem" }}>
+          <button
+            type="button"
+            aria-label={expanded ? "Collapse milestone dependencies" : "Expand milestone dependencies"}
+            onClick={() => canCollapse && toggleExpanded(item.id)}
+            disabled={!canCollapse}
+            style={{
+              width: 24,
+              alignSelf: "stretch",
+              border: `1px solid ${C.border}`,
+              borderRadius: 8,
+              background: canCollapse ? C.panel2 : "transparent",
+              color: canCollapse ? C.text : C.muted,
+              cursor: canCollapse ? "pointer" : "default",
+              flexShrink: 0,
+            }}
+          >
+            {canCollapse ? (expanded ? "-" : "+") : ""}
+          </button>
+          {renderItem(item, repeated)}
+        </div>
+        {cyclic && (
+          <div style={{ marginLeft: (Math.min(depth + 1, 8) * 30) + 30, color: C.danger, fontSize: "0.76rem" }}>
+            Cycle detected; dependency branch stopped.
+          </div>
+        )}
+        {expanded && !cyclic && node.children.map((child) => renderNode(child, depth + 1, nextPath))}
+      </React.Fragment>
+    );
+  }, [expandedIds, renderItem, toggleExpanded, tree.referenceCountById]);
+
+  const renderGroup = useCallback((group: MilestoneTaskGroup): React.ReactNode => {
+    const expanded = expandedIds.has(group.milestone.id);
+    return (
+      <React.Fragment key={group.milestone.id}>
+        <div style={{ display: "flex", alignItems: "stretch", gap: "0.35rem" }}>
+          <button
+            type="button"
+            aria-label={expanded ? "Collapse milestone dependencies" : "Expand milestone dependencies"}
+            onClick={() => toggleExpanded(group.milestone.id)}
+            style={{
+              width: 24,
+              alignSelf: "stretch",
+              border: `1px solid ${C.border}`,
+              borderRadius: 8,
+              background: C.panel2,
+              color: C.text,
+              cursor: "pointer",
+              flexShrink: 0,
+            }}
+          >
+            {expanded ? "-" : "+"}
+          </button>
+          {renderItem(group.milestone, (tree.referenceCountById.get(group.milestone.id) ?? 0) > 1)}
+        </div>
+        {expanded && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.45rem" }}>
+            {group.dependencies.length ? group.dependencies.map((node) => (
+              renderNode(node, 1, [group.milestone.id])
+            )) : (
+              <div style={{ color: C.muted, fontSize: "0.78rem", padding: "0.25rem 0.3rem" }}>No dependencies under this milestone.</div>
+            )}
+          </div>
+        )}
+      </React.Fragment>
+    );
+  }, [expandedIds, renderItem, renderNode, toggleExpanded, tree.referenceCountById]);
+
   return (
     <section style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column", border: `1px solid ${C.border}`, borderRadius: 14, background: C.panel, overflow: "hidden" }}>
-      <header style={{ padding: "0.9rem 1rem", borderBottom: `1px solid ${C.border}`, background: C.panel2 }}>
-        <div style={{ fontWeight: 700 }}>Tasks</div>
-        <div style={{ marginTop: "0.15rem", color: C.muted, fontSize: "0.78rem" }}>Always-visible task list for opening details while the schedule stays in view.</div>
+      <header style={{ padding: "0.9rem 1rem", borderBottom: `1px solid ${C.border}`, background: C.panel2, display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem", flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontWeight: 700 }}>Tasks</div>
+          <div style={{ marginTop: "0.15rem", color: C.muted, fontSize: "0.78rem" }}>Milestones with flat prerequisite lists.</div>
+        </div>
+        <div style={{ display: "flex", gap: "0.4rem" }}>
+          <button onClick={() => setExpandedIds(new Set(tree.expandableIds))} style={miniButton()}>Expand</button>
+          <button onClick={() => setExpandedIds(new Set())} style={miniButton()}>Collapse</button>
+        </div>
       </header>
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "0.7rem", display: "flex", flexDirection: "column", gap: "0.55rem" }}>
-        {items.map((item) => (
-          <button key={item.id} onClick={() => onSelect(item.id)} style={itemRowStyle(item, item.id === selectedItemId)}>
-            <span style={{ width: 8, height: 62, borderRadius: 99, background: priorityColor(item.priority), flexShrink: 0 }} />
-            <span style={{ minWidth: 0, flex: 1, textAlign: "left" }}>
-              <span style={{ display: "flex", alignItems: "center", gap: "0.45rem", flexWrap: "wrap" }}>
-                <strong style={{ fontSize: "0.95rem" }}>{item.title}</strong>
-                <Badge color={kindColor(item.kind)}>{item.kind}</Badge>
-                <Badge color={statusColor(item.status)}>{item.status}</Badge>
-              </span>
-              <span style={{ display: "block", marginTop: "0.25rem", color: C.muted, fontSize: "0.78rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {item.description || item.notes || "No description yet"}
-              </span>
-              <span style={{ display: "block", marginTop: "0.3rem", color: C.muted, fontSize: "0.73rem" }}>
-                {itemTimeLabel(item)} · {item.progress}% · {item.dependencies.length} deps
-              </span>
-            </span>
-          </button>
-        ))}
+        {tree.groups.length ? tree.groups.map((group) => renderGroup(group)) : (
+          <div style={{ color: C.muted, fontSize: "0.82rem", padding: "0.3rem" }}>Add a milestone to create a collapsible dependency group.</div>
+        )}
       </div>
     </section>
   );
+}
+
+type MilestoneTaskGroup = {
+  milestone: WorkItem;
+  dependencies: TaskDependencyNode[];
+};
+
+type TaskDependencyNode = {
+  item: WorkItem;
+  children: TaskDependencyNode[];
+};
+
+function buildMilestoneTaskGroups(items: WorkItem[]): {
+  groups: MilestoneTaskGroup[];
+  referenceCountById: Map<string, number>;
+  expandableIds: string[];
+} {
+  const itemsById = new Map(items.map((item) => [item.id, item]));
+  const referenceCountById = new Map<string, number>();
+  const expandableIds = new Set<string>();
+  const nestedMilestoneIds = new Set<string>();
+  const markNestedMilestones = (item: WorkItem, path: Set<string>) => {
+    if (path.has(item.id)) return;
+    if (item.kind === "milestone") nestedMilestoneIds.add(item.id);
+    const nextPath = new Set(path);
+    nextPath.add(item.id);
+    for (const dependencyId of item.dependencies) {
+      const dependency = itemsById.get(dependencyId);
+      if (!dependency) continue;
+      if (dependency.kind === "milestone") nestedMilestoneIds.add(dependency.id);
+      markNestedMilestones(dependency, nextPath);
+    }
+  };
+  for (const milestone of items.filter((item) => item.kind === "milestone")) {
+    for (const dependencyId of milestone.dependencies) {
+      const dependency = itemsById.get(dependencyId);
+      if (dependency) markNestedMilestones(dependency, new Set([milestone.id]));
+    }
+  }
+
+  const rootMilestones = items.filter((item) => {
+    return item.kind === "milestone" && !nestedMilestoneIds.has(item.id);
+  });
+  const milestones = rootMilestones.length ? rootMilestones : items.filter((item) => item.kind === "milestone");
+
+  const countReference = (itemId: string) => {
+    referenceCountById.set(itemId, (referenceCountById.get(itemId) ?? 0) + 1);
+  };
+
+  const makeGroupedNode = (item: WorkItem, path: Set<string>): TaskDependencyNode => {
+    countReference(item.id);
+    if (path.has(item.id)) return { item, children: [] };
+
+    const children = collectDependencyNodes(item, path);
+    if (item.kind === "milestone" && children.length) expandableIds.add(item.id);
+    return {
+      item,
+      children,
+    };
+  };
+
+  const makeScheduledNode = (item: WorkItem, path: Set<string>): TaskDependencyNode => {
+    countReference(item.id);
+    if (path.has(item.id)) return { item, children: [] };
+
+    const nextPath = new Set(path);
+    nextPath.add(item.id);
+    return {
+      item,
+      children: item.dependencies
+        .map((depId) => itemsById.get(depId))
+        .filter((dependency): dependency is WorkItem => Boolean(dependency))
+        .filter(isTaskListOnly)
+        .sort(compareTaskGroupItems)
+        .map((dependency) => makeGroupedNode(dependency, nextPath)),
+    };
+  };
+
+  function collectDependencyNodes(item: WorkItem, path: Set<string>): TaskDependencyNode[] {
+    if (path.has(item.id)) return [];
+
+    const nextPath = new Set(path);
+    nextPath.add(item.id);
+    const nodesById = new Map<string, TaskDependencyNode>();
+    const addDependency = (dependency: WorkItem, localPath: Set<string>) => {
+      if (nodesById.has(dependency.id)) return;
+      if (dependency.kind === "milestone" || isTaskListOnly(dependency)) {
+        nodesById.set(dependency.id, makeGroupedNode(dependency, localPath));
+        return;
+      }
+
+      nodesById.set(dependency.id, makeScheduledNode(dependency, localPath));
+      if (localPath.has(dependency.id)) return;
+
+      const promotedPath = new Set(localPath);
+      promotedPath.add(dependency.id);
+      const promotedDependencies = dependency.dependencies
+        .map((depId) => itemsById.get(depId))
+        .filter((candidate): candidate is WorkItem => Boolean(candidate))
+        .filter((candidate) => !isTaskListOnly(candidate));
+      for (const promotedDependency of promotedDependencies) {
+        addDependency(promotedDependency, promotedPath);
+      }
+    };
+
+    const directDependencies = item.dependencies
+      .map((depId) => itemsById.get(depId))
+      .filter((dependency): dependency is WorkItem => Boolean(dependency))
+      .sort(compareTaskGroupItems);
+
+    for (const dependency of directDependencies) addDependency(dependency, nextPath);
+    return [...nodesById.values()].sort(compareTaskGroupItemsByNode);
+  }
+
+  const groups = milestones
+    .filter((item) => item.kind === "milestone")
+    .sort((a, b) => {
+      const laneCompare = laneRank(a.lane).localeCompare(laneRank(b.lane));
+      if (laneCompare) return laneCompare;
+      const aTime = a.startAt ?? a.createdAt;
+      const bTime = b.startAt ?? b.createdAt;
+      return aTime.localeCompare(bTime) || a.title.localeCompare(b.title);
+    })
+    .map((milestone) => {
+      countReference(milestone.id);
+      const dependencies = collectDependencyNodes(milestone, new Set());
+      if (dependencies.length) expandableIds.add(milestone.id);
+      return { milestone, dependencies };
+    });
+
+  return { groups, referenceCountById, expandableIds: [...expandableIds] };
+}
+
+function isTaskListOnly(item: WorkItem): boolean {
+  return item.kind !== "milestone" && Math.max(0, item.durationDays ?? 0) === 0;
+}
+
+function compareTaskGroupItems(a: WorkItem, b: WorkItem): number {
+  const aGroup = a.kind === "milestone" || isTaskListOnly(a) ? 0 : 1;
+  const bGroup = b.kind === "milestone" || isTaskListOnly(b) ? 0 : 1;
+  if (aGroup !== bGroup) return aGroup - bGroup;
+  const laneCompare = laneRank(a.lane).localeCompare(laneRank(b.lane));
+  if (laneCompare) return laneCompare;
+  return a.title.localeCompare(b.title);
+}
+
+function compareTaskGroupItemsByNode(a: TaskDependencyNode, b: TaskDependencyNode): number {
+  return compareTaskGroupItems(a.item, b.item);
 }
 
 function PlannerSplitter({
@@ -1221,14 +1510,6 @@ function GanttPanel({
   onZoom: React.Dispatch<React.SetStateAction<number>>;
 }) {
   const labelsRef = useRef<HTMLDivElement>(null);
-  const onWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
-    if (!event.ctrlKey && !event.metaKey && Math.abs(event.deltaY) < 4) return;
-    event.preventDefault();
-    onZoom((current) => {
-      const next = current + (event.deltaY < 0 ? 0.12 : -0.12);
-      return Math.max(0.1, Math.min(4, Number(next.toFixed(2))));
-    });
-  }, [onZoom]);
 
   const onTimelineScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
     if (!labelsRef.current) return;
@@ -1253,9 +1534,23 @@ function GanttPanel({
       <header style={{ padding: "0.9rem 1rem", borderBottom: `1px solid ${C.border}`, background: C.panel2, display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
         <div>
           <div style={{ fontWeight: 700 }}>Gantt Schedule</div>
-          <div style={{ marginTop: "0.15rem", color: C.muted, fontSize: "0.78rem" }}>Use mouse wheel to zoom the time scale.</div>
+          <div style={{ marginTop: "0.15rem", color: C.muted, fontSize: "0.78rem" }}>Scroll the chart normally; use the controls to zoom the time scale.</div>
         </div>
-        <div style={{ color: C.muted, fontSize: "0.78rem" }}>Zoom {Math.round(zoom * 100)}%</div>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", color: C.muted, fontSize: "0.78rem" }}>
+          <button onClick={() => onZoom((current) => Math.max(0.1, Number((current - 0.12).toFixed(2))))} style={miniButton()}>-</button>
+          <input
+            aria-label="Gantt zoom"
+            type="range"
+            min={0.1}
+            max={4}
+            step={0.05}
+            value={zoom}
+            onChange={(event) => onZoom(Number(event.target.value))}
+            style={{ width: 150 }}
+          />
+          <button onClick={() => onZoom((current) => Math.min(4, Number((current + 0.12).toFixed(2))))} style={miniButton()}>+</button>
+          <span style={{ minWidth: 48, textAlign: "right" }}>{Math.round(zoom * 100)}%</span>
+        </div>
       </header>
       <div style={{ flex: 1, minHeight: 0, display: "flex", overflow: "hidden" }}>
         {!spec || !svgMarkup ? (
@@ -1303,7 +1598,7 @@ function GanttPanel({
                 ))}
               </div>
             </div>
-            <div style={{ flex: 1, minWidth: 0, minHeight: 0, overflow: "auto", padding: "0.75rem" }} onWheel={onWheel} onScroll={onTimelineScroll}>
+            <div style={{ flex: 1, minWidth: 0, minHeight: 0, overflow: "auto", padding: "0.75rem" }} onScroll={onTimelineScroll}>
               <div dangerouslySetInnerHTML={{ __html: svgMarkup }} />
             </div>
           </>
@@ -1344,6 +1639,7 @@ function WorkDetail({
   onClose,
   onSave,
   onSaveAndCreateDependency,
+  onSaveAndCreateDependent,
   onDelete,
   onDuplicate,
   onUpload,
@@ -1357,6 +1653,7 @@ function WorkDetail({
   onClose: () => void;
   onSave: (draft: WorkItem) => Promise<void>;
   onSaveAndCreateDependency: (draft: WorkItem) => Promise<void>;
+  onSaveAndCreateDependent: (draft: WorkItem) => Promise<void>;
   onDelete?: (draft: WorkItem) => Promise<void>;
   onDuplicate: () => void;
   onUpload: (draft: WorkItem, files: FileList | null) => Promise<void>;
@@ -1404,7 +1701,7 @@ function WorkDetail({
                 <input type="date" value={formatDateInput(draft.startAt)} onChange={(e) => setField("startAt", toIsoDate(e.target.value))} style={inputStyle()} />
               </label>
               <label style={labelStyle()}>Duration (days)
-                <input type="number" min={draft.kind === "milestone" ? 0 : 1} value={draft.kind === "milestone" ? 0 : (draft.durationDays ?? 1)} onChange={(e) => setField("durationDays", draft.kind === "milestone" ? 0 : Math.max(1, Number(e.target.value) || 1))} style={inputStyle()} />
+                <input type="number" min={0} value={draft.kind === "milestone" ? 0 : (draft.durationDays ?? 0)} onChange={(e) => setField("durationDays", draft.kind === "milestone" ? 0 : Math.max(0, Number(e.target.value) || 0))} style={inputStyle()} />
               </label>
               <label style={labelStyle()}>Location
                 <input value={draft.location ?? ""} onChange={(e) => setField("location", e.target.value || undefined)} placeholder="Lab, vehicle bay, remote..." style={inputStyle()} />
@@ -1419,7 +1716,10 @@ function WorkDetail({
             <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, padding: "0.8rem", background: C.panel2 }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem" }}>
                 <div style={{ color: C.text, fontWeight: 700 }}>Dependencies</div>
-                <button onClick={() => void onSaveAndCreateDependency(draft)} style={ghostButton()}>Add New Dependency</button>
+                <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                  <button onClick={() => void onSaveAndCreateDependency(draft)} style={ghostButton()}>Add New Dependency</button>
+                  <button onClick={() => void onSaveAndCreateDependent(draft)} style={ghostButton()}>Add Dependent Task</button>
+                </div>
               </div>
               <input value={dependencyQuery} onChange={(e) => setDependencyQuery(e.target.value)} placeholder="Search tasks, milestones, lanes..." style={{ ...inputStyle(), marginTop: "0.65rem" }} />
               <div style={{ marginTop: "0.7rem", display: "flex", flexWrap: "wrap", gap: "0.4rem" }}>
