@@ -44,6 +44,7 @@ type TestGroup = {
 
 type TestDefinition = {
   program: ValueMap;
+  diagrams: Record<string, DiagramDefinition>;
   linkedValues: Record<string, LinkedValueRecord[]>;
   inputFields: FieldDefinition[];
   testDefinedFields: FieldDefinition[];
@@ -69,8 +70,51 @@ type ResolvedTest = {
 type PreTestAsset = {
   id: string;
   label: string;
-  type: "svg_inline" | "image_url";
+  type: "svg_inline" | "image_url" | "diagram_svg";
   content: string;
+};
+
+type DiagramNode = {
+  id: string;
+  label: string;
+  note?: string;
+  tone?: string;
+  badge?: string;
+};
+
+type DiagramEdge = {
+  id: string;
+  from: string;
+  to: string;
+  label?: string;
+  tone?: string;
+};
+
+type DiagramAnnotation = {
+  label: string;
+  tone?: string;
+  connects: string[];
+};
+
+type DiagramDefinition = {
+  id: string;
+  title?: string;
+  layout: "left-to-right" | "top-to-bottom";
+  nodes: Record<string, DiagramNode>;
+  edges: DiagramEdge[];
+  annotations: DiagramAnnotation[];
+};
+
+type DiagramPatch = {
+  nodes?: Record<string, Partial<DiagramNode>>;
+  update_nodes?: Record<string, Partial<DiagramNode>>;
+  add_nodes?: Record<string, Partial<DiagramNode>>;
+  remove_nodes?: string[];
+  edges?: DiagramEdge[];
+  add_edges?: DiagramEdge[];
+  remove_edges?: string[];
+  annotations?: DiagramAnnotation[];
+  add_annotations?: DiagramAnnotation[];
 };
 
 type EquipmentRuntimeSpec = {
@@ -238,6 +282,14 @@ function escapeMarkdownCell(value: string): string {
   return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function guessLinkedValueSet(fieldId: string): string | undefined {
   if (!fieldId) return undefined;
   if (fieldId.endsWith("_id")) return `${fieldId.slice(0, -3)}s`;
@@ -362,26 +414,9 @@ function normalizeTestGroups(value: unknown): TestGroup[] {
     : [];
 }
 
-function normalizePreTestAssets(value: unknown): PreTestAsset[] {
-  return Array.isArray(value)
-    ? value.flatMap((entry, index) => {
-        const record = toRecord(entry);
-        const type = toStringValue(record.type, "image_url");
-        const content = toStringValue(record.content ?? record.url ?? record.svg, "");
-        if (!content) return [];
-        return [{
-          id: toStringValue(record.id, `asset-${index + 1}`),
-          label: toStringValue(record.label, `Asset ${index + 1}`),
-          type: type === "svg_inline" ? "svg_inline" : "image_url",
-          content,
-        }];
-      })
-    : [];
-}
-
 function normalizeEquipmentRuntime(value: unknown): EquipmentRuntimeSpec[] {
   return Array.isArray(value)
-    ? value.flatMap((entry, index) => {
+    ? value.flatMap((entry, index): EquipmentRuntimeSpec[] => {
         const record = toRecord(entry);
         const provider = toStringValue(record.provider, "");
         const label = toStringValue(record.label, "");
@@ -402,10 +437,307 @@ function normalizeEquipmentRuntime(value: unknown): EquipmentRuntimeSpec[] {
     : [];
 }
 
+function normalizeDiagramNode(id: string, value: unknown): DiagramNode {
+  const record = toRecord(value);
+  return {
+    id,
+    label: toStringValue(record.label ?? record.title ?? record.name, humanize(id)),
+    note: toStringValue(record.note ?? record.description, "") || undefined,
+    tone: toStringValue(record.tone, "") || undefined,
+    badge: toStringValue(record.badge, "") || undefined,
+  };
+}
+
+function normalizeDiagramEdge(value: unknown, index: number): DiagramEdge | null {
+  if (Array.isArray(value)) {
+    const from = toStringValue(value[0], "");
+    const to = toStringValue(value[1], "");
+    if (!from || !to) return null;
+    return {
+      id: toStringValue(value[3], `${from}_to_${to}_${index + 1}`),
+      from,
+      to,
+      label: toStringValue(value[2], "") || undefined,
+    };
+  }
+  const record = toRecord(value);
+  const from = toStringValue(record.from, "");
+  const to = toStringValue(record.to, "");
+  if (!from || !to) return null;
+  return {
+    id: toStringValue(record.id, `${from}_to_${to}_${index + 1}`),
+    from,
+    to,
+    label: toStringValue(record.label, "") || undefined,
+    tone: toStringValue(record.tone, "") || undefined,
+  };
+}
+
+function normalizeDiagramAnnotation(value: unknown): DiagramAnnotation | null {
+  const record = toRecord(value);
+  const label = toStringValue(record.label ?? record.title, "");
+  const connects = Array.isArray(record.connects) ? record.connects.map((item) => String(item)).filter(Boolean) : [];
+  if (!label || connects.length === 0) return null;
+  return {
+    label,
+    tone: toStringValue(record.tone, "") || undefined,
+    connects,
+  };
+}
+
+function normalizeDiagramDefinition(id: string, value: unknown): DiagramDefinition {
+  const record = toRecord(value);
+  const nodes = Object.fromEntries(
+    Object.entries(toRecord(record.nodes)).map(([nodeId, node]) => [nodeId, normalizeDiagramNode(nodeId, node)])
+  );
+  const edges = Array.isArray(record.edges)
+    ? record.edges.flatMap((edge, index) => {
+        const normalized = normalizeDiagramEdge(edge, index);
+        return normalized ? [normalized] : [];
+      })
+    : [];
+  const annotations = Array.isArray(record.annotations)
+    ? record.annotations.flatMap((annotation) => {
+        const normalized = normalizeDiagramAnnotation(annotation);
+        return normalized ? [normalized] : [];
+      })
+    : [];
+  const layout = toStringValue(record.layout, "left-to-right");
+  return {
+    id,
+    title: toStringValue(record.title, "") || undefined,
+    layout: layout === "top-to-bottom" ? "top-to-bottom" : "left-to-right",
+    nodes,
+    edges,
+    annotations,
+  };
+}
+
+function normalizeDiagramDefinitions(value: unknown): Record<string, DiagramDefinition> {
+  return Object.fromEntries(
+    Object.entries(toRecord(value)).map(([id, diagram]) => [id, normalizeDiagramDefinition(id, diagram)])
+  );
+}
+
+function normalizeDiagramPatch(value: unknown): DiagramPatch {
+  const record = toRecord(value);
+  const normalizeNodePatchMap = (candidate: unknown) => Object.fromEntries(
+    Object.entries(toRecord(candidate)).map(([nodeId, node]) => [nodeId, toRecord(node)])
+  );
+  const normalizeEdgeList = (candidate: unknown) => Array.isArray(candidate)
+    ? candidate.flatMap((edge, index) => {
+        const normalized = normalizeDiagramEdge(edge, index);
+        return normalized ? [normalized] : [];
+      })
+    : undefined;
+  const normalizeAnnotationList = (candidate: unknown) => Array.isArray(candidate)
+    ? candidate.flatMap((annotation) => {
+        const normalized = normalizeDiagramAnnotation(annotation);
+        return normalized ? [normalized] : [];
+      })
+    : undefined;
+
+  return {
+    nodes: normalizeNodePatchMap(record.nodes),
+    update_nodes: normalizeNodePatchMap(record.update_nodes),
+    add_nodes: normalizeNodePatchMap(record.add_nodes),
+    remove_nodes: Array.isArray(record.remove_nodes) ? record.remove_nodes.map((item) => String(item)) : undefined,
+    edges: normalizeEdgeList(record.edges),
+    add_edges: normalizeEdgeList(record.add_edges),
+    remove_edges: Array.isArray(record.remove_edges) ? record.remove_edges.map((item) => String(item)) : undefined,
+    annotations: normalizeAnnotationList(record.annotations),
+    add_annotations: normalizeAnnotationList(record.add_annotations),
+  };
+}
+
+function applyDiagramPatch(base: DiagramDefinition, patch: DiagramPatch): DiagramDefinition {
+  const nodes: Record<string, DiagramNode> = Object.fromEntries(
+    Object.entries(base.nodes).map(([id, node]) => [id, { ...node }])
+  );
+  const mergeNode = (nodeId: string, update: Partial<DiagramNode>) => {
+    nodes[nodeId] = {
+      id: nodeId,
+      label: toStringValue(update.label ?? nodes[nodeId]?.label, humanize(nodeId)),
+      note: toStringValue(update.note ?? nodes[nodeId]?.note, "") || undefined,
+      tone: toStringValue(update.tone ?? nodes[nodeId]?.tone, "") || undefined,
+      badge: toStringValue(update.badge ?? nodes[nodeId]?.badge, "") || undefined,
+    };
+  };
+
+  for (const [nodeId, update] of Object.entries(patch.add_nodes ?? {})) mergeNode(nodeId, update);
+  for (const [nodeId, update] of Object.entries(patch.update_nodes ?? {})) mergeNode(nodeId, update);
+  for (const [nodeId, update] of Object.entries(patch.nodes ?? {})) mergeNode(nodeId, update);
+  for (const nodeId of patch.remove_nodes ?? []) delete nodes[nodeId];
+
+  const removedNodeIds = new Set(patch.remove_nodes ?? []);
+  const removedEdgeIds = new Set(patch.remove_edges ?? []);
+  const replacementEdges = patch.edges;
+  const baseEdges = replacementEdges ?? base.edges;
+  const edges = [...baseEdges, ...(patch.add_edges ?? [])]
+    .filter((edge) => !removedEdgeIds.has(edge.id))
+    .filter((edge) => !removedNodeIds.has(edge.from) && !removedNodeIds.has(edge.to))
+    .filter((edge) => nodes[edge.from] && nodes[edge.to]);
+
+  return {
+    ...base,
+    nodes,
+    edges,
+    annotations: [
+      ...(patch.annotations ?? base.annotations),
+      ...(patch.add_annotations ?? []),
+    ],
+  };
+}
+
+function diagramToneColor(tone?: string): { fill: string; stroke: string; text: string } {
+  if (tone === "danger") return { fill: "#450a0a", stroke: "#f87171", text: "#fecaca" };
+  if (tone === "warning" || tone === "observe") return { fill: "#422006", stroke: "#f59e0b", text: "#fed7aa" };
+  if (tone === "ok" || tone === "source") return { fill: "#064e3b", stroke: "#34d399", text: "#d1fae5" };
+  if (tone === "protect") return { fill: "#172554", stroke: "#93c5fd", text: "#dbeafe" };
+  return { fill: "#0f172a", stroke: "#38bdf8", text: "#e5edf8" };
+}
+
+function renderDiagramSvg(diagram: DiagramDefinition): string {
+  const nodes = Object.values(diagram.nodes);
+  const incoming = new Map(nodes.map((node) => [node.id, 0]));
+  const outgoing = new Map<string, string[]>();
+  for (const edge of diagram.edges) {
+    incoming.set(edge.to, (incoming.get(edge.to) ?? 0) + 1);
+    outgoing.set(edge.from, [...(outgoing.get(edge.from) ?? []), edge.to]);
+  }
+
+  const levels = new Map<string, number>();
+  const queue = nodes.filter((node) => (incoming.get(node.id) ?? 0) === 0).map((node) => node.id);
+  if (queue.length === 0 && nodes[0]) queue.push(nodes[0].id);
+  for (const nodeId of queue) levels.set(nodeId, 0);
+
+  while (queue.length) {
+    const nodeId = queue.shift()!;
+    const nextLevel = (levels.get(nodeId) ?? 0) + 1;
+    for (const targetId of outgoing.get(nodeId) ?? []) {
+      if ((levels.get(targetId) ?? -1) < nextLevel) {
+        levels.set(targetId, nextLevel);
+        queue.push(targetId);
+      }
+    }
+  }
+  for (const node of nodes) if (!levels.has(node.id)) levels.set(node.id, 0);
+
+  const byLevel = new Map<number, DiagramNode[]>();
+  for (const node of nodes) {
+    const level = levels.get(node.id) ?? 0;
+    byLevel.set(level, [...(byLevel.get(level) ?? []), node]);
+  }
+
+  const nodeWidth = 155;
+  const nodeHeight = 82;
+  const xGap = 72;
+  const yGap = 32;
+  const topPad = diagram.title ? 92 : 42;
+  const maxLevel = Math.max(0, ...byLevel.keys());
+  const maxRows = Math.max(1, ...[...byLevel.values()].map((items) => items.length));
+  const width = Math.max(620, 48 + (maxLevel + 1) * nodeWidth + maxLevel * xGap + 48);
+  const height = Math.max(260, topPad + maxRows * nodeHeight + (maxRows - 1) * yGap + 118);
+  const positions = new Map<string, { x: number; y: number; cx: number; cy: number }>();
+
+  for (const [level, levelNodes] of byLevel.entries()) {
+    const columnHeight = levelNodes.length * nodeHeight + (levelNodes.length - 1) * yGap;
+    const startY = topPad + Math.max(0, ((height - topPad - 96) - columnHeight) / 2);
+    levelNodes
+      .sort((a, b) => a.label.localeCompare(b.label))
+      .forEach((node, index) => {
+        const x = 48 + level * (nodeWidth + xGap);
+        const y = startY + index * (nodeHeight + yGap);
+        positions.set(node.id, { x, y, cx: x + nodeWidth / 2, cy: y + nodeHeight / 2 });
+      });
+  }
+
+  const edgeMarkup = diagram.edges.map((edge) => {
+    const from = positions.get(edge.from);
+    const to = positions.get(edge.to);
+    if (!from || !to) return "";
+    const tone = diagramToneColor(edge.tone);
+    const x1 = from.cx < to.cx ? from.x + nodeWidth : from.x;
+    const x2 = from.cx < to.cx ? to.x : to.x + nodeWidth;
+    const y1 = from.cy;
+    const y2 = to.cy;
+    const midX = (x1 + x2) / 2;
+    const label = edge.label
+      ? `<text x="${midX}" y="${Math.min(y1, y2) - 8}" text-anchor="middle" fill="#94a3b8" font-size="13">${escapeXml(edge.label)}</text>`
+      : "";
+    return `<path d="M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}" stroke="${tone.stroke}" stroke-width="3" fill="none" marker-end="url(#arrow)"/>${label}`;
+  }).join("\n");
+
+  const nodeMarkup = nodes.map((node) => {
+    const pos = positions.get(node.id);
+    if (!pos) return "";
+    const tone = diagramToneColor(node.tone);
+    const note = node.note ? `<text x="${pos.cx}" y="${pos.y + 55}" text-anchor="middle" fill="#94a3b8" font-size="13">${escapeXml(node.note)}</text>` : "";
+    const badge = node.badge ? `<rect x="${pos.x + 12}" y="${pos.y + nodeHeight - 21}" width="${nodeWidth - 24}" height="18" rx="9" fill="${tone.stroke}" opacity="0.22"/><text x="${pos.cx}" y="${pos.y + nodeHeight - 8}" text-anchor="middle" fill="${tone.text}" font-size="12" font-weight="700">${escapeXml(node.badge)}</text>` : "";
+    return `<rect x="${pos.x}" y="${pos.y}" width="${nodeWidth}" height="${nodeHeight}" rx="12" fill="${tone.fill}" stroke="${tone.stroke}" stroke-width="2"/>
+      <text x="${pos.cx}" y="${pos.y + 30}" text-anchor="middle" fill="${tone.text}" font-size="16" font-weight="700">${escapeXml(node.label)}</text>
+      ${note}
+      ${badge}`;
+  }).join("\n");
+
+  const annotationMarkup = diagram.annotations.map((annotation, index) => {
+    const tone = diagramToneColor(annotation.tone);
+    const connected = annotation.connects.map((id) => positions.get(id)).filter((pos): pos is { x: number; y: number; cx: number; cy: number } => Boolean(pos));
+    const avgX = connected.length ? connected.reduce((sum, pos) => sum + pos.cx, 0) / connected.length : width / 2;
+    const y = height - 72 + index * 24;
+    const lines = connected.map((pos) => `<path d="M ${pos.cx} ${pos.y + nodeHeight} C ${pos.cx} ${y - 28}, ${avgX} ${y - 28}, ${avgX} ${y - 8}" stroke="${tone.stroke}" stroke-width="2" stroke-dasharray="6 6" fill="none"/>`).join("\n");
+    return `${lines}<text x="${avgX}" y="${y}" text-anchor="middle" fill="${tone.text}" font-size="14" font-weight="700">${escapeXml(annotation.label)}</text>`;
+  }).join("\n");
+
+  return `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#dbeafe"/>
+      </marker>
+    </defs>
+    <rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="#07111e"/>
+    ${diagram.title ? `<text x="34" y="40" fill="#e5edf8" font-size="20" font-weight="700">${escapeXml(diagram.title)}</text>` : ""}
+    ${edgeMarkup}
+    ${nodeMarkup}
+    ${annotationMarkup}
+  </svg>`;
+}
+
+function normalizePreTestAssets(value: unknown, diagrams: Record<string, DiagramDefinition>): PreTestAsset[] {
+  return Array.isArray(value)
+    ? value.flatMap((entry, index): PreTestAsset[] => {
+        const record = toRecord(entry);
+        const type = toStringValue(record.type, "image_url");
+        if (type === "diagram" || type === "diagram_ref") {
+          const diagramId = toStringValue(record.diagram ?? record.ref ?? record.diagram_id, "");
+          const base = diagramId ? diagrams[diagramId] : normalizeDiagramDefinition(toStringValue(record.id, `diagram-${index + 1}`), record.diagram);
+          if (!base) return [];
+          const rendered = renderDiagramSvg(applyDiagramPatch(base, normalizeDiagramPatch(record.patch)));
+          return [{
+            id: toStringValue(record.id, `asset-${index + 1}`),
+            label: toStringValue(record.label, base.title ?? `Diagram ${index + 1}`),
+            type: "diagram_svg",
+            content: rendered,
+          }];
+        }
+
+        const content = toStringValue(record.content ?? record.url ?? record.svg, "");
+        if (!content) return [];
+        return [{
+          id: toStringValue(record.id, `asset-${index + 1}`),
+          label: toStringValue(record.label, `Asset ${index + 1}`),
+          type: type === "svg_inline" ? "svg_inline" : "image_url",
+          content,
+        }];
+      })
+    : [];
+}
+
 function parseDefinition(text: string): TestDefinition {
   const parsed = toRecord(parseYaml(text));
   return {
     program: toRecord(parsed.program),
+    diagrams: normalizeDiagramDefinitions(parsed.diagrams),
     linkedValues: normalizeLinkedValues(parsed.linked_values),
     inputFields: normalizeFieldDefinitions(parsed.input_fields),
     testDefinedFields: normalizeFieldDefinitions(parsed.test_defined_fields),
@@ -492,7 +824,7 @@ function buildResolvedTests(definition: TestDefinition): ResolvedTest[] {
   return definition.testGroups.flatMap((group) =>
     group.tests.map((test) => {
       const preTestGuidance = toStringValue(test.values.pre_test_guidance ?? group.values.pre_test_guidance, "") || undefined;
-      const preTestAssets = normalizePreTestAssets(test.values.pre_test_assets ?? group.values.pre_test_assets);
+      const preTestAssets = normalizePreTestAssets(test.values.pre_test_assets ?? group.values.pre_test_assets, definition.diagrams);
       const equipmentRuntime = normalizeEquipmentRuntime(test.values.equipment_runtime ?? group.values.equipment_runtime);
       const definedValues: ValueMap = {
         test_group_id: group.id,
@@ -685,7 +1017,7 @@ function generateReportPages(definition: TestDefinition, run: TestRun, tests: Re
       detail.push("## Pre-Test Assets");
       detail.push("");
       for (const asset of test.preTestAssets) {
-        detail.push(`- ${asset.label}: ${asset.type === "image_url" ? asset.content : "[inline svg asset]"}`);
+        detail.push(`- ${asset.label}: ${asset.type === "image_url" ? asset.content : "[generated svg asset]"}`);
       }
       detail.push("");
     }
@@ -913,7 +1245,7 @@ function PreTestAssetGallery({ assets }: { assets: PreTestAsset[] }) {
         <div key={asset.id} style={{ border: `1px solid ${C.border}`, borderRadius: 14, background: C.panel2, padding: "0.75rem" }}>
           <div style={{ color: C.muted, fontSize: "0.74rem", textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>{asset.label}</div>
           <div style={{ marginTop: "0.55rem" }}>
-            {asset.type === "svg_inline" ? (
+            {asset.type === "svg_inline" || asset.type === "diagram_svg" ? (
               <div
                 style={{ border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden", background: "#07111e" }}
                 dangerouslySetInnerHTML={{ __html: asset.content }}

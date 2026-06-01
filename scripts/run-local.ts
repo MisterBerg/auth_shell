@@ -32,6 +32,7 @@ function main() {
   killPort(BRIDGE_PORT);
 
   runTsx("scripts/compose-up.ts");
+  run(NPM_COMMAND, ["install"]);
   runTsx("scripts/seed-local.ts", [`--developer=${developer}`]);
   runTsx("scripts/update-locals.ts");
 
