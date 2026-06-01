@@ -50,7 +50,7 @@ export default function JeffspaceApp({ config }: ModuleProps) {
   const getS3ClientRef = useRef(getS3Client);
   getS3ClientRef.current = getS3Client;
 
-  const userId = resolveLocalOwnerEmail() ?? userProfile?.email ?? "";
+  const userId = userProfile?.email?.toLowerCase() ?? resolveLocalOwnerEmail() ?? "";
   const projectsBucket = (config.meta?.projectsBucket as string | undefined) ?? config.app.bucket;
 
   const { projects: myProjects, loading: myLoading, error: myError, reload: reloadMine } = useMyProjects(userId);

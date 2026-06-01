@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
 import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { parse as parseYaml } from "yaml";
 import ReactMarkdown from "react-markdown";
@@ -45,6 +45,8 @@ type TestGroup = {
 type TestDefinition = {
   program: ValueMap;
   diagrams: Record<string, DiagramDefinition>;
+  steps: Record<string, ProcedureStep>;
+  procedures: Record<string, ProcedureDefinition>;
   linkedValues: Record<string, LinkedValueRecord[]>;
   inputFields: FieldDefinition[];
   testDefinedFields: FieldDefinition[];
@@ -62,6 +64,8 @@ type ResolvedTest = {
   runtimeDefaults: ValueMap;
   fieldIssues: string[];
   linkedValueIssues: string[];
+  procedureIssues: string[];
+  procedureSteps: ProcedureStep[];
   preTestGuidance?: string;
   preTestAssets: PreTestAsset[];
   equipmentRuntime: EquipmentRuntimeSpec[];
@@ -127,6 +131,27 @@ type EquipmentRuntimeSpec = {
   notes?: string;
 };
 
+type ProcedureStep = {
+  id: string;
+  title: string;
+  instruction: string;
+  expected?: string;
+  requiresEvidence: boolean;
+  safetyCritical: boolean;
+};
+
+type ProcedureEntry = {
+  ref?: string;
+  step?: ProcedureStep;
+};
+
+type ProcedureDefinition = {
+  id: string;
+  title: string;
+  description?: string;
+  steps: ProcedureEntry[];
+};
+
 type ArtifactRef = {
   id: string;
   fieldId?: string;
@@ -140,10 +165,18 @@ type ArtifactRef = {
   uploadedBy?: string;
 };
 
+type StepResult = {
+  status: "not-run" | "done" | "skipped" | "failed" | "blocked";
+  notes: string;
+  checkedAt?: string;
+  checkedBy?: string;
+};
+
 type ResultRecord = {
   status: string;
   inputValues: Record<string, Scalar>;
   notes: string;
+  stepResultsById: Record<string, StepResult>;
   typedArtifacts: Record<string, ArtifactRef[]>;
   supportingArtifacts: ArtifactRef[];
   startedAt?: string;
@@ -178,7 +211,32 @@ type StorageInfo = {
 type ReportPages = {
   summary: string;
   details: Record<string, string>;
+  assets: Record<string, { content: string; contentType: string }>;
 };
+
+class TestManagerBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("[test-manager] render failed:", error, info);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ height: "100%", padding: "1.25rem", background: C.bg, color: C.danger, fontFamily: "\"Segoe UI\", \"Aptos\", sans-serif" }}>
+          <strong>Test Manager failed to render</strong>
+          <pre style={{ marginTop: "0.75rem", whiteSpace: "pre-wrap", color: C.text }}>{this.state.error.message}</pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const C = {
   bg: "var(--hep-bg, #08111d)",
@@ -435,6 +493,57 @@ function normalizeEquipmentRuntime(value: unknown): EquipmentRuntimeSpec[] {
         }];
       })
     : [];
+}
+
+function normalizeProcedureStep(id: string, value: unknown): ProcedureStep {
+  const record = toRecord(value);
+  return {
+    id,
+    title: toStringValue(record.title ?? record.label ?? record.name, humanize(id)),
+    instruction: toStringValue(record.instruction ?? record.action ?? record.description, ""),
+    expected: toStringValue(record.expected ?? record.expected_result ?? record.acceptance, "") || undefined,
+    requiresEvidence: Boolean(record.requires_evidence ?? record.requiresEvidence),
+    safetyCritical: Boolean(record.safety_critical ?? record.safetyCritical),
+  };
+}
+
+function normalizeProcedureEntry(value: unknown, index: number): ProcedureEntry | null {
+  if (typeof value === "string") return { ref: value };
+  const record = toRecord(value);
+  const ref = toStringValue(record.ref ?? record.step_ref ?? record.procedure_ref, "");
+  if (ref) return { ref };
+  const id = toStringValue(record.id, `step-${index + 1}`);
+  const step = normalizeProcedureStep(id, record);
+  return step.instruction || step.title ? { step } : null;
+}
+
+function normalizeProcedureEntries(value: unknown): ProcedureEntry[] {
+  return Array.isArray(value)
+    ? value.flatMap((entry, index) => {
+        const normalized = normalizeProcedureEntry(entry, index);
+        return normalized ? [normalized] : [];
+      })
+    : [];
+}
+
+function normalizeProcedureDefinitions(value: unknown): Record<string, ProcedureDefinition> {
+  return Object.fromEntries(
+    Object.entries(toRecord(value)).map(([id, procedure]) => {
+      const record = toRecord(procedure);
+      return [id, {
+        id,
+        title: toStringValue(record.title ?? record.label ?? record.name, humanize(id)),
+        description: toStringValue(record.description, "") || undefined,
+        steps: normalizeProcedureEntries(record.steps),
+      }];
+    })
+  );
+}
+
+function normalizeProcedureStepDefinitions(value: unknown): Record<string, ProcedureStep> {
+  return Object.fromEntries(
+    Object.entries(toRecord(value)).map(([id, step]) => [id, normalizeProcedureStep(id, step)])
+  );
 }
 
 function normalizeDiagramNode(id: string, value: unknown): DiagramNode {
@@ -738,6 +847,8 @@ function parseDefinition(text: string): TestDefinition {
   return {
     program: toRecord(parsed.program),
     diagrams: normalizeDiagramDefinitions(parsed.diagrams),
+    steps: normalizeProcedureStepDefinitions(parsed.steps),
+    procedures: normalizeProcedureDefinitions(parsed.procedures),
     linkedValues: normalizeLinkedValues(parsed.linked_values),
     inputFields: normalizeFieldDefinitions(parsed.input_fields),
     testDefinedFields: normalizeFieldDefinitions(parsed.test_defined_fields),
@@ -764,6 +875,18 @@ function normalizeResultRecord(value: unknown): ResultRecord {
     status: toStringValue(record.status, "not-run"),
     inputValues: toRecord(record.inputValues) as Record<string, Scalar>,
     notes: toStringValue(record.notes, ""),
+    stepResultsById: Object.fromEntries(
+      Object.entries(toRecord(record.stepResultsById)).map(([stepId, result]) => {
+        const stepResult = toRecord(result);
+        const status = toStringValue(stepResult.status, "not-run");
+        return [stepId, {
+          status: status === "done" || status === "skipped" || status === "failed" || status === "blocked" ? status : "not-run",
+          notes: toStringValue(stepResult.notes, ""),
+          checkedAt: toStringValue(stepResult.checkedAt, "") || undefined,
+          checkedBy: toStringValue(stepResult.checkedBy, "") || undefined,
+        } satisfies StepResult];
+      })
+    ),
     typedArtifacts: Object.fromEntries(Object.entries(toRecord(record.typedArtifacts)).map(([key, artifacts]) => [key, Array.isArray(artifacts) ? artifacts as ArtifactRef[] : []])),
     supportingArtifacts: Array.isArray(record.supportingArtifacts) ? record.supportingArtifacts as ArtifactRef[] : [],
     startedAt: toStringValue(record.startedAt, "") || undefined,
@@ -820,12 +943,57 @@ function coerceRuntimeValue(value: unknown, type: string): Scalar {
   return typeof value === "string" ? value : String(value);
 }
 
+function resolveProcedureSteps(definition: TestDefinition, value: unknown): { steps: ProcedureStep[]; issues: string[] } {
+  const issues: string[] = [];
+  const resolved: ProcedureStep[] = [];
+  const seenProcedureIds = new Set<string>();
+
+  const addStep = (step: ProcedureStep) => {
+    const sameIdCount = resolved.filter((candidate) => candidate.id === step.id || candidate.id.startsWith(`${step.id}-`)).length;
+    resolved.push(sameIdCount === 0 ? step : { ...step, id: `${step.id}-${sameIdCount + 1}` });
+  };
+
+  const resolveEntries = (entries: ProcedureEntry[], source: string) => {
+    for (const entry of entries) {
+      if (entry.step) {
+        addStep(entry.step);
+        continue;
+      }
+      if (!entry.ref) continue;
+
+      const step = definition.steps[entry.ref];
+      if (step) {
+        addStep(step);
+        continue;
+      }
+
+      const procedure = definition.procedures[entry.ref];
+      if (procedure) {
+        if (seenProcedureIds.has(procedure.id)) {
+          issues.push(`${source} references procedure "${procedure.id}" recursively.`);
+          continue;
+        }
+        seenProcedureIds.add(procedure.id);
+        resolveEntries(procedure.steps, procedure.title);
+        seenProcedureIds.delete(procedure.id);
+        continue;
+      }
+
+      issues.push(`${source} references unknown step or procedure "${entry.ref}".`);
+    }
+  };
+
+  resolveEntries(normalizeProcedureEntries(value), "Test procedure");
+  return { steps: resolved, issues };
+}
+
 function buildResolvedTests(definition: TestDefinition): ResolvedTest[] {
   return definition.testGroups.flatMap((group) =>
     group.tests.map((test) => {
       const preTestGuidance = toStringValue(test.values.pre_test_guidance ?? group.values.pre_test_guidance, "") || undefined;
       const preTestAssets = normalizePreTestAssets(test.values.pre_test_assets ?? group.values.pre_test_assets, definition.diagrams);
       const equipmentRuntime = normalizeEquipmentRuntime(test.values.equipment_runtime ?? group.values.equipment_runtime);
+      const procedure = resolveProcedureSteps(definition, test.values.test_steps ?? test.values.procedure ?? group.values.test_steps ?? group.values.procedure);
       const definedValues: ValueMap = {
         test_group_id: group.id,
         test_group_title: group.title,
@@ -875,6 +1043,8 @@ function buildResolvedTests(definition: TestDefinition): ResolvedTest[] {
         runtimeDefaults,
         fieldIssues,
         linkedValueIssues,
+        procedureIssues: procedure.issues,
+        procedureSteps: procedure.steps,
         preTestGuidance,
         preTestAssets,
         equipmentRuntime,
@@ -907,6 +1077,7 @@ function ensureResult(run: TestRun, test: ResolvedTest, userEmail?: string): Res
     status: "not-run",
     inputValues: Object.fromEntries(Object.entries(test.runtimeDefaults).map(([key, value]) => [key, value as Scalar])),
     notes: "",
+    stepResultsById: {},
     typedArtifacts: {},
     supportingArtifacts: [],
     updatedAt: nowIso(),
@@ -971,14 +1142,117 @@ function downloadText(filename: string, content: string, contentType: string): v
   URL.revokeObjectURL(url);
 }
 
+function downloadBlob(filename: string, blob: Blob): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 function markdownArtifactLink(artifact: ArtifactRef): string {
   return `[${artifact.name}](s3://${artifact.bucket}/${artifact.key})`;
+}
+
+function stepStatusLabel(result: StepResult | undefined): string {
+  return humanize(result?.status ?? "not-run");
+}
+
+function safeFileSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "file";
+}
+
+let crcTable: Uint32Array | null = null;
+
+function getCrcTable(): Uint32Array {
+  if (crcTable) return crcTable;
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  crcTable = table;
+  return table;
+}
+
+function crc32(bytes: Uint8Array): number {
+  const table = getCrcTable();
+  let crc = 0xffffffff;
+  for (const byte of bytes) crc = table[(crc ^ byte) & 0xff]! ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date = new Date()): { time: number; date: number } {
+  const year = Math.max(1980, date.getFullYear());
+  return {
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+  };
+}
+
+function u16(value: number): Uint8Array {
+  return new Uint8Array([value & 0xff, (value >>> 8) & 0xff]);
+}
+
+function u32(value: number): Uint8Array {
+  return new Uint8Array([value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff]);
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+
+function createZipBlob(files: Record<string, string>): Blob {
+  const encoder = new TextEncoder();
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+  const stamp = dosDateTime();
+
+  for (const [path, content] of Object.entries(files)) {
+    const nameBytes = encoder.encode(path.replace(/^\/+/, ""));
+    const data = encoder.encode(content);
+    const crc = crc32(data);
+    const localHeader = concatBytes([
+      u32(0x04034b50), u16(20), u16(0), u16(0), u16(stamp.time), u16(stamp.date),
+      u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0), nameBytes,
+    ]);
+    localParts.push(localHeader, data);
+
+    centralParts.push(concatBytes([
+      u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(stamp.time), u16(stamp.date),
+      u32(crc), u32(data.length), u32(data.length), u16(nameBytes.length), u16(0), u16(0),
+      u16(0), u16(0), u32(0), u32(offset), nameBytes,
+    ]));
+    offset += localHeader.length + data.length;
+  }
+
+  const centralDirectory = concatBytes(centralParts);
+  const end = concatBytes([
+    u32(0x06054b50), u16(0), u16(0), u16(centralParts.length), u16(centralParts.length),
+    u32(centralDirectory.length), u32(offset), u16(0),
+  ]);
+
+  const bytes = concatBytes([...localParts, centralDirectory, end]);
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return new Blob([buffer], { type: "application/zip" });
 }
 
 function generateReportPages(definition: TestDefinition, run: TestRun, tests: ResolvedTest[]): ReportPages {
   const title = getProgramTitle(definition, { id: "", app: { bucket: "" } } as ModuleProps["config"]);
   const summary: string[] = [];
   const details: Record<string, string> = {};
+  const assets: Record<string, { content: string; contentType: string }> = {};
 
   summary.push(`# ${title} Report`);
   summary.push("");
@@ -996,7 +1270,7 @@ function generateReportPages(definition: TestDefinition, run: TestRun, tests: Re
 
   for (const test of tests) {
     const result = ensureResult(run, test);
-    summary.push(`| ${escapeMarkdownCell(test.id)} | ${escapeMarkdownCell(test.testGroupId)} | ${escapeMarkdownCell(result.status)} | ${escapeMarkdownCell(valueDisplay(test.definedValues.failure_mode))} | ${escapeMarkdownCell(valueDisplay(test.definedValues.target_module))} | [View](tests/${test.id}.md) |`);
+    summary.push(`| ${escapeMarkdownCell(test.id)} | ${escapeMarkdownCell(test.testGroupId)} | ${escapeMarkdownCell(result.status)} | ${escapeMarkdownCell(valueDisplay(test.definedValues.failure_mode))} | ${escapeMarkdownCell(valueDisplay(test.definedValues.target_module))} | [View](tests/${safeFileSegment(test.id)}.md) |`);
 
     const detail: string[] = [];
     detail.push(`# Test Result: ${test.id}`);
@@ -1014,12 +1288,18 @@ function generateReportPages(definition: TestDefinition, run: TestRun, tests: Re
       detail.push("");
     }
     if (test.preTestAssets.length > 0) {
-      detail.push("## Pre-Test Assets");
+      detail.push("## Diagrams and Pre-Test Assets");
       detail.push("");
       for (const asset of test.preTestAssets) {
-        detail.push(`- ${asset.label}: ${asset.type === "image_url" ? asset.content : "[generated svg asset]"}`);
+        if (asset.type === "image_url") {
+          detail.push(`![${escapeMarkdownCell(asset.label)}](${asset.content})`);
+        } else {
+          const assetPath = `assets/${safeFileSegment(test.id)}-${safeFileSegment(asset.id)}.svg`;
+          assets[assetPath] = { content: asset.content, contentType: "image/svg+xml" };
+          detail.push(`![${escapeMarkdownCell(asset.label)}](../${assetPath})`);
+        }
+        detail.push("");
       }
-      detail.push("");
     }
     if (test.equipmentRuntime.length > 0) {
       detail.push("## Equipment Runtime");
@@ -1035,6 +1315,17 @@ function generateReportPages(definition: TestDefinition, run: TestRun, tests: Re
       detail.push(`- ${humanize(key)}: ${escapeMarkdownCell(valueDisplay(value))}`);
     }
     detail.push("");
+    if (test.procedureSteps.length > 0) {
+      detail.push("## Procedure");
+      detail.push("");
+      detail.push("| Step | Instruction | Expected | Status | Notes |");
+      detail.push("|---|---|---|---|---|");
+      for (const [index, step] of test.procedureSteps.entries()) {
+        const stepResult = result.stepResultsById[step.id];
+        detail.push(`| ${index + 1}. ${escapeMarkdownCell(step.title)} | ${escapeMarkdownCell(step.instruction)} | ${escapeMarkdownCell(valueDisplay(step.expected))} | ${escapeMarkdownCell(stepStatusLabel(stepResult))} | ${escapeMarkdownCell(stepResult?.notes ?? "")} |`);
+      }
+      detail.push("");
+    }
     detail.push("## Runtime Inputs");
     detail.push("");
     for (const [key, value] of Object.entries(result.inputValues)) {
@@ -1064,7 +1355,7 @@ function generateReportPages(definition: TestDefinition, run: TestRun, tests: Re
     details[test.id] = detail.join("\n");
   }
 
-  return { summary: summary.join("\n"), details };
+  return { summary: summary.join("\n"), details, assets };
 }
 
 function FieldInput({
@@ -1237,6 +1528,54 @@ function MarkdownBlock({ value }: { value: string }) {
   );
 }
 
+function reportAnchorForLink(href: string | undefined): string | undefined {
+  if (!href) return href;
+  if (href === "report.md" || href === "./report.md" || href === "../report.md") return "#report-summary";
+
+  const match = href.match(/(?:^|\/)tests\/([^/#?]+)\.md(?:[?#].*)?$/);
+  if (match) return `#test-${safeFileSegment(decodeURIComponent(match[1]))}`;
+
+  return href;
+}
+
+function PrintMarkdownBlock({ value, assets }: { value: string; assets: ReportPages["assets"] }) {
+  const assetUrls = useMemo(() => {
+    const urls = new Map<string, string>();
+    for (const [path, asset] of Object.entries(assets)) {
+      const encoded = btoa(unescape(encodeURIComponent(asset.content)));
+      urls.set(`../${path}`, `data:${asset.contentType};base64,${encoded}`);
+      urls.set(path, `data:${asset.contentType};base64,${encoded}`);
+    }
+    return urls;
+  }, [assets]);
+
+  return (
+    <div style={{ color: "#111827", lineHeight: 1.62, fontSize: "0.95rem" }}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ children }) => <h1 style={{ margin: "0 0 0.75rem", fontSize: "1.55rem", color: "#0f172a" }}>{children}</h1>,
+          h2: ({ children }) => <h2 style={{ margin: "1.15rem 0 0.6rem", fontSize: "1.25rem", color: "#0f172a" }}>{children}</h2>,
+          h3: ({ children }) => <h3 style={{ margin: "0.9rem 0 0.45rem", fontSize: "1.05rem", color: "#0f172a" }}>{children}</h3>,
+          p: ({ children }) => <p style={{ margin: "0.45rem 0", color: "#111827" }}>{children}</p>,
+          ul: ({ children }) => <ul style={{ margin: "0.45rem 0", paddingLeft: "1.2rem", color: "#111827" }}>{children}</ul>,
+          ol: ({ children }) => <ol style={{ margin: "0.45rem 0", paddingLeft: "1.2rem", color: "#111827" }}>{children}</ol>,
+          li: ({ children }) => <li style={{ margin: "0.2rem 0", color: "#111827" }}>{children}</li>,
+          code: ({ children }) => <code style={{ background: "#f1f5f9", color: "#0f172a", padding: "0.1rem 0.25rem", borderRadius: 4 }}>{children}</code>,
+          pre: ({ children }) => <pre style={{ background: "#f8fafc", color: "#0f172a", border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.85rem", overflowX: "auto" }}>{children}</pre>,
+          img: ({ src, alt }) => <img src={assetUrls.get(src ?? "") ?? src ?? ""} alt={alt ?? ""} style={{ maxWidth: "100%", borderRadius: 8, border: "1px solid #cbd5e1", background: "#f8fafc", padding: "0.35rem" }} />,
+          table: ({ children }) => <table style={{ width: "100%", borderCollapse: "collapse", margin: "0.7rem 0", color: "#111827" }}>{children}</table>,
+          th: ({ children }) => <th style={{ textAlign: "left", borderBottom: "1px solid #94a3b8", padding: "0.45rem", color: "#0f172a" }}>{children}</th>,
+          td: ({ children }) => <td style={{ borderBottom: "1px solid #cbd5e1", padding: "0.45rem", verticalAlign: "top", color: "#111827" }}>{children}</td>,
+          a: ({ href, children }) => <a href={reportAnchorForLink(href)} style={{ color: "#0f766e" }}>{children}</a>,
+        }}
+      >
+        {value}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function PreTestAssetGallery({ assets }: { assets: PreTestAsset[] }) {
   if (assets.length === 0) return null;
   return (
@@ -1294,7 +1633,15 @@ function EquipmentRuntimePanel({ specs }: { specs: EquipmentRuntimeSpec[] }) {
   );
 }
 
-export default function TestManager({ config }: ModuleProps) {
+export default function TestManager(props: ModuleProps) {
+  return (
+    <TestManagerBoundary>
+      <TestManagerInner {...props} />
+    </TestManagerBoundary>
+  );
+}
+
+function TestManagerInner({ config }: ModuleProps) {
   const user = useUserProfile();
   const getS3Client = useAwsS3Client();
   const storage = useMemo(() => getStorageInfo(config), [config]);
@@ -1308,6 +1655,8 @@ export default function TestManager({ config }: ModuleProps) {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [reportDialogOpen, setReportDialogOpen] = useState(false);
+  const [printReportOpen, setPrintReportOpen] = useState(false);
 
   const resolvedTests = useMemo(() => definition ? buildResolvedTests(definition) : [], [definition]);
   const testsById = useMemo(() => new Map(resolvedTests.map((test) => [test.id, test])), [resolvedTests]);
@@ -1490,6 +1839,7 @@ export default function TestManager({ config }: ModuleProps) {
       return [
         ...test.fieldIssues.map((issue) => `${test.id}: ${issue}`),
         ...test.linkedValueIssues.map((issue) => `${test.id}: ${issue}`),
+        ...test.procedureIssues.map((issue) => `${test.id}: ${issue}`),
         ...runtimeIssues,
       ];
     });
@@ -1520,12 +1870,47 @@ export default function TestManager({ config }: ModuleProps) {
     return generateReportPages(definition, activeRun, resolvedTests);
   }, [activeRun, definition, resolvedTests]);
 
+  const buildReportFiles = useCallback((): Record<string, string> | null => {
+    if (!definition || !reportPages) return null;
+    return {
+      "report.md": reportPages.summary,
+      ...Object.fromEntries(Object.entries(reportPages.details).map(([testId, content]) => [`tests/${safeFileSegment(testId)}.md`, content])),
+      ...Object.fromEntries(Object.entries(reportPages.assets).map(([path, asset]) => [path, asset.content])),
+      "definition.yaml": definition.sourceText,
+      "workspace.json": JSON.stringify(workspace, null, 2),
+    };
+  }, [definition, reportPages, workspace]);
+
+  const downloadReportZip = useCallback(() => {
+    const files = buildReportFiles();
+    if (!files) return;
+    downloadBlob(`test-report-${safeFileSegment(storage.projectId)}.zip`, createZipBlob(files));
+    setReportDialogOpen(false);
+  }, [buildReportFiles, storage.projectId]);
+
+  const openReportPdf = useCallback(() => {
+    if (!definition || !reportPages || !activeRun) return;
+    setReportDialogOpen(false);
+    setPrintReportOpen(true);
+  }, [activeRun, config, definition, reportPages]);
+
   if (loading || !workspace) {
     return <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: C.bg, color: C.muted }}>Loading test manager...</div>;
   }
 
   return (
     <div style={{ height: "100%", minHeight: 0, display: "grid", gridTemplateRows: "auto auto auto 1fr", background: C.bg, color: C.text, fontFamily: "\"Segoe UI\", \"Aptos\", sans-serif" }}>
+      <style>{`
+        @media print {
+          body * { visibility: hidden !important; }
+          .test-manager-print-root, .test-manager-print-root * { visibility: visible !important; }
+          .test-manager-print-root { position: absolute !important; inset: 0 !important; width: auto !important; height: auto !important; overflow: visible !important; background: white !important; color: #111827 !important; }
+          .test-manager-print-root * { color-adjust: exact !important; print-color-adjust: exact !important; -webkit-print-color-adjust: exact !important; }
+          .test-manager-print-actions { display: none !important; }
+          .test-manager-print-page { break-before: page; }
+          .test-manager-print-root pre { white-space: pre-wrap !important; }
+        }
+      `}</style>
       <header style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, background: C.header, display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
         <div>
           <div style={{ fontSize: "0.72rem", color: C.accent, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 700 }}>Test Manager</div>
@@ -1538,8 +1923,7 @@ export default function TestManager({ config }: ModuleProps) {
         <div style={{ display: "flex", gap: "0.55rem", alignItems: "center", flexWrap: "wrap" }}>
           <button onClick={() => importRef.current?.click()} style={buttonStyle("primary")}>Upload YAML</button>
           <button onClick={() => definition && downloadText(`test-definition-${storage.projectId}.yaml`, definition.sourceText, "text/yaml;charset=utf-8")} style={buttonStyle()} disabled={!definition}>Download YAML</button>
-          <button onClick={() => reportPages && downloadText("report.md", reportPages.summary, "text/markdown;charset=utf-8")} style={buttonStyle()} disabled={!reportPages}>Export Summary</button>
-          <button onClick={() => downloadText(`test-workspace-${storage.projectId}.json`, JSON.stringify(workspace, null, 2), "application/json")} style={buttonStyle()}>Export Workspace</button>
+          <button onClick={() => setReportDialogOpen(true)} style={buttonStyle()} disabled={!reportPages}>Generate Report</button>
           <button onClick={createRun} style={buttonStyle()}>New Run</button>
           <button onClick={() => void loadAll()} style={buttonStyle()}>Reload</button>
           <input
@@ -1689,10 +2073,10 @@ export default function TestManager({ config }: ModuleProps) {
                     </section>
                   ) : null}
 
-                  {(selectedTest.fieldIssues.length > 0 || selectedTest.linkedValueIssues.length > 0) && (
+                  {(selectedTest.fieldIssues.length > 0 || selectedTest.linkedValueIssues.length > 0 || selectedTest.procedureIssues.length > 0) && (
                     <section style={{ border: `1px solid ${C.warning}`, borderRadius: 14, background: "rgba(251,191,36,0.08)", padding: "0.95rem 1rem" }}>
                       <div style={{ fontWeight: 700, color: C.warning, marginBottom: "0.45rem" }}>Definition Issues</div>
-                      {[...selectedTest.fieldIssues, ...selectedTest.linkedValueIssues].map((issue) => (
+                      {[...selectedTest.fieldIssues, ...selectedTest.linkedValueIssues, ...selectedTest.procedureIssues].map((issue) => (
                         <div key={issue} style={{ color: C.text, fontSize: "0.88rem", lineHeight: 1.6 }}>{issue}</div>
                       ))}
                     </section>
@@ -1701,7 +2085,7 @@ export default function TestManager({ config }: ModuleProps) {
                   <section style={cardStyle()}>
                     <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Test Definitions</div>
                     <div style={{ marginTop: "0.85rem", display: "grid", gap: "0.45rem" }}>
-                      {definition.testDefinedFields.filter((field) => !["pre_test_guidance", "pre_test_assets", "equipment_runtime"].includes(field.id)).map((field) => {
+                      {definition.testDefinedFields.filter((field) => !["pre_test_guidance", "pre_test_assets", "equipment_runtime", "procedure", "test_steps"].includes(field.id)).map((field) => {
                         const value = selectedTest.definedValues[field.id];
                         const linkedLabel = getLinkedValueLabel(definition, field, value);
                         return (
@@ -1714,6 +2098,96 @@ export default function TestManager({ config }: ModuleProps) {
                       })}
                     </div>
                   </section>
+
+                  {selectedTest.procedureSteps.length > 0 ? (
+                    <section style={cardStyle()}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
+                        <div>
+                          <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Procedure</div>
+                          <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.82rem" }}>Step through the defined test procedure before recording runtime inputs.</div>
+                        </div>
+                        <div style={{ color: C.muted, fontSize: "0.82rem" }}>
+                          {selectedTest.procedureSteps.filter((step) => selectedResult.stepResultsById[step.id]?.status === "done").length} / {selectedTest.procedureSteps.length} done
+                        </div>
+                      </div>
+                      <div style={{ marginTop: "0.9rem", display: "grid", gap: "0.7rem" }}>
+                        {selectedTest.procedureSteps.map((step, index) => {
+                          const stepResult = selectedResult.stepResultsById[step.id] ?? { status: "not-run", notes: "" };
+                          return (
+                            <div key={step.id} style={{ border: `1px solid ${stepResult.status === "done" ? C.ok : step.safetyCritical ? C.warning : C.border}`, borderRadius: 12, background: C.panel2, padding: "0.85rem" }}>
+                              <div style={{ display: "flex", gap: "0.8rem", alignItems: "flex-start" }}>
+                                <input
+                                  type="checkbox"
+                                  checked={stepResult.status === "done"}
+                                  onChange={(event) => updateSelectedResult((current) => ({
+                                    ...current,
+                                    stepResultsById: {
+                                      ...current.stepResultsById,
+                                      [step.id]: {
+                                        ...stepResult,
+                                        status: event.target.checked ? "done" : "not-run",
+                                        checkedAt: event.target.checked ? nowIso() : undefined,
+                                        checkedBy: event.target.checked ? user?.email : undefined,
+                                      },
+                                    },
+                                  }))}
+                                  style={{ marginTop: 4 }}
+                                />
+                                <div style={{ minWidth: 0, flex: 1 }}>
+                                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+                                    <strong>{index + 1}. {step.title}</strong>
+                                    {step.requiresEvidence ? <span style={{ color: C.accent, fontSize: "0.75rem", fontWeight: 700 }}>evidence</span> : null}
+                                    {step.safetyCritical ? <span style={{ color: C.warning, fontSize: "0.75rem", fontWeight: 700 }}>safety</span> : null}
+                                  </div>
+                                  <div style={{ marginTop: "0.4rem", color: C.text, lineHeight: 1.55 }}>{step.instruction}</div>
+                                  {step.expected ? <div style={{ marginTop: "0.35rem", color: C.muted, fontSize: "0.84rem", lineHeight: 1.45 }}>Expected: {step.expected}</div> : null}
+                                  <div style={{ marginTop: "0.65rem", display: "grid", gridTemplateColumns: "minmax(130px, 180px) 1fr", gap: "0.6rem" }}>
+                                    <select
+                                      value={stepResult.status}
+                                      onChange={(event) => updateSelectedResult((current) => ({
+                                        ...current,
+                                        stepResultsById: {
+                                          ...current.stepResultsById,
+                                          [step.id]: {
+                                            ...stepResult,
+                                            status: event.target.value as StepResult["status"],
+                                            checkedAt: event.target.value === "not-run" ? undefined : nowIso(),
+                                            checkedBy: event.target.value === "not-run" ? undefined : user?.email,
+                                          },
+                                        },
+                                      }))}
+                                      style={inputStyle()}
+                                    >
+                                      <option value="not-run">Not Run</option>
+                                      <option value="done">Done</option>
+                                      <option value="skipped">Skipped</option>
+                                      <option value="failed">Failed</option>
+                                      <option value="blocked">Blocked</option>
+                                    </select>
+                                    <input
+                                      value={stepResult.notes}
+                                      onChange={(event) => updateSelectedResult((current) => ({
+                                        ...current,
+                                        stepResultsById: {
+                                          ...current.stepResultsById,
+                                          [step.id]: {
+                                            ...stepResult,
+                                            notes: event.target.value,
+                                          },
+                                        },
+                                      }))}
+                                      placeholder="Step notes"
+                                      style={inputStyle()}
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  ) : null}
 
                   <section style={cardStyle()}>
                     <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Runtime Inputs</div>
@@ -1777,27 +2251,12 @@ export default function TestManager({ config }: ModuleProps) {
                       <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Summary Page Preview</div>
                       <div style={{ marginTop: "0.35rem", color: C.muted, fontSize: "0.84rem" }}>The report exports as a summary page with links to separate per-test detail pages.</div>
                     </div>
-                    <button onClick={() => reportPages && downloadText("report.md", reportPages.summary, "text/markdown;charset=utf-8")} style={buttonStyle("primary")} disabled={!reportPages}>Download Summary</button>
+                    <button onClick={() => setReportDialogOpen(true)} style={buttonStyle("primary")} disabled={!reportPages}>Generate Report</button>
                   </div>
                   <div style={{ margin: "0.95rem 0 0", padding: "0.95rem", borderRadius: 12, background: "#07111e", border: `1px solid ${C.border}` }}>
                     <MarkdownBlock value={reportPages?.summary || "Upload a YAML definition to generate the report preview."} />
                   </div>
               </section>
-
-              {selectedTest && reportPages?.details[selectedTest.id] ? (
-                <section style={cardStyle()}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
-                    <div>
-                      <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Selected Test Detail Preview</div>
-                      <div style={{ marginTop: "0.35rem", color: C.muted, fontSize: "0.84rem" }}>Typed runtime files and ad hoc supporting files are linked from the test page.</div>
-                    </div>
-                    <button onClick={() => downloadText(`${selectedTest.id}.md`, reportPages.details[selectedTest.id], "text/markdown;charset=utf-8")} style={buttonStyle()} disabled={!reportPages?.details[selectedTest.id]}>Download Selected Test Page</button>
-                  </div>
-                  <div style={{ margin: "0.95rem 0 0", padding: "0.95rem", borderRadius: 12, background: "#07111e", border: `1px solid ${C.border}` }}>
-                    <MarkdownBlock value={reportPages.details[selectedTest.id]} />
-                  </div>
-                </section>
-              ) : null}
 
               <section style={cardStyle()}>
                 <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Included Materials</div>
@@ -1812,6 +2271,54 @@ export default function TestManager({ config }: ModuleProps) {
           </section>
         )}
       </main>
+      {reportDialogOpen ? (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.58)", display: "flex", alignItems: "center", justifyContent: "center", padding: "1rem", zIndex: 50 }}>
+          <section style={{ width: "min(520px, 100%)", border: `1px solid ${C.border}`, borderRadius: 16, background: C.panel, boxShadow: "0 24px 80px rgba(0,0,0,0.45)", overflow: "hidden" }}>
+            <header style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, background: C.panel2 }}>
+              <div style={{ fontWeight: 800 }}>Generate Report</div>
+              <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.84rem" }}>Choose a portable PDF view or the full markdown report structure.</div>
+            </header>
+            <div style={{ padding: "1rem 1.1rem", display: "grid", gap: "0.8rem" }}>
+              <button onClick={openReportPdf} style={{ ...buttonStyle("primary"), textAlign: "left", padding: "0.85rem 1rem" }} disabled={!reportPages}>
+                PDF
+                <span style={{ display: "block", marginTop: "0.25rem", color: C.accentText, opacity: 0.78, fontWeight: 500 }}>Opens a print-ready report view. Use the browser print dialog to save as PDF.</span>
+              </button>
+              <button onClick={downloadReportZip} style={{ ...buttonStyle(), textAlign: "left", padding: "0.85rem 1rem" }} disabled={!reportPages}>
+                ZIP
+                <span style={{ display: "block", marginTop: "0.25rem", color: C.muted, fontWeight: 500 }}>Downloads report.md, tests/*.md, generated SVG assets, definition.yaml, and workspace.json.</span>
+              </button>
+            </div>
+            <footer style={{ padding: "0.85rem 1.1rem", borderTop: `1px solid ${C.border}`, display: "flex", justifyContent: "flex-end" }}>
+              <button onClick={() => setReportDialogOpen(false)} style={buttonStyle()}>Cancel</button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
+      {printReportOpen && definition && reportPages && activeRun ? (
+        <div className="test-manager-print-root" style={{ position: "fixed", inset: 0, zIndex: 60, overflow: "auto", background: "#f8fafc", color: "#111827", padding: "1.25rem" }}>
+          <div className="test-manager-print-actions" style={{ position: "sticky", top: 0, zIndex: 2, display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", padding: "0.75rem 0", background: "#f8fafc" }}>
+            <div style={{ fontWeight: 800 }}>Print Report</div>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              <button onClick={() => window.print()} style={{ ...buttonStyle("primary"), borderColor: "#0f766e", background: "#0f766e", color: "white" }}>Print / Save PDF</button>
+              <button onClick={() => setPrintReportOpen(false)} style={{ ...buttonStyle(), color: "#111827", borderColor: "#cbd5e1" }}>Close</button>
+            </div>
+          </div>
+          <article style={{ maxWidth: 980, margin: "0 auto", background: "white", border: "1px solid #e5e7eb", borderRadius: 12, padding: "1.2rem 1.4rem", boxShadow: "0 16px 50px rgba(15,23,42,0.12)" }}>
+            <h1 style={{ marginTop: 0 }}>{getProgramTitle(definition, config)} Report</h1>
+            <p><strong>Run:</strong> {activeRun.label}<br /><strong>Generated:</strong> {formatDate(nowIso())}</p>
+            <section id="report-summary">
+              <h2>Summary</h2>
+              <PrintMarkdownBlock value={reportPages.summary} assets={reportPages.assets} />
+            </section>
+            {Object.entries(reportPages.details).map(([testId, markdown]) => (
+              <section key={testId} id={`test-${safeFileSegment(testId)}`} className="test-manager-print-page">
+                <h2>{testId}</h2>
+                <PrintMarkdownBlock value={markdown} assets={reportPages.assets} />
+              </section>
+            ))}
+          </article>
+        </div>
+      ) : null}
     </div>
   );
 }
