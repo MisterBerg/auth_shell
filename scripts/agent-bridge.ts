@@ -45,6 +45,7 @@ const CAPABILITIES = [
   "workspace_root",
   "appspace_context",
   "appspace_operation_queue",
+  "organizer_memory",
 ];
 
 type AppspaceOperation = {
@@ -63,6 +64,23 @@ type AppspaceSession = {
   updatedAt: string;
   context: Record<string, unknown>;
   operations: AppspaceOperation[];
+};
+
+type OrganizerTimingState = "overdue" | "upcoming" | "no-dates";
+
+type OrganizerItem = {
+  id: string;
+  kind: string;
+  title: string;
+  details?: string;
+  status: string;
+  tags?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+  createdBy?: string;
+  dueAt?: string;
+  followUpAt?: string;
+  linkedWorkItemIds?: string[];
 };
 
 type PythonAllowlistEntry = {
@@ -210,6 +228,12 @@ async function runRpc(body: RpcRequest): Promise<unknown> {
       return getAppspaceContext(body.params);
     case "search_appspace_assets":
       return searchAppspaceAssets(body.params);
+    case "list_organizer_items":
+      return listOrganizerItems(body.params);
+    case "batch_update_organizer_items":
+      return batchUpdateOrganizerItems(body.params);
+    case "mark_organizer_items_complete":
+      return markOrganizerItemsComplete(body.params);
     case "queue_appspace_operation":
       return queueAppspaceOperation(body.params);
     case "list_appspace_operations":
@@ -379,6 +403,168 @@ function searchAppspaceAssets(params: Record<string, unknown> = {}): unknown {
   };
 }
 
+function readOrganizerItemsFromSession(session: AppspaceSession): OrganizerItem[] {
+  const organizer = session.context["organizer"];
+  if (!organizer || typeof organizer !== "object" || Array.isArray(organizer)) {
+    throw new Error("Organizer context is not available in the synced appspace snapshot.");
+  }
+  const items = (organizer as Record<string, unknown>)["items"];
+  if (!Array.isArray(items)) {
+    throw new Error("Organizer items are not available in the synced appspace snapshot.");
+  }
+  return items.filter((item): item is OrganizerItem => Boolean(item && typeof item === "object"));
+}
+
+function getOrganizerAnchorDate(item: OrganizerItem): string | undefined {
+  return item.dueAt ?? item.followUpAt;
+}
+
+function matchesOrganizerTimingState(
+  item: OrganizerItem,
+  timingState: OrganizerTimingState | undefined,
+  now = Date.now(),
+): boolean {
+  if (!timingState) return true;
+  const anchor = getOrganizerAnchorDate(item);
+  if (timingState === "no-dates") {
+    return !anchor;
+  }
+  if (!anchor) return false;
+  if (item.status === "done" || item.status === "archived") {
+    return false;
+  }
+  const anchorTime = new Date(anchor).getTime();
+  if (Number.isNaN(anchorTime)) {
+    return false;
+  }
+  return timingState === "overdue" ? anchorTime < now : anchorTime >= now;
+}
+
+function matchesText(haystack: string, query: string): boolean {
+  if (!query.trim()) return true;
+  return haystack.toLowerCase().includes(query.trim().toLowerCase());
+}
+
+function listOrganizerItems(params: Record<string, unknown> = {}): unknown {
+  const session = getSession(params);
+  const query = typeof params["query"] === "string" ? params["query"] : "";
+  const kind = typeof params["kind"] === "string" ? params["kind"] : "";
+  const status = typeof params["status"] === "string" ? params["status"] : "";
+  const timingState = typeof params["timingState"] === "string"
+    ? params["timingState"] as OrganizerTimingState
+    : undefined;
+  const includeArchived = params["includeArchived"] === true;
+  const limit = clampNumber(params["limit"], 1, 200, 50);
+  const items = readOrganizerItemsFromSession(session)
+    .filter((item) => (includeArchived ? true : item.status !== "archived"))
+    .filter((item) => (kind ? item.kind === kind : true))
+    .filter((item) => (status ? item.status === status : true))
+    .filter((item) => matchesOrganizerTimingState(item, timingState))
+    .filter((item) => matchesText(JSON.stringify(item), query))
+    .sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")))
+    .slice(0, limit);
+  return {
+    sessionId: session.sessionId,
+    count: items.length,
+    totalVisible: readOrganizerItemsFromSession(session).filter((item) => item.status !== "archived").length,
+    items,
+  };
+}
+
+function queueSessionOperation(session: AppspaceSession, operation: string, args: Record<string, unknown>): AppspaceOperation {
+  const now = new Date().toISOString();
+  const queued: AppspaceOperation = {
+    id: `op_${Date.now()}_${randomUUID()}`,
+    operation,
+    args,
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+  };
+  session.operations.push(queued);
+  return queued;
+}
+
+async function waitForOperationCompletion(
+  sessionId: string,
+  operationId: string,
+  timeoutMs = 20000,
+  pollMs = 250,
+): Promise<AppspaceOperation> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= timeoutMs) {
+    const session = appspaceSessions.get(sessionId);
+    const operation = session?.operations.find((item) => item.id === operationId);
+    if (!operation) {
+      throw new Error(`Queued appspace operation disappeared: ${operationId}`);
+    }
+    if (operation.status === "completed" || operation.status === "failed") {
+      return operation;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, pollMs));
+  }
+  throw new Error(`Timed out waiting for appspace operation ${operationId}.`);
+}
+
+async function queueOrganizerMutationAndWait(
+  params: Record<string, unknown>,
+  operation: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const session = getSession(params);
+  const queued = queueSessionOperation(session, operation, args);
+  const timeoutMs = clampNumber(params["timeoutMs"], 1000, 120000, 20000);
+  const completed = await waitForOperationCompletion(session.sessionId, queued.id, timeoutMs);
+  if (completed.status === "failed") {
+    throw new Error(completed.error ?? `Organizer operation failed: ${operation}`);
+  }
+  const result = completed.result;
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const record = result as Record<string, unknown>;
+    const output = typeof record["output"] === "string" ? record["output"] : "";
+    if (output) {
+      try {
+        return JSON.parse(output) as unknown;
+      } catch {
+        return {
+          ...record,
+          output,
+        };
+      }
+    }
+  }
+  return result ?? {
+    status: "completed",
+    sessionId: session.sessionId,
+    operationId: queued.id,
+  };
+}
+
+async function batchUpdateOrganizerItems(params: Record<string, unknown> = {}): Promise<unknown> {
+  const itemIds = Array.isArray(params["itemIds"]) ? params["itemIds"] : [];
+  if (!itemIds.length) {
+    throw new Error("itemIds must be a non-empty array.");
+  }
+  const patch = params["patch"];
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new Error("patch must be an object.");
+  }
+  return queueOrganizerMutationAndWait(params, "batch_update_organizer_items", {
+    itemIds,
+    patch,
+  });
+}
+
+async function markOrganizerItemsComplete(params: Record<string, unknown> = {}): Promise<unknown> {
+  const itemIds = Array.isArray(params["itemIds"]) ? params["itemIds"] : [];
+  if (!itemIds.length) {
+    throw new Error("itemIds must be a non-empty array.");
+  }
+  return queueOrganizerMutationAndWait(params, "mark_organizer_items_complete", {
+    itemIds,
+  });
+}
+
 function queueAppspaceOperation(params: Record<string, unknown> = {}): unknown {
   const session = getSession(params);
   const operation = typeof params["operation"] === "string" ? params["operation"].trim() : "";
@@ -386,16 +572,7 @@ function queueAppspaceOperation(params: Record<string, unknown> = {}): unknown {
     throw new Error("operation is required.");
   }
   const opArgs = params["args"] === undefined ? {} : readRecord(params["args"], "args");
-  const now = new Date().toISOString();
-  const queued: AppspaceOperation = {
-    id: `op_${Date.now()}_${randomUUID()}`,
-    operation,
-    args: opArgs,
-    status: "queued",
-    createdAt: now,
-    updatedAt: now,
-  };
-  session.operations.push(queued);
+  const queued = queueSessionOperation(session, operation, opArgs);
   return {
     status: "queued",
     sessionId: session.sessionId,

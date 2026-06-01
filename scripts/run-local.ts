@@ -82,10 +82,27 @@ function parseDeveloper(): string {
 }
 
 function run(command: string, args: string[]): void {
+  if (process.platform === "win32" && /\.cmd$/i.test(command)) {
+    const shell = process.env["ComSpec"] || "cmd.exe";
+    const commandLine = [command, ...args.map(quoteWindowsArg)].join(" ");
+    execFileSync(shell, ["/d", "/s", "/c", commandLine], {
+      cwd: ROOT,
+      stdio: "inherit",
+    });
+    return;
+  }
+
   execFileSync(command, args, {
     cwd: ROOT,
     stdio: "inherit",
   });
+}
+
+function quoteWindowsArg(value: string): string {
+  if (!/[\s"]/u.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/"/g, '\\"')}"`;
 }
 
 function runTsx(scriptPath: string, scriptArgs: string[] = []): void {

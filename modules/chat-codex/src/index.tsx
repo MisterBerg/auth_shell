@@ -217,6 +217,43 @@ type PersistedChatSession = {
   pendingContinuation: PendingContinuation | null;
 };
 
+type OrganizerItemKind = "note" | "todo" | "follow-up" | "waiting-on" | "idea" | "reminder";
+type OrganizerItemStatus = "open" | "active" | "done" | "archived";
+type OrganizerTimingState = "overdue" | "upcoming" | "no-dates";
+
+type OrganizerItem = {
+  id: string;
+  kind: OrganizerItemKind;
+  title: string;
+  details: string;
+  status: OrganizerItemStatus;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  dueAt?: string;
+  followUpAt?: string;
+  linkedWorkItemIds: string[];
+};
+
+type OrganizerStore = {
+  version: 1;
+  projectId: string;
+  items: OrganizerItem[];
+};
+
+type OrganizerItemInput = {
+  id?: string;
+  kind?: OrganizerItemKind;
+  title: string;
+  details?: string;
+  status?: OrganizerItemStatus;
+  tags?: string[];
+  dueAt?: string;
+  followUpAt?: string;
+  linkedWorkItemIds?: string[];
+};
+
 type AgentRunResult = {
   assistantText: string;
   lastToolMessages: string[];
@@ -417,6 +454,43 @@ const WORK_ITEM_PATCH_SCHEMA = {
     lane: { type: "string" },
   },
   additionalProperties: false,
+} as const;
+
+const ORGANIZER_ITEM_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    kind: { type: "string", enum: ["note", "todo", "follow-up", "waiting-on", "idea", "reminder"] },
+    title: { type: "string" },
+    details: { type: "string" },
+    status: { type: "string", enum: ["open", "active", "done", "archived"] },
+    tags: { type: "array", items: { type: "string" } },
+    dueAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+    followUpAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+  },
+  required: ["title"],
+  additionalProperties: false,
+} as const;
+
+const ORGANIZER_ITEM_PATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: { type: "string", enum: ["note", "todo", "follow-up", "waiting-on", "idea", "reminder"] },
+    title: { type: "string" },
+    details: { type: "string" },
+    status: { type: "string", enum: ["open", "active", "done", "archived"] },
+    tags: { type: "array", items: { type: "string" } },
+    dueAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
+    followUpAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+  },
+  additionalProperties: false,
+} as const;
+
+const ORGANIZER_TIMING_STATE_SCHEMA = {
+  type: "string",
+  enum: ["overdue", "upcoming", "no-dates"],
 } as const;
 
 const TOOL_DEFINITIONS: ToolDefinition[] = [
@@ -684,6 +758,103 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
       },
       required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_organizer_items",
+    description: "List organizer memory items stored for this chat module instance. Supports text, kind, status, and semantic timing filters such as overdue or upcoming.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        kind: { type: "string", enum: ["note", "todo", "follow-up", "waiting-on", "idea", "reminder"] },
+        status: { type: "string", enum: ["open", "active", "done", "archived"] },
+        timingState: ORGANIZER_TIMING_STATE_SCHEMA,
+        includeArchived: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 200 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_organizer_items",
+    description: "Create one or more organizer memory items such as notes, todos, follow-ups, reminders, or waiting-on entries.",
+    parameters: {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          items: ORGANIZER_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["items"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_organizer_item",
+    description: "Update an existing organizer memory item by id.",
+    parameters: {
+      type: "object",
+      properties: {
+        itemId: { type: "string" },
+        patch: ORGANIZER_ITEM_PATCH_SCHEMA,
+      },
+      required: ["itemId", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "delete_organizer_item",
+    description: "Delete an organizer memory item by id.",
+    parameters: {
+      type: "object",
+      properties: {
+        itemId: { type: "string" },
+      },
+      required: ["itemId"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "batch_update_organizer_items",
+    description: "Update several organizer memory items in one call using the same patch.",
+    parameters: {
+      type: "object",
+      properties: {
+        itemIds: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string" },
+        },
+        patch: ORGANIZER_ITEM_PATCH_SCHEMA,
+      },
+      required: ["itemIds", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "mark_organizer_items_complete",
+    description: "Mark one or more organizer memory items complete by setting their status to done.",
+    parameters: {
+      type: "object",
+      properties: {
+        itemIds: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string" },
+        },
+      },
+      required: ["itemIds"],
       additionalProperties: false,
     },
   },
@@ -1793,9 +1964,167 @@ function makeWorkId(): string {
   return cryptoId ? `work-${cryptoId}` : `work-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function makeOrganizerItemId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `org-${cryptoId}` : `org-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function dirnamePath(path: string): string {
   const idx = path.lastIndexOf("/");
   return idx >= 0 ? path.slice(0, idx) : "";
+}
+
+function normalizeOptionalDate(value: unknown, fieldName: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new Error(`${fieldName} must be a string.`);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? new Date(`${value}T00:00:00`)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error(`Invalid ${fieldName}: ${value}`);
+  return date.toISOString();
+}
+
+function defaultOrganizerItem(userEmail?: string, partial?: Partial<OrganizerItem>): OrganizerItem {
+  const at = nowIso();
+  return {
+    id: partial?.id ?? makeOrganizerItemId(),
+    kind: partial?.kind ?? "note",
+    title: partial?.title ?? "New note",
+    details: partial?.details ?? "",
+    status: partial?.status ?? "open",
+    tags: partial?.tags ?? [],
+    createdAt: partial?.createdAt ?? at,
+    updatedAt: partial?.updatedAt ?? at,
+    createdBy: partial?.createdBy ?? userEmail,
+    dueAt: partial?.dueAt,
+    followUpAt: partial?.followUpAt,
+    linkedWorkItemIds: partial?.linkedWorkItemIds ?? [],
+  };
+}
+
+function normalizeOrganizerItem(args: {
+  input: OrganizerItemInput | Partial<OrganizerItem>;
+  existing?: OrganizerItem;
+  userEmail?: string;
+}): OrganizerItem {
+  const at = nowIso();
+  return {
+    id: args.input.id ?? args.existing?.id ?? makeOrganizerItemId(),
+    kind: (args.input.kind ?? args.existing?.kind ?? "note") as OrganizerItemKind,
+    title: args.input.title ?? args.existing?.title ?? "New note",
+    details: args.input.details ?? args.existing?.details ?? "",
+    status: (args.input.status ?? args.existing?.status ?? "open") as OrganizerItemStatus,
+    tags: args.input.tags ?? args.existing?.tags ?? [],
+    createdAt: args.existing?.createdAt ?? at,
+    updatedAt: at,
+    createdBy: args.existing?.createdBy ?? args.userEmail,
+    dueAt: "dueAt" in args.input ? normalizeOptionalDate(args.input.dueAt, "dueAt") : args.existing?.dueAt,
+    followUpAt: "followUpAt" in args.input ? normalizeOptionalDate(args.input.followUpAt, "followUpAt") : args.existing?.followUpAt,
+    linkedWorkItemIds: args.input.linkedWorkItemIds ?? args.existing?.linkedWorkItemIds ?? [],
+  };
+}
+
+function getOrganizerStorage(configBucket: string, configPath: string, projectId: string, moduleId: string) {
+  const projectDir = dirnamePath(configPath);
+  const basePrefix = projectDir ? `${projectDir}/chat-codex/${moduleId}` : `chat-codex/${moduleId}`;
+  return {
+    bucket: configBucket,
+    projectId,
+    storeKey: `${basePrefix}/organizer.json`,
+  };
+}
+
+async function loadOrganizerStore(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  configBucket: string,
+  configPath: string,
+  projectId: string,
+  moduleId: string,
+): Promise<{ storage: ReturnType<typeof getOrganizerStorage>; store: OrganizerStore }> {
+  const storage = getOrganizerStorage(configBucket, configPath, projectId, moduleId);
+  const store = await readOptionalJsonObject<OrganizerStore>(getS3Client, storage.bucket, storage.storeKey);
+  return {
+    storage,
+    store: store ?? { version: 1, projectId: storage.projectId, items: [] },
+  };
+}
+
+async function saveOrganizerStore(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  storage: ReturnType<typeof getOrganizerStorage>,
+  store: OrganizerStore,
+): Promise<void> {
+  await writeJsonObject(getS3Client, storage.bucket, storage.storeKey, store);
+}
+
+function buildOrganizerQueryText(item: OrganizerItem): string {
+  return [
+    item.id,
+    item.kind,
+    item.title,
+    item.details,
+    item.status,
+    item.tags.join(" "),
+    item.createdBy ?? "",
+    item.dueAt ?? "",
+    item.followUpAt ?? "",
+    item.linkedWorkItemIds.join(" "),
+  ].join(" ").toLowerCase();
+}
+
+function getOrganizerAnchorDate(item: OrganizerItem): string | undefined {
+  return item.dueAt ?? item.followUpAt;
+}
+
+function matchesOrganizerTimingState(
+  item: OrganizerItem,
+  timingState: OrganizerTimingState | undefined,
+  now = Date.now(),
+): boolean {
+  if (!timingState) return true;
+  const anchor = getOrganizerAnchorDate(item);
+  if (timingState === "no-dates") {
+    return !anchor;
+  }
+  if (!anchor) return false;
+  if (item.status === "done" || item.status === "archived") {
+    return false;
+  }
+  const anchorTime = new Date(anchor).getTime();
+  if (Number.isNaN(anchorTime)) {
+    return false;
+  }
+  return timingState === "overdue" ? anchorTime < now : anchorTime >= now;
+}
+
+function summarizeOrganizerStore(store: OrganizerStore): string {
+  const visible = store.items.filter((item) => item.status !== "archived");
+  const open = visible.filter((item) => item.status === "open").length;
+  const active = visible.filter((item) => item.status === "active").length;
+  const waiting = visible.filter((item) => item.kind === "waiting-on" && item.status !== "done").length;
+  const dueSoon = visible
+    .filter((item) => item.dueAt && item.status !== "done")
+    .sort((a, b) => String(a.dueAt).localeCompare(String(b.dueAt)))
+    .slice(0, 3)
+    .map((item) => `${item.title} (${item.dueAt?.slice(0, 10)})`);
+  const recent = visible
+    .slice()
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 4)
+    .map((item) => `${item.kind}:${item.title}`);
+  return [
+    `Organizer memory currently has ${visible.length} visible items (${open} open, ${active} active, ${waiting} waiting-on).`,
+    dueSoon.length ? `Upcoming due items: ${dueSoon.join("; ")}.` : "No due items are currently recorded.",
+    recent.length ? `Recently updated items: ${recent.join("; ")}.` : "No organizer items have been captured yet.",
+  ].join(" ");
+}
+
+function formatOrganizerDate(value?: string): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
 async function readOptionalJsonObject<T>(
@@ -2511,8 +2840,28 @@ function compactInputItems(inputItems: Array<InputMessageItem | ResponsesApiOutp
     return { inputItems, truncatedSummary: "" };
   }
 
-  const recentItems = inputItems.slice(-BROWSER_CONTEXT_ITEM_LIMIT);
-  const droppedItems = inputItems.slice(0, Math.max(0, inputItems.length - recentItems.length));
+  const trailingItems = inputItems.slice(-BROWSER_CONTEXT_ITEM_LIMIT);
+  const keepIndexes = new Set<number>();
+  const trailingStart = Math.max(0, inputItems.length - trailingItems.length);
+  for (let index = trailingStart; index < inputItems.length; index++) {
+    keepIndexes.add(index);
+  }
+
+  for (let index = trailingStart; index < inputItems.length; index++) {
+    const item = inputItems[index];
+    if ((item as FunctionCallOutputItem).type !== "function_call_output") continue;
+    for (let cursor = index - 1; cursor >= 0; cursor--) {
+      const candidate = inputItems[cursor];
+      const candidateType = (candidate as { type?: string }).type;
+      if (candidateType === "message" || candidateType === "function_call_output") {
+        break;
+      }
+      keepIndexes.add(cursor);
+    }
+  }
+
+  const recentItems = inputItems.filter((_, index) => keepIndexes.has(index));
+  const droppedItems = inputItems.filter((item) => !recentItems.includes(item));
   const summaryLines: string[] = [];
   let used = 0;
   for (const item of droppedItems) {
@@ -2574,6 +2923,14 @@ function maskBridgeToken(value: string): string {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
+}
+
+function isFunctionCallOutputMismatchError(error: unknown): boolean {
+  return error instanceof Error && /No tool call found for function call output with call_id/i.test(error.message);
+}
+
+function isReasoningItemMismatchError(error: unknown): boolean {
+  return error instanceof Error && /was provided without its required 'reasoning' item/i.test(error.message);
 }
 
 function readBridgeDefaults(): AgentBridgeDefaults {
@@ -2653,6 +3010,13 @@ async function buildAppspaceContextSnapshot(args: {
 }) {
   const context = await loadWorkspaceContext(args.getS3Client, args.configBucket, args.configPath, args.projectId);
   const slots = buildSlotTree(context.rootConfig.children);
+  const { storage: organizerStorage, store: organizerStore } = await loadOrganizerStore(
+    args.getS3Client,
+    args.configBucket,
+    args.configPath,
+    args.projectId,
+    args.config.id,
+  );
   let assets: Array<Record<string, unknown>> = [];
 
   if (args.assetsTable) {
@@ -2713,6 +3077,13 @@ async function buildAppspaceContextSnapshot(args: {
     })),
     bridge: {
       workspaceRoot: args.bridgeWorkspaceRoot || undefined,
+    },
+    organizer: {
+      bucket: organizerStorage.bucket,
+      storeKey: organizerStorage.storeKey,
+      summary: summarizeOrganizerStore(organizerStore),
+      visibleCount: organizerStore.items.filter((item) => item.status !== "archived").length,
+      items: organizerStore.items,
     },
     capabilities: {
       browserAgentCanExecuteAppspaceOperations: true,
@@ -3409,6 +3780,156 @@ async function executeTool(args: {
         }, null, 2),
         toolMessage: `Created work-manager slot ${[...parentPath, parsed.slotId].join(" / ")} with ${items.length} item${items.length === 1 ? "" : "s"}.`,
         mutatedWorkspace: true,
+      };
+    }
+
+    case "list_organizer_items": {
+      const parsed = parseToolArgs<{
+        query?: string;
+        kind?: OrganizerItemKind;
+        status?: OrganizerItemStatus;
+        timingState?: OrganizerTimingState;
+        includeArchived?: boolean;
+        limit?: number;
+      }>(toolCall.arguments);
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const limit = Math.max(1, Math.min(200, parsed.limit ?? 50));
+      const items = store.items
+        .filter((item) => (parsed.includeArchived ? true : item.status !== "archived"))
+        .filter((item) => (parsed.kind ? item.kind === parsed.kind : true))
+        .filter((item) => (parsed.status ? item.status === parsed.status : true))
+        .filter((item) => matchesOrganizerTimingState(item, parsed.timingState))
+        .filter((item) => matchesQuery(buildOrganizerQueryText(item), parsed.query ?? ""))
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        .slice(0, limit);
+      return {
+        output: JSON.stringify({
+          count: items.length,
+          totalVisible: store.items.filter((item) => item.status !== "archived").length,
+          items,
+        }, null, 2),
+        toolMessage: `Listed ${items.length} organizer item${items.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "batch_update_organizer_items": {
+      const parsed = parseToolArgs<{ itemIds: string[]; patch: Partial<OrganizerItem> }>(toolCall.arguments);
+      if (!parsed.itemIds?.length) {
+        throw new Error("At least one organizer item id is required.");
+      }
+      const itemIds = new Set(parsed.itemIds.map((id) => id.trim()).filter(Boolean));
+      if (!itemIds.size) {
+        throw new Error("At least one valid organizer item id is required.");
+      }
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const missing = [...itemIds].filter((id) => !store.items.some((item) => item.id === id));
+      if (missing.length) {
+        throw new Error(`Organizer items not found: ${missing.join(", ")}`);
+      }
+      const updatedItems: OrganizerItem[] = [];
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: store.items.map((item) => {
+          if (!itemIds.has(item.id)) return item;
+          const updated = normalizeOrganizerItem({ input: parsed.patch, existing: item, userEmail });
+          updatedItems.push(updated);
+          return updated;
+        }),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, updatedCount: updatedItems.length, items: updatedItems }, null, 2),
+        toolMessage: `Updated ${updatedItems.length} organizer item${updatedItems.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "mark_organizer_items_complete": {
+      const parsed = parseToolArgs<{ itemIds: string[] }>(toolCall.arguments);
+      if (!parsed.itemIds?.length) {
+        throw new Error("At least one organizer item id is required.");
+      }
+      const itemIds = new Set(parsed.itemIds.map((id) => id.trim()).filter(Boolean));
+      if (!itemIds.size) {
+        throw new Error("At least one valid organizer item id is required.");
+      }
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const missing = [...itemIds].filter((id) => !store.items.some((item) => item.id === id));
+      if (missing.length) {
+        throw new Error(`Organizer items not found: ${missing.join(", ")}`);
+      }
+      const completedItems: OrganizerItem[] = [];
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: store.items.map((item) => {
+          if (!itemIds.has(item.id)) return item;
+          const updated = normalizeOrganizerItem({
+            input: { status: "done" },
+            existing: item,
+            userEmail,
+          });
+          completedItems.push(updated);
+          return updated;
+        }),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, updatedCount: completedItems.length, items: completedItems }, null, 2),
+        toolMessage: `Marked ${completedItems.length} organizer item${completedItems.length === 1 ? "" : "s"} complete.`,
+      };
+    }
+
+    case "create_organizer_items": {
+      const parsed = parseToolArgs<{ items: OrganizerItemInput[] }>(toolCall.arguments);
+      if (!parsed.items?.length) {
+        throw new Error("At least one organizer item is required.");
+      }
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const created = parsed.items.map((input) => normalizeOrganizerItem({ input, userEmail }));
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: [...created, ...store.items],
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, created }, null, 2),
+        toolMessage: `Created ${created.length} organizer item${created.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "update_organizer_item": {
+      const parsed = parseToolArgs<{ itemId: string; patch: Partial<OrganizerItem> }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = store.items.find((item) => item.id === parsed.itemId);
+      if (!existing) {
+        throw new Error(`Organizer item not found: ${parsed.itemId}`);
+      }
+      const updated = normalizeOrganizerItem({ input: parsed.patch, existing, userEmail });
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: store.items.map((item) => item.id === parsed.itemId ? updated : item),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, item: updated }, null, 2),
+        toolMessage: `Updated organizer item ${updated.title}.`,
+      };
+    }
+
+    case "delete_organizer_item": {
+      const parsed = parseToolArgs<{ itemId: string }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = store.items.find((item) => item.id === parsed.itemId);
+      if (!existing) {
+        throw new Error(`Organizer item not found: ${parsed.itemId}`);
+      }
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: store.items.filter((item) => item.id !== parsed.itemId),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, deletedId: parsed.itemId }, null, 2),
+        toolMessage: `Deleted organizer item ${existing.title}.`,
       };
     }
 
@@ -4910,6 +5431,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const [newFolderName, setNewFolderName] = useState("");
   const [composer, setComposer] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [organizerStore, setOrganizerStore] = useState<OrganizerStore>({ version: 1, projectId, items: [] });
+  const [organizerOpen, setOrganizerOpen] = useState(false);
+  const [organizerLoading, setOrganizerLoading] = useState(false);
+  const [organizerError, setOrganizerError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const [stopRequested, setStopRequested] = useState(false);
   const [pendingContinuation, setPendingContinuation] = useState<PendingContinuation | null>(null);
@@ -4968,6 +5493,23 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     }
   }, [bridgeDefaults, bridgeEnabledKey, bridgeTokenKey, bridgeUrlKey, bridgeWorkspaceRootKey]);
 
+  async function refreshOrganizerStore() {
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      setOrganizerStore(store);
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refreshOrganizerStore();
+  }, [config.id, configBucket, configPath, getS3Client, projectId]);
+
   useEffect(() => {
     setMetaDraft({ title, model, systemPrompt });
   }, [title, model, systemPrompt]);
@@ -4999,6 +5541,12 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const canSend = !!apiKey.trim() && !!composer.trim() && !busy;
   const canSaveSettings = !!metaDraft.title.trim() && !!metaDraft.model.trim() && !!metaDraft.systemPrompt.trim() && !busy;
   const continuationPending = Boolean(pendingContinuation);
+  const organizerVisibleItems = organizerStore.items.filter((item) => item.status !== "archived");
+  const organizerSummary = summarizeOrganizerStore(organizerStore);
+  const organizerRecentItems = organizerVisibleItems
+    .slice()
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 6);
 
   async function syncBridgeAppspaceContext(bridge: BridgeConfig | null = activeBridge) {
     if (!bridge) return;
@@ -5382,14 +5930,53 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         kind: "status",
         text: `Working step ${i + 1} of up to ${TOOL_ITERATION_LIMIT}...`,
       });
-      const response = await createOpenAiResponse({
-        apiKey: apiKey.trim(),
-        input: compacted.inputItems,
-        model,
-        instructions,
-        tools: TOOL_DEFINITIONS,
-        signal: args.signal,
-      });
+      let response: ResponsesApiResponse;
+      try {
+        response = await createOpenAiResponse({
+          apiKey: apiKey.trim(),
+          input: compacted.inputItems,
+          model,
+          instructions,
+          tools: TOOL_DEFINITIONS,
+          signal: args.signal,
+        });
+      } catch (error) {
+        if (isFunctionCallOutputMismatchError(error)) {
+          const message =
+            "The agent hit an OpenAI tool-history mismatch while continuing a multi-step run. " +
+            "A tool output no longer matched a preserved tool call in the browser context. " +
+            "I compacted context more safely for future steps, but this run stopped before the model could recover.";
+          args.onProgress({
+            kind: "tool_result",
+            name: "tool_loop",
+            text: message,
+          });
+          return {
+            assistantText: `${message} Original error: ${(error as Error).message}`,
+            lastToolMessages: [message],
+            pending: null,
+            shouldNavigate,
+          };
+        }
+        if (isReasoningItemMismatchError(error)) {
+          const message =
+            "The agent hit an OpenAI reasoning-history mismatch while continuing a multi-step run. " +
+            "A preserved function call no longer had its required reasoning item in browser context. " +
+            "I updated compaction to keep entire tool-response blocks together, but this run stopped before the model could recover.";
+          args.onProgress({
+            kind: "tool_result",
+            name: "tool_loop",
+            text: message,
+          });
+          return {
+            assistantText: `${message} Original error: ${(error as Error).message}`,
+            lastToolMessages: [message],
+            pending: null,
+            shouldNavigate,
+          };
+        }
+        throw error;
+      }
 
       const functionCalls = (response.output ?? []).filter(
         (item): item is ResponsesApiFunctionCall =>
@@ -5432,6 +6019,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             projectId,
             configBucket,
             configPath,
+            userEmail: user?.email?.toLowerCase(),
             getS3Client,
             getDdbClient,
             assetsTable,
@@ -5475,22 +6063,24 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       ];
     }
 
+    const pendingCompacted = compactInputItems(inputItems);
     return {
       assistantText:
         `I reached the current tool-work limit of ${TOOL_ITERATION_LIMIT} steps. ` +
         "I still have my current working context and can keep going from here if you want.",
       lastToolMessages,
       pending: {
-        inputItems,
-        contextBits: args.contextBits,
+        inputItems: pendingCompacted.inputItems,
+        contextBits: pendingCompacted.truncatedSummary
+          ? [...args.contextBits, pendingCompacted.truncatedSummary]
+          : args.contextBits,
         lastToolMessages,
       },
       shouldNavigate,
     };
   }
 
-  async function handleSend() {
-    const input = composer.trim();
+  async function submitUserPrompt(input: string) {
     if (!apiKey.trim() || !input) return;
 
     const userMessage = createMessage("user", input);
@@ -5527,6 +6117,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         bridge
           ? `Local runtime is enabled with workspace root ${bridgeWorkspaceRoot || "unknown"}.`
           : "Local runtime is disabled for this project/module. Do not use local filesystem, shell, Python, or PDF bridge tools unless the user enables it in settings.",
+        organizerSummary,
+        "Organizer memory is available through list_organizer_items, create_organizer_items, update_organizer_item, delete_organizer_item, batch_update_organizer_items, and mark_organizer_items_complete. Use it to maintain durable context when that will help the user.",
         user?.email ? `Signed-in user: ${user.email}.` : undefined,
       ].filter((value): value is string => Boolean(value));
 
@@ -5558,6 +6150,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       if (session.shouldNavigate) {
         window.dispatchEvent(new Event("shell:navigate"));
       }
+      await refreshOrganizerStore();
     } catch (error) {
       console.debug("[chat-codex] tool loop error", {
         message: (error as Error).message,
@@ -5579,6 +6172,28 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setBusy(false);
       setStopRequested(false);
     }
+  }
+
+  async function handleSend() {
+    await submitUserPrompt(composer.trim());
+  }
+
+  async function handleOrganizerSweep() {
+    const today = new Date().toLocaleDateString(undefined, {
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+    });
+    await submitUserPrompt(
+      [
+        `Run an organizer sweep for ${today}.`,
+        "Review the organizer memory first.",
+        "Then check relevant work-manager tasks or schedules if they seem connected.",
+        "Tell me what needs attention now, what looks stale, and what I am likely to forget.",
+        "Update organizer items when that would improve continuity.",
+        "Finish with a short action list.",
+      ].join(" "),
+    );
   }
 
   async function handleContinueWorking() {
@@ -5624,6 +6239,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       if (session.shouldNavigate) {
         window.dispatchEvent(new Event("shell:navigate"));
       }
+      await refreshOrganizerStore();
     } catch (error) {
       console.debug("[chat-codex] continuation error", {
         message: (error as Error).message,
@@ -5683,10 +6299,81 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         <button onClick={clearConversation} style={ghostButtonStyle}>
           Clear
         </button>
+        <button onClick={() => setOrganizerOpen((value) => !value)} style={ghostButtonStyle}>
+          {organizerOpen ? "Hide Organizer" : "Organizer"}
+        </button>
         <button onClick={() => setSettingsOpen((value) => !value)} style={ghostButtonStyle}>
           {settingsOpen ? "Close" : "Settings"}
         </button>
       </div>
+
+      {organizerOpen && (
+        <div style={{ padding: "0.9rem", borderBottom: `1px solid ${C.border}`, background: "#0b1a2d", display: "grid", gap: "0.8rem" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "start", flexWrap: "wrap" }}>
+            <div style={{ minWidth: 0, flex: "1 1 360px" }}>
+              <div style={{ fontSize: "0.78rem", textTransform: "uppercase", letterSpacing: "0.08em", color: C.muted, marginBottom: "0.35rem" }}>
+                Organizer Memory
+              </div>
+              <div style={{ fontSize: "0.84rem", lineHeight: 1.55, color: C.text }}>
+                {organizerSummary}
+              </div>
+              {organizerError && <div style={{ marginTop: "0.45rem", fontSize: "0.74rem", color: C.danger }}>{organizerError}</div>}
+            </div>
+            <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap" }}>
+              <button onClick={() => void refreshOrganizerStore()} style={ghostButtonStyle} disabled={organizerLoading || busy}>
+                {organizerLoading ? "Refreshing..." : "Refresh"}
+              </button>
+              <button onClick={() => void handleOrganizerSweep()} style={primaryButtonStyle} disabled={!apiKey.trim() || busy}>
+                Run Organizer Sweep
+              </button>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "0.6rem" }}>
+            {[
+              ["Visible", String(organizerVisibleItems.length)],
+              ["Open", String(organizerVisibleItems.filter((item) => item.status === "open").length)],
+              ["Active", String(organizerVisibleItems.filter((item) => item.status === "active").length)],
+              ["Waiting On", String(organizerVisibleItems.filter((item) => item.kind === "waiting-on" && item.status !== "done").length)],
+            ].map(([label, value]) => (
+              <div key={label} style={{ padding: "0.75rem 0.8rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                <div style={{ fontSize: "0.72rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</div>
+                <div style={{ marginTop: "0.25rem", fontSize: "1.1rem", fontWeight: 700 }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: "grid", gap: "0.5rem" }}>
+            <div style={{ fontSize: "0.74rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+              Recent Items
+            </div>
+            {organizerRecentItems.length === 0 ? (
+              <div style={{ padding: "0.8rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321", fontSize: "0.8rem", color: C.muted }}>
+                No organizer items yet. Ask Codex to remember notes, follow-ups, reminders, or waiting-on items and it can store them here.
+              </div>
+            ) : (
+              organizerRecentItems.map((item) => (
+                <div key={item.id} style={{ display: "grid", gap: "0.2rem", padding: "0.8rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", flexWrap: "wrap" }}>
+                    <div style={{ fontSize: "0.84rem", fontWeight: 600 }}>{item.title}</div>
+                    <div style={{ fontSize: "0.72rem", color: C.muted }}>{item.kind} · {item.status}</div>
+                  </div>
+                  {item.details ? (
+                    <div style={{ fontSize: "0.78rem", lineHeight: 1.5, color: C.muted }}>
+                      {item.details}
+                    </div>
+                  ) : null}
+                  <div style={{ display: "flex", gap: "0.6rem", flexWrap: "wrap", fontSize: "0.72rem", color: C.muted }}>
+                    {item.dueAt ? <span>Due {formatOrganizerDate(item.dueAt)}</span> : null}
+                    {item.followUpAt ? <span>Follow up {formatOrganizerDate(item.followUpAt)}</span> : null}
+                    {item.tags.length ? <span>Tags: {item.tags.join(", ")}</span> : null}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
 
       {settingsOpen && (
         <div style={{ padding: "0.9rem", borderBottom: `1px solid ${C.border}`, background: C.panelAlt, display: "grid", gap: "0.7rem" }}>
@@ -5830,7 +6517,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
           <div style={{ maxWidth: 720, margin: "0 auto", padding: "1.2rem 1.25rem", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 16 }}>
             <div style={{ fontSize: "0.95rem", fontWeight: 700, marginBottom: "0.45rem" }}>Workspace-side Codex test module</div>
             <div style={{ fontSize: "0.82rem", lineHeight: 1.6, color: C.muted }}>
-              This version can inspect the workspace, browse assets and resources, list published modules, add, update, or remove top-level slots, and use a local bridge for files, commands, and PDF analysis.
+              This version can inspect the workspace, browse assets and resources, manage organizer memory, list published modules, add or update slots, and use a local bridge for files, commands, and PDF analysis.
             </div>
           </div>
         ) : (
@@ -5878,7 +6565,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             value={composer}
             onChange={(event) => setComposer(event.currentTarget.value)}
             onKeyDown={handleComposerKeyDown}
-            placeholder="Ask Codex to inspect the workspace or make a concrete module/config change..."
+            placeholder="Ask Codex to inspect the workspace, remember a follow-up, sweep your open items, or make a concrete module/config change..."
             rows={3}
             style={{ ...inputStyle, resize: "none", minHeight: 84 }}
           />
