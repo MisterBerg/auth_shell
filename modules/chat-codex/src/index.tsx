@@ -219,7 +219,25 @@ type PersistedChatSession = {
 
 type OrganizerItemKind = "note" | "todo" | "follow-up" | "waiting-on" | "idea" | "reminder";
 type OrganizerItemStatus = "open" | "active" | "done" | "archived";
+type WorkObjectiveStatus = "open" | "active" | "blocked" | "done" | "archived";
 type OrganizerTimingState = "overdue" | "upcoming" | "no-dates";
+
+type WorkObjective = {
+  id: string;
+  title: string;
+  scope: string;
+  status: WorkObjectiveStatus;
+  subjects: string[];
+  notes: string;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  targetAt?: string;
+  linkedOrganizerItemIds: string[];
+  linkedWorkItemIds: string[];
+  linkedAssetIds: string[];
+};
 
 type OrganizerItem = {
   id: string;
@@ -234,12 +252,28 @@ type OrganizerItem = {
   dueAt?: string;
   followUpAt?: string;
   linkedWorkItemIds: string[];
+  objectiveIds: string[];
 };
 
 type OrganizerStore = {
   version: 1;
   projectId: string;
   items: OrganizerItem[];
+  objectives: WorkObjective[];
+};
+
+type WorkObjectiveInput = {
+  id?: string;
+  title: string;
+  scope?: string;
+  status?: WorkObjectiveStatus;
+  subjects?: string[];
+  notes?: string;
+  tags?: string[];
+  targetAt?: string;
+  linkedOrganizerItemIds?: string[];
+  linkedWorkItemIds?: string[];
+  linkedAssetIds?: string[];
 };
 
 type OrganizerItemInput = {
@@ -252,6 +286,7 @@ type OrganizerItemInput = {
   dueAt?: string;
   followUpAt?: string;
   linkedWorkItemIds?: string[];
+  objectiveIds?: string[];
 };
 
 type AgentRunResult = {
@@ -468,8 +503,45 @@ const ORGANIZER_ITEM_INPUT_SCHEMA = {
     dueAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
     followUpAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
     linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    objectiveIds: { type: "array", items: { type: "string" } },
   },
   required: ["title"],
+  additionalProperties: false,
+} as const;
+
+const WORK_OBJECTIVE_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    title: { type: "string" },
+    scope: { type: "string", description: "What this objective covers and why it matters." },
+    status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
+    subjects: { type: "array", items: { type: "string" }, description: "Major subjects or workstreams under the objective." },
+    notes: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    targetAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+    linkedOrganizerItemIds: { type: "array", items: { type: "string" } },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    linkedAssetIds: { type: "array", items: { type: "string" } },
+  },
+  required: ["title"],
+  additionalProperties: false,
+} as const;
+
+const WORK_OBJECTIVE_PATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    scope: { type: "string" },
+    status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
+    subjects: { type: "array", items: { type: "string" } },
+    notes: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    targetAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
+    linkedOrganizerItemIds: { type: "array", items: { type: "string" } },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    linkedAssetIds: { type: "array", items: { type: "string" } },
+  },
   additionalProperties: false,
 } as const;
 
@@ -484,6 +556,7 @@ const ORGANIZER_ITEM_PATCH_SCHEMA = {
     dueAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
     followUpAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
     linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    objectiveIds: { type: "array", items: { type: "string" } },
   },
   additionalProperties: false,
 } as const;
@@ -792,6 +865,65 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
       },
       required: ["items"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_work_objectives",
+    description: "List larger work objectives that group notes, todos, work-manager tasks, assets, and project subjects into an overarching scope.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
+        includeArchived: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_work_objectives",
+    description: "Create one or more larger work objectives. Use objectives for durable context such as hardware validation scope, vendor testing scope, document procurement scope, or investigation scope.",
+    parameters: {
+      type: "object",
+      properties: {
+        objectives: {
+          type: "array",
+          minItems: 1,
+          items: WORK_OBJECTIVE_INPUT_SCHEMA,
+        },
+      },
+      required: ["objectives"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_work_objective",
+    description: "Update a larger work objective by id, including its scope, status, subjects, notes, and links to organizer items, work-manager items, or assets.",
+    parameters: {
+      type: "object",
+      properties: {
+        objectiveId: { type: "string" },
+        patch: WORK_OBJECTIVE_PATCH_SCHEMA,
+      },
+      required: ["objectiveId", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "archive_work_objective",
+    description: "Archive a larger work objective by id.",
+    parameters: {
+      type: "object",
+      properties: {
+        objectiveId: { type: "string" },
+      },
+      required: ["objectiveId"],
       additionalProperties: false,
     },
   },
@@ -1969,6 +2101,11 @@ function makeOrganizerItemId(): string {
   return cryptoId ? `org-${cryptoId}` : `org-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function makeWorkObjectiveId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `obj-${cryptoId}` : `obj-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function dirnamePath(path: string): string {
   const idx = path.lastIndexOf("/");
   return idx >= 0 ? path.slice(0, idx) : "";
@@ -2000,6 +2137,7 @@ function defaultOrganizerItem(userEmail?: string, partial?: Partial<OrganizerIte
     dueAt: partial?.dueAt,
     followUpAt: partial?.followUpAt,
     linkedWorkItemIds: partial?.linkedWorkItemIds ?? [],
+    objectiveIds: partial?.objectiveIds ?? [],
   };
 }
 
@@ -2022,6 +2160,56 @@ function normalizeOrganizerItem(args: {
     dueAt: "dueAt" in args.input ? normalizeOptionalDate(args.input.dueAt, "dueAt") : args.existing?.dueAt,
     followUpAt: "followUpAt" in args.input ? normalizeOptionalDate(args.input.followUpAt, "followUpAt") : args.existing?.followUpAt,
     linkedWorkItemIds: args.input.linkedWorkItemIds ?? args.existing?.linkedWorkItemIds ?? [],
+    objectiveIds: args.input.objectiveIds ?? args.existing?.objectiveIds ?? [],
+  };
+}
+
+function normalizeWorkObjective(args: {
+  input: WorkObjectiveInput | Partial<WorkObjective>;
+  existing?: WorkObjective;
+  userEmail?: string;
+}): WorkObjective {
+  const at = nowIso();
+  return {
+    id: args.input.id ?? args.existing?.id ?? makeWorkObjectiveId(),
+    title: args.input.title ?? args.existing?.title ?? "New objective",
+    scope: args.input.scope ?? args.existing?.scope ?? "",
+    status: (args.input.status ?? args.existing?.status ?? "open") as WorkObjectiveStatus,
+    subjects: args.input.subjects ?? args.existing?.subjects ?? [],
+    notes: args.input.notes ?? args.existing?.notes ?? "",
+    tags: args.input.tags ?? args.existing?.tags ?? [],
+    createdAt: args.existing?.createdAt ?? at,
+    updatedAt: at,
+    createdBy: args.existing?.createdBy ?? args.userEmail,
+    targetAt: "targetAt" in args.input ? normalizeOptionalDate(args.input.targetAt, "targetAt") : args.existing?.targetAt,
+    linkedOrganizerItemIds: args.input.linkedOrganizerItemIds ?? args.existing?.linkedOrganizerItemIds ?? [],
+    linkedWorkItemIds: args.input.linkedWorkItemIds ?? args.existing?.linkedWorkItemIds ?? [],
+    linkedAssetIds: args.input.linkedAssetIds ?? args.existing?.linkedAssetIds ?? [],
+  };
+}
+
+function normalizeLoadedOrganizerStore(store: OrganizerStore | null, projectId: string): OrganizerStore {
+  const at = nowIso();
+  return {
+    version: 1,
+    projectId: store?.projectId ?? projectId,
+    items: (store?.items ?? []).map((item) => defaultOrganizerItem(item.createdBy, item)),
+    objectives: (store?.objectives ?? []).map((objective) => ({
+      id: objective.id ?? makeWorkObjectiveId(),
+      title: objective.title ?? "New objective",
+      scope: objective.scope ?? "",
+      status: objective.status ?? "open",
+      subjects: objective.subjects ?? [],
+      notes: objective.notes ?? "",
+      tags: objective.tags ?? [],
+      createdAt: objective.createdAt ?? at,
+      updatedAt: objective.updatedAt ?? objective.createdAt ?? at,
+      createdBy: objective.createdBy,
+      targetAt: objective.targetAt,
+      linkedOrganizerItemIds: objective.linkedOrganizerItemIds ?? [],
+      linkedWorkItemIds: objective.linkedWorkItemIds ?? [],
+      linkedAssetIds: objective.linkedAssetIds ?? [],
+    })),
   };
 }
 
@@ -2046,7 +2234,7 @@ async function loadOrganizerStore(
   const store = await readOptionalJsonObject<OrganizerStore>(getS3Client, storage.bucket, storage.storeKey);
   return {
     storage,
-    store: store ?? { version: 1, projectId: storage.projectId, items: [] },
+    store: normalizeLoadedOrganizerStore(store, storage.projectId),
   };
 }
 
@@ -2070,6 +2258,23 @@ function buildOrganizerQueryText(item: OrganizerItem): string {
     item.dueAt ?? "",
     item.followUpAt ?? "",
     item.linkedWorkItemIds.join(" "),
+    item.objectiveIds.join(" "),
+  ].join(" ").toLowerCase();
+}
+
+function buildObjectiveQueryText(objective: WorkObjective): string {
+  return [
+    objective.id,
+    objective.title,
+    objective.scope,
+    objective.status,
+    objective.subjects.join(" "),
+    objective.notes,
+    objective.tags.join(" "),
+    objective.targetAt ?? "",
+    objective.linkedOrganizerItemIds.join(" "),
+    objective.linkedWorkItemIds.join(" "),
+    objective.linkedAssetIds.join(" "),
   ].join(" ").toLowerCase();
 }
 
@@ -2100,6 +2305,7 @@ function matchesOrganizerTimingState(
 
 function summarizeOrganizerStore(store: OrganizerStore): string {
   const visible = store.items.filter((item) => item.status !== "archived");
+  const objectives = (store.objectives ?? []).filter((objective) => objective.status !== "archived");
   const open = visible.filter((item) => item.status === "open").length;
   const active = visible.filter((item) => item.status === "active").length;
   const waiting = visible.filter((item) => item.kind === "waiting-on" && item.status !== "done").length;
@@ -2113,8 +2319,14 @@ function summarizeOrganizerStore(store: OrganizerStore): string {
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     .slice(0, 4)
     .map((item) => `${item.kind}:${item.title}`);
+  const activeObjectives = objectives
+    .filter((objective) => objective.status === "active" || objective.status === "blocked")
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 4)
+    .map((objective) => `${objective.status}:${objective.title}`);
   return [
-    `Organizer memory currently has ${visible.length} visible items (${open} open, ${active} active, ${waiting} waiting-on).`,
+    `Organizer memory currently has ${objectives.length} visible objectives and ${visible.length} visible items (${open} open, ${active} active, ${waiting} waiting-on).`,
+    activeObjectives.length ? `Active or blocked objectives: ${activeObjectives.join("; ")}.` : "No active objectives are currently recorded.",
     dueSoon.length ? `Upcoming due items: ${dueSoon.join("; ")}.` : "No due items are currently recorded.",
     recent.length ? `Recently updated items: ${recent.join("; ")}.` : "No organizer items have been captured yet.",
   ].join(" ");
@@ -2834,33 +3046,126 @@ function summarizeInputItem(item: InputMessageItem | ResponsesApiOutputItem | Fu
   return raw.length > 240 ? `${raw.slice(0, 240)}...` : raw;
 }
 
+function inputItemType(item: InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem): string | undefined {
+  return (item as { type?: string }).type;
+}
+
+function addResponseBlockForIndex(
+  inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>,
+  keepIndexes: Set<number>,
+  index: number,
+): boolean {
+  let changed = false;
+  let start = index;
+  while (start > 0) {
+    const previousType = inputItemType(inputItems[start - 1]!);
+    if (previousType === "message" || previousType === "function_call_output") break;
+    start--;
+  }
+
+  let end = index + 1;
+  while (end < inputItems.length) {
+    const type = inputItemType(inputItems[end]!);
+    if (type === "message" || type === "function_call_output") break;
+    end++;
+  }
+
+  for (let cursor = start; cursor < end; cursor++) {
+    if (!keepIndexes.has(cursor)) {
+      keepIndexes.add(cursor);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function repairToolHistoryItems(inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>) {
+  const seenCallIds = new Set<string>();
+  return inputItems.filter((item) => {
+    if ((item as ResponsesApiFunctionCall).type === "function_call") {
+      const callId = (item as ResponsesApiFunctionCall).call_id;
+      if (typeof callId === "string") seenCallIds.add(callId);
+      return true;
+    }
+    if ((item as FunctionCallOutputItem).type === "function_call_output") {
+      const callId = (item as FunctionCallOutputItem).call_id;
+      return typeof callId === "string" && seenCallIds.has(callId);
+    }
+    return true;
+  });
+}
+
 function compactInputItems(inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>) {
+  const repairedItems = repairToolHistoryItems(inputItems);
+  if (repairedItems.length !== inputItems.length) {
+    inputItems = repairedItems;
+  }
+
   const serializedLength = inputItems.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
   if (inputItems.length <= BROWSER_CONTEXT_ITEM_LIMIT && serializedLength <= BROWSER_CONTEXT_CHAR_BUDGET) {
     return { inputItems, truncatedSummary: "" };
   }
 
-  const trailingItems = inputItems.slice(-BROWSER_CONTEXT_ITEM_LIMIT);
   const keepIndexes = new Set<number>();
-  const trailingStart = Math.max(0, inputItems.length - trailingItems.length);
+  const trailingStart = Math.max(0, inputItems.length - BROWSER_CONTEXT_ITEM_LIMIT);
   for (let index = trailingStart; index < inputItems.length; index++) {
     keepIndexes.add(index);
   }
 
-  for (let index = trailingStart; index < inputItems.length; index++) {
-    const item = inputItems[index];
-    if ((item as FunctionCallOutputItem).type !== "function_call_output") continue;
-    for (let cursor = index - 1; cursor >= 0; cursor--) {
-      const candidate = inputItems[cursor];
-      const candidateType = (candidate as { type?: string }).type;
-      if (candidateType === "message" || candidateType === "function_call_output") {
-        break;
+  const callIndexesById = new Map<string, number[]>();
+  const outputIndexesByCallId = new Map<string, number[]>();
+  inputItems.forEach((item, index) => {
+    if ((item as ResponsesApiFunctionCall).type === "function_call") {
+      const callId = (item as ResponsesApiFunctionCall).call_id;
+      if (typeof callId === "string") {
+        callIndexesById.set(callId, [...(callIndexesById.get(callId) ?? []), index]);
       }
-      keepIndexes.add(cursor);
+    }
+    if ((item as FunctionCallOutputItem).type === "function_call_output") {
+      const callId = (item as FunctionCallOutputItem).call_id;
+      if (typeof callId === "string") {
+        outputIndexesByCallId.set(callId, [...(outputIndexesByCallId.get(callId) ?? []), index]);
+      }
+    }
+  });
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const index of [...keepIndexes].sort((a, b) => a - b)) {
+      const item = inputItems[index]!;
+      const type = inputItemType(item);
+
+      if (type === "function_call_output") {
+        const output = item as FunctionCallOutputItem;
+        const matchingCallIndex = (callIndexesById.get(output.call_id) ?? [])
+          .filter((candidateIndex) => candidateIndex < index)
+          .at(-1);
+        if (matchingCallIndex !== undefined) {
+          changed = addResponseBlockForIndex(inputItems, keepIndexes, matchingCallIndex) || changed;
+        }
+        continue;
+      }
+
+      if (type === "function_call") {
+        const call = item as ResponsesApiFunctionCall;
+        changed = addResponseBlockForIndex(inputItems, keepIndexes, index) || changed;
+        for (const outputIndex of outputIndexesByCallId.get(call.call_id) ?? []) {
+          if (!keepIndexes.has(outputIndex)) {
+            keepIndexes.add(outputIndex);
+            changed = true;
+          }
+        }
+        continue;
+      }
+
+      if (type !== "message") {
+        changed = addResponseBlockForIndex(inputItems, keepIndexes, index) || changed;
+      }
     }
   }
 
-  const recentItems = inputItems.filter((_, index) => keepIndexes.has(index));
+  const recentItems = repairToolHistoryItems(inputItems.filter((_, index) => keepIndexes.has(index)));
   const droppedItems = inputItems.filter((item) => !recentItems.includes(item));
   const summaryLines: string[] = [];
   let used = 0;
@@ -3083,6 +3388,8 @@ async function buildAppspaceContextSnapshot(args: {
       storeKey: organizerStorage.storeKey,
       summary: summarizeOrganizerStore(organizerStore),
       visibleCount: organizerStore.items.filter((item) => item.status !== "archived").length,
+      visibleObjectiveCount: (organizerStore.objectives ?? []).filter((objective) => objective.status !== "archived").length,
+      objectives: organizerStore.objectives ?? [],
       items: organizerStore.items,
     },
     capabilities: {
@@ -3809,6 +4116,87 @@ async function executeTool(args: {
           items,
         }, null, 2),
         toolMessage: `Listed ${items.length} organizer item${items.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "list_work_objectives": {
+      const parsed = parseToolArgs<{
+        query?: string;
+        status?: WorkObjectiveStatus;
+        includeArchived?: boolean;
+        limit?: number;
+      }>(toolCall.arguments);
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const limit = Math.max(1, Math.min(100, parsed.limit ?? 50));
+      const objectives = (store.objectives ?? [])
+        .filter((objective) => (parsed.includeArchived ? true : objective.status !== "archived"))
+        .filter((objective) => (parsed.status ? objective.status === parsed.status : true))
+        .filter((objective) => matchesQuery(buildObjectiveQueryText(objective), parsed.query ?? ""))
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        .slice(0, limit);
+      return {
+        output: JSON.stringify({
+          count: objectives.length,
+          totalVisible: (store.objectives ?? []).filter((objective) => objective.status !== "archived").length,
+          objectives,
+        }, null, 2),
+        toolMessage: `Listed ${objectives.length} work objective${objectives.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "create_work_objectives": {
+      const parsed = parseToolArgs<{ objectives: WorkObjectiveInput[] }>(toolCall.arguments);
+      if (!parsed.objectives?.length) {
+        throw new Error("At least one work objective is required.");
+      }
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const created = parsed.objectives.map((input) => normalizeWorkObjective({ input, userEmail }));
+      const nextStore: OrganizerStore = {
+        ...store,
+        objectives: [...created, ...(store.objectives ?? [])],
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, created }, null, 2),
+        toolMessage: `Created ${created.length} work objective${created.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "update_work_objective": {
+      const parsed = parseToolArgs<{ objectiveId: string; patch: Partial<WorkObjective> }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = (store.objectives ?? []).find((objective) => objective.id === parsed.objectiveId);
+      if (!existing) {
+        throw new Error(`Work objective not found: ${parsed.objectiveId}`);
+      }
+      const updated = normalizeWorkObjective({ input: parsed.patch, existing, userEmail });
+      const nextStore: OrganizerStore = {
+        ...store,
+        objectives: (store.objectives ?? []).map((objective) => objective.id === parsed.objectiveId ? updated : objective),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, objective: updated }, null, 2),
+        toolMessage: `Updated work objective ${updated.title}.`,
+      };
+    }
+
+    case "archive_work_objective": {
+      const parsed = parseToolArgs<{ objectiveId: string }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = (store.objectives ?? []).find((objective) => objective.id === parsed.objectiveId);
+      if (!existing) {
+        throw new Error(`Work objective not found: ${parsed.objectiveId}`);
+      }
+      const archived = normalizeWorkObjective({ input: { status: "archived" }, existing, userEmail });
+      const nextStore: OrganizerStore = {
+        ...store,
+        objectives: (store.objectives ?? []).map((objective) => objective.id === parsed.objectiveId ? archived : objective),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, objective: archived }, null, 2),
+        toolMessage: `Archived work objective ${archived.title}.`,
       };
     }
 
@@ -5431,10 +5819,13 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const [newFolderName, setNewFolderName] = useState("");
   const [composer, setComposer] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [organizerStore, setOrganizerStore] = useState<OrganizerStore>({ version: 1, projectId, items: [] });
+  const [organizerStore, setOrganizerStore] = useState<OrganizerStore>({ version: 1, projectId, items: [], objectives: [] });
   const [organizerOpen, setOrganizerOpen] = useState(false);
   const [organizerLoading, setOrganizerLoading] = useState(false);
   const [organizerError, setOrganizerError] = useState<string | undefined>();
+  const [organizerShowAll, setOrganizerShowAll] = useState(false);
+  const [selectedOrganizerItemId, setSelectedOrganizerItemId] = useState<string | null>(null);
+  const [selectedObjectiveId, setSelectedObjectiveId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [stopRequested, setStopRequested] = useState(false);
   const [pendingContinuation, setPendingContinuation] = useState<PendingContinuation | null>(null);
@@ -5542,11 +5933,21 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const canSaveSettings = !!metaDraft.title.trim() && !!metaDraft.model.trim() && !!metaDraft.systemPrompt.trim() && !busy;
   const continuationPending = Boolean(pendingContinuation);
   const organizerVisibleItems = organizerStore.items.filter((item) => item.status !== "archived");
+  const organizerVisibleObjectives = (organizerStore.objectives ?? []).filter((objective) => objective.status !== "archived");
   const organizerSummary = summarizeOrganizerStore(organizerStore);
-  const organizerRecentItems = organizerVisibleItems
+  const organizerSortedObjectives = organizerVisibleObjectives
     .slice()
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-    .slice(0, 6);
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const organizerSortedItems = organizerVisibleItems
+    .slice()
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const organizerDisplayedItems = organizerShowAll ? organizerSortedItems : organizerSortedItems.slice(0, 6);
+  const selectedOrganizerItem = selectedOrganizerItemId
+    ? organizerVisibleItems.find((item) => item.id === selectedOrganizerItemId) ?? null
+    : null;
+  const selectedObjective = selectedObjectiveId
+    ? organizerVisibleObjectives.find((objective) => objective.id === selectedObjectiveId) ?? null
+    : null;
 
   async function syncBridgeAppspaceContext(bridge: BridgeConfig | null = activeBridge) {
     if (!bridge) return;
@@ -6118,7 +6519,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
           ? `Local runtime is enabled with workspace root ${bridgeWorkspaceRoot || "unknown"}.`
           : "Local runtime is disabled for this project/module. Do not use local filesystem, shell, Python, or PDF bridge tools unless the user enables it in settings.",
         organizerSummary,
-        "Organizer memory is available through list_organizer_items, create_organizer_items, update_organizer_item, delete_organizer_item, batch_update_organizer_items, and mark_organizer_items_complete. Use it to maintain durable context when that will help the user.",
+        "Work objectives are the durable high-level scope layer for broad efforts such as hardware validation, vendor testing, procurement, and investigations. Prefer list_work_objectives before treating organizer items or schedule tasks as isolated work.",
+        "Organizer memory is available through list_work_objectives, create_work_objectives, update_work_objective, archive_work_objective, list_organizer_items, create_organizer_items, update_organizer_item, delete_organizer_item, batch_update_organizer_items, and mark_organizer_items_complete. Use objectives for overarching scope and organizer items for small notes, todos, reminders, follow-ups, and waiting-on items.",
         user?.email ? `Signed-in user: ${user.email}.` : undefined,
       ].filter((value): value is string => Boolean(value));
 
@@ -6187,10 +6589,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     await submitUserPrompt(
       [
         `Run an organizer sweep for ${today}.`,
-        "Review the organizer memory first.",
-        "Then check relevant work-manager tasks or schedules if they seem connected.",
-        "Tell me what needs attention now, what looks stale, and what I am likely to forget.",
-        "Update organizer items when that would improve continuity.",
+        "Review work objectives first, then organizer memory under those objectives.",
+        "Then check relevant work-manager tasks or schedules if they seem connected to active objectives.",
+        "Tell me what needs attention now, what objective each item supports, what looks stale, and what I am likely to forget.",
+        "Update work objectives or organizer items when that would improve continuity.",
         "Finish with a short action list.",
       ].join(" "),
     );
@@ -6332,6 +6734,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "0.6rem" }}>
             {[
               ["Visible", String(organizerVisibleItems.length)],
+              ["Objectives", String(organizerVisibleObjectives.length)],
               ["Open", String(organizerVisibleItems.filter((item) => item.status === "open").length)],
               ["Active", String(organizerVisibleItems.filter((item) => item.status === "active").length)],
               ["Waiting On", String(organizerVisibleItems.filter((item) => item.kind === "waiting-on" && item.status !== "done").length)],
@@ -6345,32 +6748,208 @@ export default function ChatCodexModule({ config }: ModuleProps) {
 
           <div style={{ display: "grid", gap: "0.5rem" }}>
             <div style={{ fontSize: "0.74rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
-              Recent Items
+              Work Objectives
             </div>
-            {organizerRecentItems.length === 0 ? (
+            {organizerSortedObjectives.length === 0 ? (
+              <div style={{ padding: "0.8rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321", fontSize: "0.8rem", color: C.muted }}>
+                No work objectives yet. Ask Codex to create objectives for larger scopes like hardware validation, vendor testing, procurement, or investigations.
+              </div>
+            ) : (
+              <div style={{ display: "grid", gap: "0.45rem", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
+                {organizerSortedObjectives.slice(0, 8).map((objective) => (
+                  <button
+                    key={objective.id}
+                    onClick={() => setSelectedObjectiveId(objective.id)}
+                    style={{
+                      display: "grid",
+                      gap: "0.35rem",
+                      textAlign: "left",
+                      padding: "0.85rem 0.9rem",
+                      border: `1px solid ${C.border}`,
+                      borderRadius: 12,
+                      background: "#071321",
+                      color: C.text,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: "0.7rem", alignItems: "start" }}>
+                      <div style={{ minWidth: 0, fontSize: "0.86rem", fontWeight: 750, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{objective.title}</div>
+                      <div style={{ fontSize: "0.72rem", color: C.muted, whiteSpace: "nowrap" }}>{objective.status}</div>
+                    </div>
+                    <div style={{ fontSize: "0.78rem", lineHeight: 1.45, color: C.muted, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                      {objective.scope || objective.notes || "No scope recorded."}
+                    </div>
+                    <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap", fontSize: "0.72rem", color: C.muted }}>
+                      {objective.subjects.length ? <span>{objective.subjects.length} subject{objective.subjects.length === 1 ? "" : "s"}</span> : null}
+                      {objective.linkedOrganizerItemIds.length ? <span>{objective.linkedOrganizerItemIds.length} organizer link{objective.linkedOrganizerItemIds.length === 1 ? "" : "s"}</span> : null}
+                      {objective.linkedWorkItemIds.length ? <span>{objective.linkedWorkItemIds.length} work link{objective.linkedWorkItemIds.length === 1 ? "" : "s"}</span> : null}
+                      {objective.targetAt ? <span>Target {formatOrganizerDate(objective.targetAt)}</span> : null}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div style={{ display: "grid", gap: "0.5rem" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
+              <div style={{ fontSize: "0.74rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                {organizerShowAll ? "All Items" : "Recent Items"}
+              </div>
+              {organizerSortedItems.length > 6 ? (
+                <button onClick={() => setOrganizerShowAll((value) => !value)} style={{ ...ghostButtonStyle, padding: "0.32rem 0.65rem" }}>
+                  {organizerShowAll ? "Show Recent" : `View All ${organizerSortedItems.length}`}
+                </button>
+              ) : null}
+            </div>
+            {organizerDisplayedItems.length === 0 ? (
               <div style={{ padding: "0.8rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321", fontSize: "0.8rem", color: C.muted }}>
                 No organizer items yet. Ask Codex to remember notes, follow-ups, reminders, or waiting-on items and it can store them here.
               </div>
             ) : (
-              organizerRecentItems.map((item) => (
-                <div key={item.id} style={{ display: "grid", gap: "0.2rem", padding: "0.8rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", flexWrap: "wrap" }}>
-                    <div style={{ fontSize: "0.84rem", fontWeight: 600 }}>{item.title}</div>
-                    <div style={{ fontSize: "0.72rem", color: C.muted }}>{item.kind} · {item.status}</div>
-                  </div>
-                  {item.details ? (
-                    <div style={{ fontSize: "0.78rem", lineHeight: 1.5, color: C.muted }}>
-                      {item.details}
+              <div style={{ display: "grid", gap: "0.45rem", maxHeight: organizerShowAll ? "34vh" : "none", overflowY: organizerShowAll ? "auto" : "visible", paddingRight: organizerShowAll ? "0.25rem" : 0 }}>
+                {organizerDisplayedItems.map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => setSelectedOrganizerItemId(item.id)}
+                    style={{
+                      display: "grid",
+                      gap: "0.3rem",
+                      width: "100%",
+                      textAlign: "left",
+                      padding: "0.8rem 0.9rem",
+                      border: `1px solid ${C.border}`,
+                      borderRadius: 12,
+                      background: "#071321",
+                      color: C.text,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: "0.75rem", alignItems: "start" }}>
+                      <div style={{ minWidth: 0, fontSize: "0.84rem", fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.title}</div>
+                      <div style={{ fontSize: "0.72rem", color: C.muted, whiteSpace: "nowrap" }}>{item.kind} · {item.status}</div>
                     </div>
-                  ) : null}
-                  <div style={{ display: "flex", gap: "0.6rem", flexWrap: "wrap", fontSize: "0.72rem", color: C.muted }}>
-                    {item.dueAt ? <span>Due {formatOrganizerDate(item.dueAt)}</span> : null}
-                    {item.followUpAt ? <span>Follow up {formatOrganizerDate(item.followUpAt)}</span> : null}
-                    {item.tags.length ? <span>Tags: {item.tags.join(", ")}</span> : null}
+                    <div style={{ fontSize: "0.78rem", lineHeight: 1.45, color: C.muted, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                      {item.details || "No details recorded."}
+                    </div>
+                    <div style={{ display: "flex", gap: "0.6rem", flexWrap: "wrap", fontSize: "0.72rem", color: C.muted }}>
+                      {item.dueAt ? <span>Due {formatOrganizerDate(item.dueAt)}</span> : null}
+                      {item.followUpAt ? <span>Follow up {formatOrganizerDate(item.followUpAt)}</span> : null}
+                      {item.tags.length ? <span>Tags: {item.tags.join(", ")}</span> : null}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {selectedObjective && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 40, display: "grid", placeItems: "center", padding: "1rem", background: "rgba(0,0,0,0.55)" }}>
+          <div style={{ width: "min(760px, 100%)", maxHeight: "82vh", overflow: "auto", border: `1px solid ${C.border}`, borderRadius: 16, background: C.panel, boxShadow: "0 24px 80px rgba(0,0,0,0.45)" }}>
+            <div style={{ position: "sticky", top: 0, zIndex: 1, display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "start", padding: "1rem 1.05rem", borderBottom: `1px solid ${C.border}`, background: C.panel }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: "0.74rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                  Work Objective
+                </div>
+                <div style={{ marginTop: "0.3rem", fontSize: "1rem", fontWeight: 750, overflowWrap: "anywhere" }}>
+                  {selectedObjective.title}
+                </div>
+              </div>
+              <button onClick={() => setSelectedObjectiveId(null)} style={ghostButtonStyle}>
+                Close
+              </button>
+            </div>
+            <div style={{ display: "grid", gap: "0.9rem", padding: "1rem 1.05rem" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.6rem" }}>
+                {[
+                  ["Status", selectedObjective.status],
+                  ["Updated", formatOrganizerDate(selectedObjective.updatedAt)],
+                  ["Created", formatOrganizerDate(selectedObjective.createdAt)],
+                  ["Target", selectedObjective.targetAt ? formatOrganizerDate(selectedObjective.targetAt) : "None"],
+                ].map(([label, value]) => (
+                  <div key={label} style={{ padding: "0.7rem 0.75rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                    <div style={{ fontSize: "0.68rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</div>
+                    <div style={{ marginTop: "0.25rem", fontSize: "0.84rem", color: C.text }}>{value || "None"}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ display: "grid", gap: "0.35rem" }}>
+                <div style={{ fontSize: "0.72rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Scope</div>
+                <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.55, fontSize: "0.86rem", color: C.text, padding: "0.85rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                  {selectedObjective.scope || "No scope recorded."}
+                </div>
+              </div>
+
+              {selectedObjective.notes ? (
+                <div style={{ display: "grid", gap: "0.35rem" }}>
+                  <div style={{ fontSize: "0.72rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Notes</div>
+                  <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.55, fontSize: "0.86rem", color: C.text, padding: "0.85rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                    {selectedObjective.notes}
                   </div>
                 </div>
-              ))
-            )}
+              ) : null}
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "0.6rem", fontSize: "0.8rem", color: C.muted }}>
+                <div>Subjects: {selectedObjective.subjects.length ? selectedObjective.subjects.join(", ") : "None"}</div>
+                <div>Tags: {selectedObjective.tags.length ? selectedObjective.tags.join(", ") : "None"}</div>
+                <div>Organizer items: {selectedObjective.linkedOrganizerItemIds.length ? selectedObjective.linkedOrganizerItemIds.join(", ") : "None"}</div>
+                <div>Work items: {selectedObjective.linkedWorkItemIds.length ? selectedObjective.linkedWorkItemIds.join(", ") : "None"}</div>
+                <div>Assets: {selectedObjective.linkedAssetIds.length ? selectedObjective.linkedAssetIds.join(", ") : "None"}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedOrganizerItem && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 40, display: "grid", placeItems: "center", padding: "1rem", background: "rgba(0,0,0,0.55)" }}>
+          <div style={{ width: "min(720px, 100%)", maxHeight: "82vh", overflow: "auto", border: `1px solid ${C.border}`, borderRadius: 16, background: C.panel, boxShadow: "0 24px 80px rgba(0,0,0,0.45)" }}>
+            <div style={{ position: "sticky", top: 0, zIndex: 1, display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "start", padding: "1rem 1.05rem", borderBottom: `1px solid ${C.border}`, background: C.panel }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: "0.74rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                  Organizer Item
+                </div>
+                <div style={{ marginTop: "0.3rem", fontSize: "1rem", fontWeight: 750, overflowWrap: "anywhere" }}>
+                  {selectedOrganizerItem.title}
+                </div>
+              </div>
+              <button onClick={() => setSelectedOrganizerItemId(null)} style={ghostButtonStyle}>
+                Close
+              </button>
+            </div>
+            <div style={{ display: "grid", gap: "0.9rem", padding: "1rem 1.05rem" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.6rem" }}>
+                {[
+                  ["Kind", selectedOrganizerItem.kind],
+                  ["Status", selectedOrganizerItem.status],
+                  ["Updated", formatOrganizerDate(selectedOrganizerItem.updatedAt)],
+                  ["Created", formatOrganizerDate(selectedOrganizerItem.createdAt)],
+                ].map(([label, value]) => (
+                  <div key={label} style={{ padding: "0.7rem 0.75rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                    <div style={{ fontSize: "0.68rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</div>
+                    <div style={{ marginTop: "0.25rem", fontSize: "0.84rem", color: C.text }}>{value || "None"}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ display: "grid", gap: "0.35rem" }}>
+                <div style={{ fontSize: "0.72rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Details</div>
+                <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.55, fontSize: "0.86rem", color: C.text, padding: "0.85rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                  {selectedOrganizerItem.details || "No details recorded."}
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0.6rem", fontSize: "0.8rem", color: C.muted }}>
+                <div>Due: {selectedOrganizerItem.dueAt ? formatOrganizerDate(selectedOrganizerItem.dueAt) : "None"}</div>
+                <div>Follow up: {selectedOrganizerItem.followUpAt ? formatOrganizerDate(selectedOrganizerItem.followUpAt) : "None"}</div>
+                <div>Tags: {selectedOrganizerItem.tags.length ? selectedOrganizerItem.tags.join(", ") : "None"}</div>
+                <div>Objectives: {selectedOrganizerItem.objectiveIds.length ? selectedOrganizerItem.objectiveIds.join(", ") : "None"}</div>
+                <div>Linked work items: {selectedOrganizerItem.linkedWorkItemIds.length ? selectedOrganizerItem.linkedWorkItemIds.join(", ") : "None"}</div>
+              </div>
+            </div>
           </div>
         </div>
       )}

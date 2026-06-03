@@ -17,12 +17,14 @@
  *   4. Writes/updates the registry record in DynamoDB
  */
 
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
+import { createRequire } from "module";
 import { readFileSync, existsSync } from "fs";
 import { resolve, join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
@@ -32,6 +34,7 @@ import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dyn
 // ---------------------------------------------------------------------------
 
 const ROOT = resolve(__dirname, "..");
+const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
 
 // Local Docker endpoints
 const LOCAL = {
@@ -172,7 +175,8 @@ async function main() {
 
   // Step 1: build
   console.log("Building...");
-  execSync("npm run build", { cwd: modulePath, stdio: "inherit" });
+  ensureNativeBuildDependencies();
+  runNpm(["run", "build"], modulePath);
 
   const bundlePath = join(modulePath, "dist", "bundle.js");
   if (!existsSync(bundlePath)) {
@@ -270,6 +274,62 @@ Done!
   Bundle:  s3://${registryBucket}/${latestKey}
   Config:  create a config.json pointing to bucket="${registryBucket}" key="${latestKey}"
 `);
+}
+
+function runNpm(args: string[], cwd: string): void {
+  if (process.platform === "win32") {
+    const shell = process.env["ComSpec"] || "cmd.exe";
+    const commandLine = [NPM_COMMAND, ...args.map(quoteWindowsArg)].join(" ");
+    execFileSync(shell, ["/d", "/s", "/c", commandLine], {
+      cwd,
+      stdio: "inherit",
+    });
+    return;
+  }
+
+  execFileSync(NPM_COMMAND, args, {
+    cwd,
+    stdio: "inherit",
+  });
+}
+
+function ensureNativeBuildDependencies(): void {
+  ensureRollupNativePackage();
+  runNpm(["rebuild", "esbuild"], ROOT);
+}
+
+function ensureRollupNativePackage(): void {
+  const packageName = rollupNativePackageName();
+  if (!packageName) return;
+
+  try {
+    require.resolve(packageName, { paths: [ROOT] });
+    return;
+  } catch {
+    const rollupPkg = require("rollup/package.json") as { version?: string };
+    if (!rollupPkg.version) return;
+    console.log(`Installing missing Rollup native package for this host: ${packageName}@${rollupPkg.version}`);
+    runNpm(["install", "--no-save", `${packageName}@${rollupPkg.version}`], ROOT);
+  }
+}
+
+function rollupNativePackageName(): string | null {
+  if (process.platform === "darwin") {
+    return process.arch === "arm64" ? "@rollup/rollup-darwin-arm64" : "@rollup/rollup-darwin-x64";
+  }
+  if (process.platform === "win32") {
+    if (process.arch === "arm64") return "@rollup/rollup-win32-arm64-msvc";
+    if (process.arch === "ia32") return "@rollup/rollup-win32-ia32-msvc";
+    return "@rollup/rollup-win32-x64-msvc";
+  }
+  return null;
+}
+
+function quoteWindowsArg(value: string): string {
+  if (!/[\s"]/u.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/"/g, '\\"')}"`;
 }
 
 main().catch((err) => {
