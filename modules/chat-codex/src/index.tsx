@@ -6874,6 +6874,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const [selectedOrganizerItemId, setSelectedOrganizerItemId] = useState<string | null>(null);
   const [selectedScopeId, setSelectedScopeId] = useState<string | null>(null);
   const [selectedSweepChecklistIds, setSelectedSweepChecklistIds] = useState<string[]>([]);
+  const [scopeNoteDraft, setScopeNoteDraft] = useState("");
+  const [itemNoteDraft, setItemNoteDraft] = useState("");
   const [organizerWindow, setOrganizerWindow] = useState({ left: 80, top: 72, width: 1120, height: 720 });
   const [busy, setBusy] = useState(false);
   const [stopRequested, setStopRequested] = useState(false);
@@ -6963,6 +6965,14 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }, [messages, busy]);
 
   useEffect(() => {
+    setScopeNoteDraft("");
+  }, [selectedScopeId]);
+
+  useEffect(() => {
+    setItemNoteDraft("");
+  }, [selectedOrganizerItemId]);
+
+  useEffect(() => {
     if (hydratedSessionKey !== chatSessionKey) return;
     safeWriteLocalStorage(chatSessionKey, JSON.stringify({
       messages,
@@ -6974,6 +6984,107 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   useEffect(() => () => {
     window.removeEventListener("mousemove", handleOrganizerDragMove);
   }, []);
+
+  function formatUserOrganizerNote(text: string): string {
+    const author = user?.email?.toLowerCase() ?? "user";
+    return `[${new Date().toLocaleString()} ${author}]\n${text.trim()}`;
+  }
+
+  async function persistOrganizerStore(nextStore: OrganizerStore) {
+    const { storage } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+    await saveOrganizerStore(getS3Client, storage, nextStore);
+    setOrganizerStore(nextStore);
+  }
+
+  async function updateSelectedScopeStatus(status: WorkScopeStatus) {
+    if (!selectedScope) return;
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const updated = normalizeWorkScope({
+        input: { status },
+        existing: selectedScope,
+        userEmail: user?.email?.toLowerCase(),
+      });
+      await persistOrganizerStore({
+        ...organizerStore,
+        scopes: (organizerStore.scopes ?? []).map((scope) => scope.id === selectedScope.id ? updated : scope),
+      });
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
+  async function addSelectedScopeNote() {
+    if (!selectedScope || !scopeNoteDraft.trim()) return;
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const note = formatUserOrganizerNote(scopeNoteDraft);
+      const nextNotes = selectedScope.notes ? `${selectedScope.notes}\n\n${note}` : note;
+      const updated = normalizeWorkScope({
+        input: { notes: nextNotes },
+        existing: selectedScope,
+        userEmail: user?.email?.toLowerCase(),
+      });
+      await persistOrganizerStore({
+        ...organizerStore,
+        scopes: (organizerStore.scopes ?? []).map((scope) => scope.id === selectedScope.id ? updated : scope),
+      });
+      setScopeNoteDraft("");
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
+  async function updateSelectedOrganizerItemStatus(status: OrganizerItemStatus) {
+    if (!selectedOrganizerItem) return;
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const updated = normalizeOrganizerItem({
+        input: { status },
+        existing: selectedOrganizerItem,
+        userEmail: user?.email?.toLowerCase(),
+      });
+      await persistOrganizerStore({
+        ...organizerStore,
+        items: organizerStore.items.map((item) => item.id === selectedOrganizerItem.id ? updated : item),
+      });
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
+  async function addSelectedOrganizerItemNote() {
+    if (!selectedOrganizerItem || !itemNoteDraft.trim()) return;
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const note = formatUserOrganizerNote(itemNoteDraft);
+      const nextDetails = selectedOrganizerItem.details ? `${selectedOrganizerItem.details}\n\n${note}` : note;
+      const updated = normalizeOrganizerItem({
+        input: { details: nextDetails },
+        existing: selectedOrganizerItem,
+        userEmail: user?.email?.toLowerCase(),
+      });
+      await persistOrganizerStore({
+        ...organizerStore,
+        items: organizerStore.items.map((item) => item.id === selectedOrganizerItem.id ? updated : item),
+      });
+      setItemNoteDraft("");
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
 
   async function updateSweepChecklistStatus(itemIds: string[], status: "completed" | "ignored") {
     if (!itemIds.length || !organizerStore.sweepReview) return;
@@ -8131,6 +8242,30 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                     </div>
                     <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.45, fontSize: "0.78rem", color: C.text }}>{selectedScope.scope || "No scope recorded."}</div>
                     {selectedScope.notes ? <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.45, fontSize: "0.76rem", color: C.muted }}>{selectedScope.notes}</div> : null}
+                    <div style={{ display: "grid", gap: "0.45rem", paddingTop: "0.2rem", borderTop: `1px solid ${C.border}` }}>
+                      <label style={labelStyle}>Manual status</label>
+                      <select
+                        value={selectedScope.status}
+                        onChange={(event) => void updateSelectedScopeStatus(event.currentTarget.value as WorkScopeStatus)}
+                        disabled={organizerLoading}
+                        style={inputStyle}
+                      >
+                        {["open", "active", "blocked", "done", "archived"].map((status) => (
+                          <option key={status} value={status}>{status}</option>
+                        ))}
+                      </select>
+                      <label style={labelStyle}>Add scope note</label>
+                      <textarea
+                        value={scopeNoteDraft}
+                        onChange={(event) => setScopeNoteDraft(event.currentTarget.value)}
+                        placeholder="Add a note for the agent to consider..."
+                        rows={3}
+                        style={{ ...inputStyle, resize: "vertical", minHeight: 76 }}
+                      />
+                      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                        <button onClick={() => void addSelectedScopeNote()} style={primaryButtonStyle} disabled={!scopeNoteDraft.trim() || organizerLoading}>Add Note</button>
+                      </div>
+                    </div>
                   </div>
                 ) : (
                   <div style={{ fontSize: "0.82rem", color: C.muted, lineHeight: 1.55 }}>Click a scope node to highlight its upstream chain and downstream subtree. The graph scrolls horizontally and vertically.</div>
@@ -8195,6 +8330,31 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                 <div style={{ fontSize: "0.72rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Details</div>
                 <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.55, fontSize: "0.86rem", color: C.text, padding: "0.85rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
                   {selectedOrganizerItem.details || "No details recorded."}
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gap: "0.55rem", padding: "0.85rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                <label style={labelStyle}>Manual status</label>
+                <select
+                  value={selectedOrganizerItem.status}
+                  onChange={(event) => void updateSelectedOrganizerItemStatus(event.currentTarget.value as OrganizerItemStatus)}
+                  disabled={organizerLoading}
+                  style={inputStyle}
+                >
+                  {["open", "active", "done", "archived"].map((status) => (
+                    <option key={status} value={status}>{status}</option>
+                  ))}
+                </select>
+                <label style={labelStyle}>Add item note</label>
+                <textarea
+                  value={itemNoteDraft}
+                  onChange={(event) => setItemNoteDraft(event.currentTarget.value)}
+                  placeholder="Add a note or completion detail..."
+                  rows={4}
+                  style={{ ...inputStyle, resize: "vertical", minHeight: 92 }}
+                />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <button onClick={() => void addSelectedOrganizerItemNote()} style={primaryButtonStyle} disabled={!itemNoteDraft.trim() || organizerLoading}>Add Note</button>
                 </div>
               </div>
 
