@@ -15,7 +15,7 @@
     "modules/kicad-board-viewer": "6ce2b36fc9f9aac99e5c855fe2508551243119b1d62b8349399cc16d96d83bf5",
     "modules/shell-core": "ba56fefa7f82f68738761e5dbc1b3bd38ab662e7f2a7dbd2eaf3c557f3e26d2f",
     "apps/landing": "a9dc35613b7dcf574f600ff32edac2b904dd11d5f4d5f00f11627f39c785b2d6",
-    "modules/chat-codex": "7ae6458a54e1287eb55684acd6feef2a32e8f3ed0e7948e2d359d6b39a50163b",
+    "modules/chat-codex": "5a744c8f0250514d3ecac1b4492c8c39eb866ab51b96e5e786f48eb802bd1383",
     "modules/work-manager": "e8d2f45a7ace7cc8aef242b67b71f3f90f1b67e152e532be02ef1ea3b845f558",
     "modules/test-manager": "a6b8e971a8cd405d3ea8ba229fb8bcc35f45ccec4694c2a0442f2bd6e2f46646"
   }

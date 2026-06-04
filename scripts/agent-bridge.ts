@@ -81,6 +81,26 @@ type OrganizerItem = {
   dueAt?: string;
   followUpAt?: string;
   linkedWorkItemIds?: string[];
+  objectiveIds?: string[];
+  scopeIds?: string[];
+};
+
+type WorkScope = {
+  id: string;
+  title: string;
+  scope?: string;
+  status: string;
+  parentScopeId?: string;
+  subjects?: string[];
+  notes?: string;
+  tags?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+  createdBy?: string;
+  targetAt?: string;
+  linkedOrganizerItemIds?: string[];
+  linkedWorkItemIds?: string[];
+  linkedAssetIds?: string[];
 };
 
 type PythonAllowlistEntry = {
@@ -228,8 +248,28 @@ async function runRpc(body: RpcRequest): Promise<unknown> {
       return getAppspaceContext(body.params);
     case "search_appspace_assets":
       return searchAppspaceAssets(body.params);
+    case "get_organizer_overview":
+      return getOrganizerOverview(body.params);
+    case "list_work_scope_index":
+      return listWorkScopeIndex(body.params);
+    case "search_work_scope_graph":
+      return searchWorkScopeGraph(body.params);
+    case "get_work_scope_context":
+      return getWorkScopeContext(body.params);
+    case "create_work_scopes":
+      return createWorkScopes(body.params);
+    case "replace_organizer_store":
+      return replaceOrganizerStore(body.params);
+    case "update_work_scope":
+      return updateWorkScope(body.params);
+    case "archive_work_scope":
+      return archiveWorkScope(body.params);
     case "list_organizer_items":
       return listOrganizerItems(body.params);
+    case "create_organizer_items":
+      return createOrganizerItems(body.params);
+    case "upsert_sweep_review":
+      return upsertSweepReview(body.params);
     case "batch_update_organizer_items":
       return batchUpdateOrganizerItems(body.params);
     case "mark_organizer_items_complete":
@@ -415,6 +455,201 @@ function readOrganizerItemsFromSession(session: AppspaceSession): OrganizerItem[
   return items.filter((item): item is OrganizerItem => Boolean(item && typeof item === "object"));
 }
 
+function readOrganizerScopesFromSession(session: AppspaceSession): WorkScope[] {
+  const organizer = session.context["organizer"];
+  if (!organizer || typeof organizer !== "object" || Array.isArray(organizer)) {
+    throw new Error("Organizer context is not available in the synced appspace snapshot.");
+  }
+  const scopes = (organizer as Record<string, unknown>)["scopes"];
+  if (!Array.isArray(scopes)) {
+    return [];
+  }
+  return scopes.filter((scope): scope is WorkScope => Boolean(scope && typeof scope === "object"));
+}
+
+function readOrganizerSnapshot(params: Record<string, unknown> = {}): { session: AppspaceSession; scopes: WorkScope[]; items: OrganizerItem[] } {
+  const session = getSession(params);
+  return {
+    session,
+    scopes: readOrganizerScopesFromSession(session),
+    items: readOrganizerItemsFromSession(session),
+  };
+}
+
+function scopeExcerpt(scope: WorkScope): string {
+  const text = [
+    scope.scope ?? "",
+    scope.notes ?? "",
+    (scope.subjects ?? []).join(", "),
+    (scope.tags ?? []).join(", "),
+  ].filter(Boolean).join(" ");
+  return text.length > 180 ? `${text.slice(0, 177)}...` : text;
+}
+
+function itemScopeIds(item: OrganizerItem): string[] {
+  return [...(item.scopeIds ?? []), ...(item.objectiveIds ?? [])];
+}
+
+function linkedItemsForScope(scope: WorkScope, items: OrganizerItem[]): OrganizerItem[] {
+  const linkedIds = new Set(scope.linkedOrganizerItemIds ?? []);
+  return items.filter((item) => itemScopeIds(item).includes(scope.id) || linkedIds.has(item.id));
+}
+
+function compactScopeRecord(scope: WorkScope, scopes: WorkScope[], items: OrganizerItem[]): Record<string, unknown> {
+  return {
+    scopeId: scope.id,
+    title: scope.title,
+    status: scope.status,
+    parentScopeId: scope.parentScopeId,
+    excerpt: scopeExcerpt(scope),
+    childCount: scopes.filter((candidate) => candidate.parentScopeId === scope.id).length,
+    linkedItemCount: linkedItemsForScope(scope, items).length,
+  };
+}
+
+function scopeSearchText(scope: WorkScope, items: OrganizerItem[]): string {
+  const linkedItems = linkedItemsForScope(scope, items);
+  return [
+    scope.id,
+    scope.title,
+    scope.status,
+    scope.parentScopeId ?? "",
+    scope.scope ?? "",
+    scope.notes ?? "",
+    (scope.subjects ?? []).join(" "),
+    (scope.tags ?? []).join(" "),
+    scope.targetAt ?? "",
+    linkedItems.map((item) => [
+      item.id,
+      item.kind,
+      item.title,
+      item.details ?? "",
+      item.status,
+      (item.tags ?? []).join(" "),
+      item.dueAt ?? "",
+      item.followUpAt ?? "",
+    ].join(" ")).join(" "),
+  ].join(" ").toLowerCase();
+}
+
+function scoreScopeSearch(scope: WorkScope, items: OrganizerItem[], query: string): number {
+  const terms = query.toLowerCase().split(/\s+/).map((term) => term.trim()).filter(Boolean);
+  if (!terms.length) return 1;
+  const text = scopeSearchText(scope, items);
+  let score = 0;
+  for (const term of terms) {
+    if (text.includes(term)) score += 10;
+    if (scope.title.toLowerCase().includes(term)) score += 20;
+    if ((scope.subjects ?? []).join(" ").toLowerCase().includes(term)) score += 12;
+    if ((scope.tags ?? []).join(" ").toLowerCase().includes(term)) score += 8;
+  }
+  return score;
+}
+
+function getOrganizerOverview(params: Record<string, unknown> = {}): unknown {
+  const { session, scopes, items } = readOrganizerSnapshot(params);
+  const visibleScopes = scopes.filter((scope) => scope.status !== "archived");
+  const visibleItems = items.filter((item) => item.status !== "archived");
+  return {
+    sessionId: session.sessionId,
+    scopeCount: visibleScopes.length,
+    itemCount: visibleItems.length,
+    openItemCount: visibleItems.filter((item) => item.status === "open").length,
+    activeItemCount: visibleItems.filter((item) => item.status === "active").length,
+    waitingItemCount: visibleItems.filter((item) => item.kind === "waiting-on").length,
+    scopes: visibleScopes.map((scope) => compactScopeRecord(scope, visibleScopes, visibleItems)),
+    unassignedItems: visibleItems
+      .filter((item) => itemScopeIds(item).length === 0)
+      .map((item) => ({ id: item.id, kind: item.kind, title: item.title, status: item.status, excerpt: item.details?.slice(0, 220) ?? "" })),
+  };
+}
+
+function listWorkScopeIndex(params: Record<string, unknown> = {}): unknown {
+  const { session, scopes, items } = readOrganizerSnapshot(params);
+  const includeArchived = params["includeArchived"] === true;
+  const visibleScopes = scopes
+    .filter((scope) => (includeArchived ? true : scope.status !== "archived"))
+    .sort((a, b) => (a.parentScopeId ?? "").localeCompare(b.parentScopeId ?? "") || a.title.localeCompare(b.title));
+  const visibleItems = items.filter((item) => item.status !== "archived");
+  return {
+    sessionId: session.sessionId,
+    count: visibleScopes.length,
+    index: visibleScopes.map((scope) => compactScopeRecord(scope, visibleScopes, visibleItems)),
+  };
+}
+
+function searchWorkScopeGraph(params: Record<string, unknown> = {}): unknown {
+  const { session, scopes, items } = readOrganizerSnapshot(params);
+  const query = typeof params["query"] === "string" ? params["query"].trim() : "";
+  if (!query) throw new Error("query is required.");
+  const includeArchived = params["includeArchived"] === true;
+  const visibleScopes = scopes.filter((scope) => (includeArchived ? true : scope.status !== "archived"));
+  const visibleItems = items.filter((item) => item.status !== "archived");
+  const results = visibleScopes
+    .map((scope) => ({ scope, score: scoreScopeSearch(scope, visibleItems, query) }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.scope.title.localeCompare(b.scope.title))
+    .map((entry) => ({ ...compactScopeRecord(entry.scope, visibleScopes, visibleItems), score: entry.score }));
+  return {
+    sessionId: session.sessionId,
+    query,
+    count: results.length,
+    results,
+  };
+}
+
+function getWorkScopeContext(params: Record<string, unknown> = {}): unknown {
+  const { session, scopes, items } = readOrganizerSnapshot(params);
+  const scopeId = typeof params["scopeId"] === "string" ? params["scopeId"].trim() : "";
+  if (!scopeId) throw new Error("scopeId is required.");
+  const direction = params["direction"] === "self" || params["direction"] === "upstream" || params["direction"] === "downstream" || params["direction"] === "both"
+    ? params["direction"]
+    : "both";
+  const depth = clampNumber(params["depth"], 0, 20, 3);
+  const includeLinkedItems = params["includeLinkedItems"] !== false;
+  const visibleScopes = scopes.filter((scope) => scope.status !== "archived");
+  const byId = new Map(visibleScopes.map((scope) => [scope.id, scope]));
+  const selected = byId.get(scopeId);
+  if (!selected) throw new Error(`Work scope not found: ${scopeId}`);
+
+  const upstream: WorkScope[] = [];
+  let current = selected;
+  while ((direction === "upstream" || direction === "both") && current.parentScopeId && upstream.length < depth) {
+    const parent = byId.get(current.parentScopeId);
+    if (!parent) break;
+    upstream.unshift(parent);
+    current = parent;
+  }
+
+  const downstream: WorkScope[] = [];
+  if (direction === "downstream" || direction === "both") {
+    const queue = [{ id: selected.id, depth: 0 }];
+    while (queue.length) {
+      const next = queue.shift()!;
+      if (next.depth >= depth) continue;
+      for (const child of visibleScopes.filter((scope) => scope.parentScopeId === next.id)) {
+        downstream.push(child);
+        queue.push({ id: child.id, depth: next.depth + 1 });
+      }
+    }
+  }
+
+  const contextScopes = direction === "self" ? [selected] : [...upstream, selected, ...downstream];
+  const contextScopeIds = new Set(contextScopes.map((scope) => scope.id));
+  const linkedItems = includeLinkedItems
+    ? items.filter((item) => item.status !== "archived" && itemScopeIds(item).some((id) => contextScopeIds.has(id)))
+    : [];
+
+  return {
+    sessionId: session.sessionId,
+    selected,
+    upstream,
+    downstream,
+    scopes: contextScopes,
+    linkedItems,
+  };
+}
+
 function getOrganizerAnchorDate(item: OrganizerItem): string | undefined {
   return item.dueAt ?? item.followUpAt;
 }
@@ -538,6 +773,54 @@ async function queueOrganizerMutationAndWait(
     sessionId: session.sessionId,
     operationId: queued.id,
   };
+}
+
+async function createWorkScopes(params: Record<string, unknown> = {}): Promise<unknown> {
+  const scopes = Array.isArray(params["scopes"]) ? params["scopes"] : [];
+  if (!scopes.length) {
+    throw new Error("scopes must be a non-empty array.");
+  }
+  return queueOrganizerMutationAndWait(params, "create_work_scopes", { scopes });
+}
+
+async function replaceOrganizerStore(params: Record<string, unknown> = {}): Promise<unknown> {
+  const scopes = Array.isArray(params["scopes"]) ? params["scopes"] : [];
+  const items = Array.isArray(params["items"]) ? params["items"] : [];
+  return queueOrganizerMutationAndWait(params, "replace_organizer_store", { scopes, items });
+}
+
+async function updateWorkScope(params: Record<string, unknown> = {}): Promise<unknown> {
+  const scopeId = typeof params["scopeId"] === "string" ? params["scopeId"].trim() : "";
+  if (!scopeId) {
+    throw new Error("scopeId is required.");
+  }
+  const patch = params["patch"];
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+    throw new Error("patch must be an object.");
+  }
+  return queueOrganizerMutationAndWait(params, "update_work_scope", { scopeId, patch });
+}
+
+async function archiveWorkScope(params: Record<string, unknown> = {}): Promise<unknown> {
+  const scopeId = typeof params["scopeId"] === "string" ? params["scopeId"].trim() : "";
+  if (!scopeId) {
+    throw new Error("scopeId is required.");
+  }
+  return queueOrganizerMutationAndWait(params, "archive_work_scope", { scopeId });
+}
+
+async function createOrganizerItems(params: Record<string, unknown> = {}): Promise<unknown> {
+  const items = Array.isArray(params["items"]) ? params["items"] : [];
+  if (!items.length) {
+    throw new Error("items must be a non-empty array.");
+  }
+  return queueOrganizerMutationAndWait(params, "create_organizer_items", { items });
+}
+
+async function upsertSweepReview(params: Record<string, unknown> = {}): Promise<unknown> {
+  const statusUpdates = Array.isArray(params["statusUpdates"]) ? params["statusUpdates"] : [];
+  const checklist = Array.isArray(params["checklist"]) ? params["checklist"] : [];
+  return queueOrganizerMutationAndWait(params, "upsert_sweep_review", { statusUpdates, checklist });
 }
 
 async function batchUpdateOrganizerItems(params: Record<string, unknown> = {}): Promise<unknown> {
