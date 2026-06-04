@@ -19,6 +19,11 @@ import {
   ListObjectsV2Command,
   DeleteObjectsCommand,
 } from "@aws-sdk/client-s3";
+import {
+  CloudFrontClient,
+  ListDistributionsCommand,
+  CreateInvalidationCommand,
+} from "@aws-sdk/client-cloudfront";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "..");
@@ -32,8 +37,13 @@ const DIST_DIR    = join(SHELL_DIR, "dist");
 // Credentials
 // ---------------------------------------------------------------------------
 
-function loadCredentials(): { accessKeyId: string; secretAccessKey: string } {
+function loadCredentials(): { accessKeyId: string; secretAccessKey: string } | undefined {
   const credFile = join(ROOT, ".aws", "credentials", "access_key");
+  try {
+    statSync(credFile);
+  } catch {
+    return undefined;
+  }
   const lines = readFileSync(credFile, "utf-8").trim().split(/\r?\n/);
   return { accessKeyId: lines[0]!.trim(), secretAccessKey: lines[1]!.trim() };
 }
@@ -83,15 +93,16 @@ function walk(dir: string, base = dir): string[] {
 
 async function main(): Promise<void> {
   const credentials = loadCredentials();
-  const s3 = new S3Client({ region: REGION, credentials });
+  const s3 = new S3Client(credentials ? { region: REGION, credentials } : { region: REGION });
+  const cf = new CloudFrontClient(credentials ? { region: "us-east-1", credentials } : { region: "us-east-1" });
 
   // Build
-  console.log("\n[1/3] Building shell app...");
+  console.log("\n[1/4] Building shell app...");
   execSync("npm run build", { cwd: SHELL_DIR, stdio: "inherit" });
   console.log("  ✓ Build complete");
 
   // Clear existing objects in bucket
-  console.log(`\n[2/3] Clearing "${SHELL_BUCKET}"...`);
+  console.log(`\n[2/4] Clearing "${SHELL_BUCKET}"...`);
   const listed = await s3.send(new ListObjectsV2Command({ Bucket: SHELL_BUCKET }));
   const existing = listed.Contents?.map((o) => ({ Key: o.Key! })) ?? [];
   if (existing.length > 0) {
@@ -105,7 +116,7 @@ async function main(): Promise<void> {
   }
 
   // Upload dist/
-  console.log(`\n[3/3] Uploading to "${SHELL_BUCKET}"...`);
+  console.log(`\n[3/4] Uploading to "${SHELL_BUCKET}"...`);
   const files = walk(DIST_DIR);
   let count = 0;
   for (const file of files) {
@@ -129,19 +140,37 @@ async function main(): Promise<void> {
   }
   console.log(`\n  ✓ ${count} files uploaded`);
 
+  console.log("\n[4/4] Invalidating CloudFront...");
+  const listedDistributions = await cf.send(new ListDistributionsCommand({}));
+  const distribution = (listedDistributions.DistributionList?.Items ?? []).find((dist) =>
+    (dist.Origins?.Items ?? []).some((origin) => {
+      const haystack = `${origin.DomainName ?? ""} ${origin.Id ?? ""}`;
+      return haystack.includes(SHELL_BUCKET);
+    })
+  );
+  if (!distribution?.Id) {
+    throw new Error(`Could not find CloudFront distribution for ${SHELL_BUCKET}`);
+  }
+  const invalidation = await cf.send(new CreateInvalidationCommand({
+    DistributionId: distribution.Id,
+    InvalidationBatch: {
+      CallerReference: `deploy-shell-${Date.now()}`,
+      Paths: {
+        Quantity: 1,
+        Items: ["/*"],
+      },
+    },
+  }));
+  console.log(`  ✓ CloudFront invalidation started (${distribution.Id} / ${invalidation.Invalidation?.Id})`);
+
   console.log(`
 ╔══════════════════════════════════════════════════════════════╗
 ║  Shell deployed to jeffspace-shell                          ║
 ╚══════════════════════════════════════════════════════════════╝
 
-  CloudFront will serve the updated files within ~5 minutes.
-  If you need to force-invalidate the CloudFront cache:
-
-    aws cloudfront create-invalidation \\
-      --distribution-id <YOUR_DIST_ID> \\
-      --paths "/*"
-
-  (Distribution ID was printed by provision-aws.ts)
+  CloudFront invalidation has been started automatically.
+  Distribution: ${distribution.Id}
+  Invalidation: ${invalidation.Invalidation?.Id ?? "unknown"}
 `);
 }
 
