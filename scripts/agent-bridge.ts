@@ -168,10 +168,6 @@ type CommandResult = {
 
 const appspaceSessions = new Map<string, AppspaceSession>();
 
-if (!TOKEN) {
-  throw new Error("AGENT_BRIDGE_TOKEN is required.");
-}
-
 createServer(async (req, res) => {
   try {
     addCors(req, res);
@@ -192,7 +188,7 @@ createServer(async (req, res) => {
           name: "Jeffspace local agent bridge",
           protocolVersion: PROTOCOL_VERSION,
           capabilities: CAPABILITIES,
-          requiresPairingToken: true,
+          requiresPairingToken: Boolean(TOKEN),
         },
       } satisfies RpcSuccess);
       return;
@@ -290,6 +286,9 @@ function addCors(req: IncomingMessage, res: ServerResponse): void {
   if (origin && isAllowedOrigin(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
+    if (req.headers["access-control-request-private-network"] === "true") {
+      res.setHeader("Access-Control-Allow-Private-Network", "true");
+    }
   }
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -312,6 +311,7 @@ function isAllowedOrigin(origin: string): boolean {
 }
 
 function validateToken(req: IncomingMessage): void {
+  if (!TOKEN) return;
   const auth = req.headers.authorization ?? "";
   if (auth !== `Bearer ${TOKEN}`) {
     throw new Error("Unauthorized.");
@@ -364,6 +364,9 @@ function readSessionId(params: Record<string, unknown> = {}, fallbackLatest = tr
     const latest = [...appspaceSessions.values()]
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
     if (latest) return latest.sessionId;
+    throw new Error(
+      "No appspace session is synced. The bridge service is running, but Jeffspace must be open with the chat module local runtime enabled before appspace context is available."
+    );
   }
   throw new Error("sessionId is required.");
 }
@@ -390,6 +393,10 @@ function syncAppspaceContext(params: Record<string, unknown> = {}): unknown {
   const now = new Date().toISOString();
   const existing = appspaceSessions.get(sessionId);
   const operations = existing?.operations ?? [];
+  const project = readOptionalRecord(context["project"]);
+  console.log(
+    `[agent-bridge] sync_appspace_context session=${sessionId} project=${String(project?.["projectId"] ?? "<unknown>")} keys=${Object.keys(context).length}`
+  );
   appspaceSessions.set(sessionId, {
     sessionId,
     updatedAt: now,
@@ -402,6 +409,11 @@ function syncAppspaceContext(params: Record<string, unknown> = {}): unknown {
     updatedAt: now,
     queuedOperationCount: operations.filter((operation) => operation.status === "queued").length,
   };
+}
+
+function readOptionalRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
 }
 
 function getAppspaceContext(params: Record<string, unknown> = {}): unknown {

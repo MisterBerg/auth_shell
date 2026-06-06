@@ -18,7 +18,7 @@ Default local bridge:
 - Port: `4317`
 - Health endpoint: `GET /health`
 - RPC endpoint: `POST /rpc`
-- Auth: `Authorization: Bearer <token>`
+- Auth: optional. If the bridge was started with `AGENT_BRIDGE_TOKEN`, send `Authorization: Bearer <token>`. Installer-managed local bridges may run tokenless on loopback.
 
 Example health check:
 
@@ -31,7 +31,6 @@ Example RPC call:
 ```bash
 curl -sS -X POST http://127.0.0.1:4317/rpc \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer some-token' \
   --data '{"method":"get_bridge_status","params":{}}'
 ```
 
@@ -52,7 +51,7 @@ or:
 1. Check bridge health.
 2. Call `get_bridge_status`.
 3. Confirm at least one browser appspace session is synced before relying on appspace context.
-4. If `appspaceSessions` is empty, ask Jeff to open the app, open/enable the chat module local runtime checkbox, and pair the bridge.
+4. If `appspaceSessions` is empty, ask Jeff to open the app and enable the chat module local runtime checkbox.
 5. Call `get_appspace_context` or `get_organizer_overview`.
 6. Use appspace APIs for project/module/asset/organizer mutations.
 7. Use local filesystem/shell/Python APIs for local analysis, generation, conversion, and repo changes.
@@ -112,6 +111,8 @@ The browser normally calls `sync_appspace_context` and `complete_appspace_operat
 
 Bridge appspace read APIs depend on browser-synced appspace sessions. If no session is synced, calls that need appspace context will fail or return no useful data.
 
+Important: `/health` only proves the local bridge service is running. It does not mean appspace content is available. Appspace content becomes available only after a Jeffspace browser tab with a chat module has local runtime enabled and has successfully called `sync_appspace_context`. Verify this with `get_bridge_status`; a ready bridge has at least one `appspaceSessions` entry.
+
 Mutation APIs such as `create_work_scopes`, `create_organizer_items`, `update_work_scope`, and `upsert_sweep_review` queue operations for the browser and wait for the browser to execute them. The browser remains the appspace persistence owner.
 
 If an operation times out:
@@ -128,7 +129,6 @@ Get appspace context:
 ```bash
 curl -sS -X POST http://127.0.0.1:4317/rpc \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer some-token' \
   --data '{"method":"get_appspace_context","params":{}}'
 ```
 
@@ -137,7 +137,6 @@ Search work scopes:
 ```bash
 curl -sS -X POST http://127.0.0.1:4317/rpc \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer some-token' \
   --data '{"method":"search_work_scope_graph","params":{"query":"zener smoke short","includeArchived":false}}'
 ```
 
@@ -146,7 +145,6 @@ Expand context around a scope:
 ```bash
 curl -sS -X POST http://127.0.0.1:4317/rpc \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer some-token' \
   --data '{"method":"get_work_scope_context","params":{"scopeId":"scope-id","direction":"both","depth":3,"includeLinkedItems":true}}'
 ```
 
@@ -155,7 +153,6 @@ Create a linked organizer item:
 ```bash
 curl -sS -X POST http://127.0.0.1:4317/rpc \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer some-token' \
   --data '{"method":"create_organizer_items","params":{"items":[{"kind":"todo","title":"Follow up with lab","details":"Ask for quote timing and sample handling.","status":"open","scopeIds":["scope-vendor-tests"],"followUpAt":"2026-06-08"}],"timeoutMs":120000}}'
 ```
 
@@ -164,7 +161,6 @@ Update a work scope:
 ```bash
 curl -sS -X POST http://127.0.0.1:4317/rpc \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer some-token' \
   --data '{"method":"update_work_scope","params":{"scopeId":"scope-id","patch":{"status":"blocked","notes":"Waiting on vendor quote."},"timeoutMs":120000}}'
 ```
 
@@ -173,7 +169,6 @@ Queue a generic browser appspace operation:
 ```bash
 curl -sS -X POST http://127.0.0.1:4317/rpc \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer some-token' \
   --data '{"method":"queue_appspace_operation","params":{"operation":"focus_slot","args":{"slotPath":["some-slot-id"]},"timeoutMs":120000}}'
 ```
 
@@ -356,4 +351,3 @@ Useful module patterns:
 - Keep the auth shell thin; new functionality should live in core or modules.
 - For browser/local split behavior, preserve both Mac and Windows local workflows.
 - Report exact files changed, APIs used, and any operations that timed out or failed.
-

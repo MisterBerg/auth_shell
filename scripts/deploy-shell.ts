@@ -100,6 +100,7 @@ async function main(): Promise<void> {
   console.log("\n[1/4] Building shell app...");
   execSync("npm run build", { cwd: SHELL_DIR, stdio: "inherit" });
   console.log("  ✓ Build complete");
+  buildAgentRuntimeInstallers();
 
   // Clear existing objects in bucket
   console.log(`\n[2/4] Clearing "${SHELL_BUCKET}"...`);
@@ -172,6 +173,21 @@ async function main(): Promise<void> {
   Distribution: ${distribution.Id}
   Invalidation: ${invalidation.Invalidation?.Id ?? "unknown"}
 `);
+}
+
+function buildAgentRuntimeInstallers(): void {
+  if (process.env["SKIP_AGENT_RUNTIME_INSTALLERS"] === "1") {
+    console.log("  · skipped agent runtime installers (SKIP_AGENT_RUNTIME_INSTALLERS=1)");
+    return;
+  }
+
+  if (process.platform !== "darwin") {
+    console.log("  · skipped macOS agent runtime installer build; run on macOS or provide the artifact before deploy");
+    return;
+  }
+
+  console.log("  · building macOS agent runtime installer");
+  execSync("npm run build:agent-runtime:macos", { cwd: ROOT, stdio: "inherit" });
 }
 
 main().catch((err) => {

@@ -38,6 +38,7 @@
     "publish": "tsx scripts/publish-module.ts",
     "publish:all": "tsx scripts/publish-all.ts",
     "publish:all:local": "tsx scripts/publish-all.ts --local",
+    "build:agent-runtime:macos": "tsx scripts/build-agent-runtime-macos.ts",
     "provision": "tsx scripts/provision-aws.ts",
     "deploy:shell": "tsx scripts/deploy-shell.ts",
     "kicad:export-board": "tsx scripts/kicad/export-board-viewer.ts"

@@ -161,7 +161,7 @@ type GenericSlotToolArgs = {
 
 type BridgeConfig = {
   url: string;
-  token: string;
+  token?: string;
 };
 
 type BridgeStatus = {
@@ -4098,12 +4098,16 @@ function parentPath(path: string): string {
 }
 
 async function callBridge<T>(bridge: BridgeConfig, method: string, params: Record<string, unknown> = {}): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (bridge.token?.trim()) {
+    headers.Authorization = `Bearer ${bridge.token.trim()}`;
+  }
+
   const response = await fetch(`${bridge.url.replace(/\/$/, "")}/rpc`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${bridge.token}`,
-    },
+    headers,
     body: JSON.stringify({ method, params }),
   });
 
@@ -4160,37 +4164,62 @@ async function buildAppspaceContextSnapshot(args: {
   registryEntries: ModuleRegistryEntry[];
   bridgeWorkspaceRoot?: string;
 }) {
-  const context = await loadWorkspaceContext(args.getS3Client, args.configBucket, args.configPath, args.projectId);
+  const syncWarnings: string[] = [];
+  let context: WorkspaceContext;
+  try {
+    context = await loadWorkspaceContext(args.getS3Client, args.configBucket, args.configPath, args.projectId);
+  } catch (error) {
+    syncWarnings.push(`Root config could not be loaded from storage: ${(error as Error).message}`);
+    context = {
+      projectId: args.projectId,
+      configBucket: args.configBucket,
+      configPath: args.configPath,
+      rootConfig: args.config,
+      resources: collectResources(args.config),
+    };
+  }
   const slots = buildSlotTree(context.rootConfig.children);
-  const { storage: organizerStorage, store: organizerStore } = await loadOrganizerStore(
-    args.getS3Client,
-    args.configBucket,
-    args.configPath,
-    args.projectId,
-    args.config.id,
-  );
+  const organizerStorage = getOrganizerStorage(args.configBucket, args.configPath, args.projectId, args.config.id);
+  let organizerStore: OrganizerStore = { version: 1, projectId: args.projectId, items: [], scopes: [], objectives: [] };
+  try {
+    const loaded = await loadOrganizerStore(
+      args.getS3Client,
+      args.configBucket,
+      args.configPath,
+      args.projectId,
+      args.config.id,
+    );
+    organizerStore = loaded.store;
+  } catch (error) {
+    syncWarnings.push(`Organizer store could not be loaded: ${(error as Error).message}`);
+  }
   let assets: Array<Record<string, unknown>> = [];
 
   if (args.assetsTable) {
-    const ddb = await args.getDdbClient();
-    const records = await listAssets({ ddb, tableName: args.assetsTable, projectId: args.projectId });
-    assets = records.map((asset) => {
-      const version = getCurrentAssetVersion(asset);
-      return {
-        assetId: asset.assetId,
-        label: asset.label,
-        bucket: version.bucket,
-        key: version.key,
-        versionId: version.versionId,
-        mimeType: version.mimeType,
-        sizeBytes: version.sizeBytes,
-        meta: asset.meta ?? {},
-      };
-    });
+    try {
+      const ddb = await args.getDdbClient();
+      const records = await listAssets({ ddb, tableName: args.assetsTable, projectId: args.projectId });
+      assets = records.map((asset) => {
+        const version = getCurrentAssetVersion(asset);
+        return {
+          assetId: asset.assetId,
+          label: asset.label,
+          bucket: version.bucket,
+          key: version.key,
+          versionId: version.versionId,
+          mimeType: version.mimeType,
+          sizeBytes: version.sizeBytes,
+          meta: asset.meta ?? {},
+        };
+      });
+    } catch (error) {
+      syncWarnings.push(`Project assets could not be listed from ${args.assetsTable}: ${(error as Error).message}`);
+    }
   }
 
   return {
     schemaVersion: 1,
+    syncWarnings,
     project: {
       projectId: args.projectId,
       configBucket: args.configBucket,
@@ -6857,6 +6886,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const [bridgeHealth, setBridgeHealth] = useState<BridgeHealth | null>(null);
   const [bridgeCheckLoading, setBridgeCheckLoading] = useState(false);
   const [bridgeWorkspaceRoot, setBridgeWorkspaceRoot] = useState("");
+  const [bridgeLastSyncedAt, setBridgeLastSyncedAt] = useState("");
+  const [bridgeSyncError, setBridgeSyncError] = useState<string | undefined>();
   const [draftBridgeUrl, setDraftBridgeUrl] = useState("");
   const [draftBridgeToken, setDraftBridgeToken] = useState("");
   const [bridgeBrowserOpen, setBridgeBrowserOpen] = useState(false);
@@ -7146,12 +7177,12 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }
 
   const connectionLabel = apiKey ? maskKey(apiKey) : "Not connected";
-  const activeBridge = localRuntimeEnabled && bridgeUrl.trim() && bridgeToken.trim()
-    ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
+  const activeBridge = localRuntimeEnabled && bridgeUrl.trim()
+    ? { url: bridgeUrl.trim(), token: bridgeToken.trim() || undefined }
     : null;
   const bridgeLabel = localRuntimeEnabled
     ? bridgeUrl
-      ? `${bridgeUrl} · ${maskBridgeToken(bridgeToken)}`
+      ? `${bridgeUrl}${bridgeToken ? ` · ${maskBridgeToken(bridgeToken)}` : ""}`
       : "Enabled, not configured"
     : "Disabled";
   const canSend = !!apiKey.trim() && !!composer.trim() && !busy;
@@ -7221,6 +7252,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       sessionId: bridgeAppspaceSessionId,
       context: snapshot,
     });
+    setBridgeLastSyncedAt(new Date().toLocaleTimeString());
+    setBridgeSyncError(undefined);
   }
 
   async function executeBrowserWorkspaceOperation(
@@ -7314,6 +7347,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         await syncBridgeAppspaceContext(bridge);
         await processQueuedBridgeAppspaceOperations(bridge);
       } catch (error) {
+        setBridgeSyncError((error as Error).message);
         console.debug("[chat-codex] bridge appspace sync failed", {
           message: (error as Error).message,
         });
@@ -7361,13 +7395,13 @@ export default function ChatCodexModule({ config }: ModuleProps) {
 
   async function handleSaveBridge() {
     if (!localRuntimeEnabled) {
-      setConnectionError("Enable the local runtime before saving or checking a pairing token.");
+      setConnectionError("Enable the local runtime before connecting.");
       return;
     }
     const normalizedUrl = draftBridgeUrl.trim().replace(/\/$/, "");
-    const normalizedToken = draftBridgeToken.trim();
-    if (!normalizedUrl || !normalizedToken) {
-      setConnectionError("Bridge URL and bridge token are both required.");
+    const normalizedToken = draftBridgeToken.trim() || undefined;
+    if (!normalizedUrl) {
+      setConnectionError("Bridge URL is required.");
       return;
     }
 
@@ -7375,12 +7409,13 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       const bridge = { url: normalizedUrl, token: normalizedToken };
       const status = await getBridgeStatus(bridge);
       safeWriteLocalStorage(bridgeUrlKey, normalizedUrl);
-      safeWriteLocalStorage(bridgeTokenKey, normalizedToken);
+      safeWriteLocalStorage(bridgeTokenKey, normalizedToken ?? "");
       safeWriteLocalStorage(bridgeWorkspaceRootKey, status.workspaceRoot ?? "");
       setBridgeUrl(normalizedUrl);
-      setBridgeToken(normalizedToken);
+      setBridgeToken(normalizedToken ?? "");
       setBridgeWorkspaceRoot(status.workspaceRoot ?? "");
       setConnectionError(undefined);
+      await syncBridgeAppspaceContext(bridge);
     } catch (error) {
       setConnectionError((error as Error).message);
     }
@@ -7396,8 +7431,16 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     setLocalRuntimeEnabled(false);
     setBridgeHealth(null);
     setBridgeWorkspaceRoot("");
+    setBridgeLastSyncedAt("");
+    setBridgeSyncError(undefined);
     setDraftBridgeUrl("");
     setDraftBridgeToken("");
+  }
+
+  function resolveDraftOrSavedBridge(): BridgeConfig | null {
+    const resolvedUrl = (draftBridgeUrl.trim() || bridgeUrl.trim()).replace(/\/$/, "");
+    const resolvedToken = draftBridgeToken.trim() || bridgeToken.trim() || undefined;
+    return resolvedUrl ? { url: resolvedUrl, token: resolvedToken } : null;
   }
 
   async function checkLocalRuntime(urlOverride?: string) {
@@ -7437,14 +7480,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setBridgeBrowserError("Enable the local runtime before browsing local folders.");
       return;
     }
-    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
-      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
-      : bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+    const bridge = resolveDraftOrSavedBridge();
 
     if (!bridge) {
-      setBridgeBrowserError("Save the bridge URL and token before browsing.");
+      setBridgeBrowserError("Save the bridge URL before browsing.");
       return;
     }
 
@@ -7470,14 +7509,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setConnectionError("Check Enable local runtime before choosing a workspace root.");
       return;
     }
-    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
-      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
-      : bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+    const bridge = resolveDraftOrSavedBridge();
 
     if (!bridge) {
-      setConnectionError("Save the bridge URL and token before choosing a workspace root.");
+      setConnectionError("Save the bridge URL before choosing a workspace root.");
       return;
     }
 
@@ -7498,14 +7533,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setConnectionError("Enable the local runtime before changing the workspace root.");
       return;
     }
-    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
-      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
-      : bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+    const bridge = resolveDraftOrSavedBridge();
 
     if (!bridge) {
-      setConnectionError("Save the bridge URL and token before changing the workspace root.");
+      setConnectionError("Save the bridge URL before changing the workspace root.");
       return;
     }
 
@@ -7521,14 +7552,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setBridgeBrowserError("Enable the local runtime before creating local folders.");
       return;
     }
-    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
-      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
-      : bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+    const bridge = resolveDraftOrSavedBridge();
 
     if (!bridge) {
-      setBridgeBrowserError("Save the bridge URL and token before creating folders.");
+      setBridgeBrowserError("Save the bridge URL before creating folders.");
       return;
     }
 
@@ -8408,7 +8435,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                 style={{ marginTop: 3 }}
               />
               <span>
-                Enable local runtime for this project. This allows the agent to use local files, commands, Python tools, and future native Codex runtime features after pairing.
+                Enable local runtime for this project. This allows the agent to use local files, commands, Python tools, and native runtime features when the local service is running.
               </span>
             </label>
             <input
@@ -8420,7 +8447,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             <input
               value={draftBridgeToken}
               onChange={(event) => setDraftBridgeToken(event.currentTarget.value)}
-              placeholder="Bridge token"
+              placeholder="Optional bridge token"
               type="password"
               style={inputStyle}
             />
@@ -8433,7 +8460,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                 {bridgeCheckLoading ? "Checking..." : "Check Runtime"}
               </button>
               <button onClick={handleSaveBridge} style={primaryButtonStyle}>
-                Save Pairing Token
+                Save Runtime
               </button>
               {(bridgeUrl || bridgeToken) && (
                 <button onClick={handleForgetBridge} style={dangerButtonStyle}>
@@ -8442,7 +8469,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
               )}
             </div>
             <div style={{ fontSize: "0.72rem", color: C.muted }}>
-              Disabled means no local runtime calls are made, even if the service is installed or a token is saved.
+              Disabled means no local runtime calls are made, even if the service is installed.
             </div>
             {bridgeHealth ? (
               <div style={{ fontSize: "0.72rem", color: C.muted }}>
@@ -8460,6 +8487,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                 </div>
               </div>
             )}
+            <div style={{ fontSize: "0.72rem", color: bridgeSyncError ? C.danger : C.muted }}>
+              Appspace sync: {bridgeSyncError ? `failed - ${bridgeSyncError}` : bridgeLastSyncedAt ? `last synced ${bridgeLastSyncedAt}` : "not synced yet"}
+            </div>
             <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap", alignItems: "center" }}>
               <button onClick={() => void openBridgeBrowser()} style={primaryButtonStyle} disabled={!localRuntimeEnabled}>
                 Set Workspace Root
