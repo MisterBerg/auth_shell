@@ -6,7 +6,7 @@ import { TopBar } from "./TopBar.tsx";
 import { ProjectTabs } from "./ProjectTabs.tsx";
 import { ProjectDetails } from "./ProjectDetails.tsx";
 import { NewProjectDialog } from "./NewProjectDialog.tsx";
-import { createProjectDraft, useMyProjects, useSharedProjects, useCreateProject } from "./useProjects.ts";
+import { createProjectDraft, useMyProjects, useSharedProjects, useCreateProject, useDeleteProject } from "./useProjects.ts";
 import type { CreatedProject } from "./useProjects.ts";
 import type { ProjectRecord } from "./types.ts";
 
@@ -46,6 +46,7 @@ function resolveLocalOwnerEmail(): string | undefined {
 export default function JeffspaceApp({ config }: ModuleProps) {
   const userProfile = useUserProfile();
   const createProject = useCreateProject();
+  const deleteProject = useDeleteProject();
   const getS3Client = useAwsS3Client();
   const getS3ClientRef = useRef(getS3Client);
   getS3ClientRef.current = getS3Client;
@@ -81,6 +82,12 @@ export default function JeffspaceApp({ config }: ModuleProps) {
   const handleOpenProject = useCallback((project: ProjectRecord) => {
     navigateTo(project.rootBucket, project.rootConfigPath);
   }, [navigateTo]);
+
+  const handleDeleteProject = useCallback(async (project: ProjectRecord) => {
+    await deleteProject(project);
+    setSelectedProject(undefined);
+    reloadMine();
+  }, [deleteProject, reloadMine]);
 
   // Step 1: user fills in name + description → prepare draft → show picker
   const handleNewProjectConfirm = useCallback(async (displayName: string, description: string) => {
@@ -185,6 +192,7 @@ export default function JeffspaceApp({ config }: ModuleProps) {
             project={selectedProject}
             onOpen={handleOpenProject}
             onClose={() => setSelectedProject(undefined)}
+            onDelete={handleDeleteProject}
           />
         )}
       </div>

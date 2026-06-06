@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import type { ModuleProps, ModuleConfig, UserProfile } from "module-core";
 import {
   useUserProfile, useSignOut, useEditMode,
-  useAwsS3Client, useAwsDdbClient, useUpdateSlotMeta,
+  useAwsS3Client, useAwsDdbClient, useUpdateSlotMeta, useTableNames,
 } from "module-core";
 import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { PutCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
@@ -13,7 +13,6 @@ import type { S3Client } from "@aws-sdk/client-s3";
 // Constants
 // ---------------------------------------------------------------------------
 
-const PROJECTS_TABLE = "org-projects";
 const C = {
   bg:      "#0f1929",
   bgDeep:  "#080f1c",
@@ -36,6 +35,7 @@ export default function OAuthBadge({ config }: ModuleProps) {
   const { editMode } = useEditMode();
   const getS3Client  = useAwsS3Client();
   const getDdbClient = useAwsDdbClient();
+  const { projects: projectsTable } = useTableNames();
   const updateSlotMeta = useUpdateSlotMeta(); // null when not inside a SlotContainer
 
   const homeUrl = (config.meta?.homeUrl as string | undefined) ?? "/";
@@ -151,6 +151,7 @@ export default function OAuthBadge({ config }: ModuleProps) {
       {panel === "settings" && (
         <ProjectSettingsPanel
           userProfile={userProfile}
+          projectsTable={projectsTable}
           getS3Client={getS3Client}
           getDdbClient={getDdbClient}
           onClose={() => setPanel(null)}
@@ -341,13 +342,14 @@ type RootConfig = ModuleConfig & { theme?: { cssKey?: string; cssBucket?: string
 
 type SettingsProps = {
   userProfile: UserProfile | undefined;
+  projectsTable: string;
   getS3Client: (bucket?: string) => Promise<S3Client>;
   getDdbClient: () => Promise<DynamoDBDocumentClient>;
   onClose: () => void;
   onDeleted: () => void;
 };
 
-function ProjectSettingsPanel({ userProfile, getS3Client, getDdbClient, onClose, onDeleted }: SettingsProps) {
+function ProjectSettingsPanel({ userProfile, projectsTable, getS3Client, getDdbClient, onClose, onDeleted }: SettingsProps) {
   const [tab, setTab] = useState<SettingsTab>("share");
   const [rootConfig, setRootConfig] = useState<RootConfig | null>(null);
   const [loadError, setLoadError] = useState<string | undefined>();
@@ -403,6 +405,7 @@ function ProjectSettingsPanel({ userProfile, getS3Client, getDdbClient, onClose,
                 configBucket={configBucket!}
                 configPath={configPath!}
                 ownerEmail={userProfile?.email}
+                projectsTable={projectsTable}
                 getDdbClient={getDdbClient}
               />
             )}
@@ -420,6 +423,7 @@ function ProjectSettingsPanel({ userProfile, getS3Client, getDdbClient, onClose,
                 projectId={rootConfig.id}
                 projectTitle={projectTitle}
                 ownerEmail={userProfile?.email}
+                projectsTable={projectsTable}
                 getDdbClient={getDdbClient}
                 onDeleted={onDeleted}
               />
@@ -435,9 +439,9 @@ function ProjectSettingsPanel({ userProfile, getS3Client, getDdbClient, onClose,
 // Share Tab
 // ---------------------------------------------------------------------------
 
-function ShareTab({ projectId, projectTitle, configBucket, configPath, ownerEmail, getDdbClient }: {
+function ShareTab({ projectId, projectTitle, configBucket, configPath, ownerEmail, projectsTable, getDdbClient }: {
   projectId: string; projectTitle: string; configBucket: string; configPath: string;
-  ownerEmail?: string; getDdbClient: () => Promise<DynamoDBDocumentClient>;
+  ownerEmail?: string; projectsTable: string; getDdbClient: () => Promise<DynamoDBDocumentClient>;
 }) {
   const [email, setEmail] = useState("");
   const [role,  setRole]  = useState<"editor" | "viewer">("editor");
@@ -448,14 +452,14 @@ function ShareTab({ projectId, projectTitle, configBucket, configPath, ownerEmai
     e.preventDefault();
     const trimmed = email.trim().toLowerCase();
     if (!trimmed || !ownerEmail) return;
-    if (trimmed === ownerEmail) { setStatus({ type: "err", msg: "You cannot share a project with yourself." }); return; }
+    if (trimmed === ownerEmail.toLowerCase()) { setStatus({ type: "err", msg: "You cannot share a project with yourself." }); return; }
 
     setBusy(true);
     setStatus(null);
     try {
       const ddb = await getDdbClient();
       await ddb.send(new PutCommand({
-        TableName: PROJECTS_TABLE,
+        TableName: projectsTable,
         Item: {
           userId: trimmed,
           projectId,
@@ -579,9 +583,9 @@ function AppearanceTab({ rootConfig, configBucket, configPath, getS3Client, onSa
 // Danger Tab
 // ---------------------------------------------------------------------------
 
-function DangerTab({ projectId, projectTitle, ownerEmail, getDdbClient, onDeleted }: {
+function DangerTab({ projectId, projectTitle, ownerEmail, projectsTable, getDdbClient, onDeleted }: {
   projectId: string; projectTitle: string; ownerEmail?: string;
-  getDdbClient: () => Promise<DynamoDBDocumentClient>; onDeleted: () => void;
+  projectsTable: string; getDdbClient: () => Promise<DynamoDBDocumentClient>; onDeleted: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
   const [confirmText, setConfirmText] = useState("");
@@ -595,8 +599,8 @@ function DangerTab({ projectId, projectTitle, ownerEmail, getDdbClient, onDelete
     try {
       const ddb = await getDdbClient();
       await ddb.send(new DeleteCommand({
-        TableName: PROJECTS_TABLE,
-        Key: { userId: ownerEmail, projectId },
+        TableName: projectsTable,
+        Key: { userId: ownerEmail.toLowerCase(), projectId },
       }));
       onDeleted();
     } catch (err: unknown) {
