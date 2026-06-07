@@ -509,7 +509,66 @@ type WorkItemInput = Partial<WorkItem> & {
   dependencyTitles?: string[];
 };
 
-const DEFAULT_MODEL = "gpt-5.2-codex";
+const DEFAULT_MODEL = "gpt-5.4-mini";
+type ModelOption = {
+  id: string;
+  label: string;
+  price: string;
+};
+
+const MODEL_OPTIONS: Array<{ group: string; options: ModelOption[] }> = [
+  {
+    group: "Frontier",
+    options: [
+      {
+        id: "gpt-5.5",
+        label: "GPT-5.5 - frontier, highest cost",
+        price: "Input $5.00 / Cached $0.50 / Output $30.00 per 1M",
+      },
+      {
+        id: "gpt-5.4",
+        label: "GPT-5.4 - frontier value",
+        price: "Input $2.50 / Cached $0.25 / Output $15.00 per 1M",
+      },
+      {
+        id: "gpt-5-codex",
+        label: "GPT-5-Codex - coding agent",
+        price: "Input $1.25 / Cached $0.125 / Output $10.00 per 1M",
+      },
+    ],
+  },
+  {
+    group: "Budget",
+    options: [
+      {
+        id: "gpt-5.4-mini",
+        label: "GPT-5.4 mini - default, strong budget agent",
+        price: "Input $0.75 / Cached $0.075 / Output $4.50 per 1M",
+      },
+      {
+        id: "gpt-5.4-nano",
+        label: "GPT-5.4 nano - fast/simple tasks",
+        price: "Input $0.20 / Cached $0.02 / Output $1.25 per 1M",
+      },
+      {
+        id: "gpt-5-mini",
+        label: "GPT-5 mini - older cheap reasoning",
+        price: "Input $0.25 / Cached $0.025 / Output $2.00 per 1M",
+      },
+      {
+        id: "gpt-5-nano",
+        label: "GPT-5 nano - cheapest legacy option",
+        price: "Input $0.05 / Cached $0.005 / Output $0.40 per 1M",
+      },
+      {
+        id: "gpt-4o-mini",
+        label: "GPT-4o mini - very cheap compatibility",
+        price: "Input $0.15 / Cached input not shown / Output $0.60 per 1M",
+      },
+    ],
+  },
+] as const;
+const FLAT_MODEL_OPTIONS = MODEL_OPTIONS.flatMap((group) => group.options);
 const DEFAULT_TITLE = "Codex Chat";
 const TOOL_ITERATION_LIMIT = 20;
 const BROWSER_CONTEXT_ITEM_LIMIT = 18;
@@ -7187,6 +7246,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     : "Disabled";
   const canSend = !!apiKey.trim() && !!composer.trim() && !busy;
   const canSaveSettings = !!metaDraft.title.trim() && !!metaDraft.model.trim() && !!metaDraft.systemPrompt.trim() && !busy;
+  const selectedModelOption = FLAT_MODEL_OPTIONS.find((option) => option.id === metaDraft.model);
   const continuationPending = Boolean(pendingContinuation);
   const organizerOverview = buildOrganizerOverview(organizerStore);
   const organizerVisibleItems = organizerOverview.unassignedItems.concat(organizerOverview.linkedByObjective.flatMap((entry) => entry.items));
@@ -8500,21 +8560,56 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             </div>
           </div>
 
+          <div style={{ display: "grid", gap: "0.35rem" }}>
+            <label style={labelStyle}>Model</label>
+            <select
+              value={metaDraft.model}
+              onChange={(event) => {
+                const nextModel = event.currentTarget.value;
+                setMetaDraft((current) => ({ ...current, model: nextModel }));
+              }}
+              style={inputStyle}
+            >
+              {!MODEL_OPTIONS.some((group) => group.options.some((option) => option.id === metaDraft.model)) && metaDraft.model.trim() ? (
+                <option value={metaDraft.model}>{metaDraft.model} - custom current value</option>
+              ) : null}
+              {MODEL_OPTIONS.map((group) => (
+                <optgroup key={group.group} label={group.group}>
+                  {group.options.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label} - {option.price}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+            <div style={{ fontSize: "0.72rem", color: C.muted, lineHeight: 1.45 }}>
+              {selectedModelOption ? (
+                <>
+                  {selectedModelOption.id}: {selectedModelOption.price}. Standard token pricing; tool calls may add separate costs.
+                </>
+              ) : (
+                <>Custom model. Check OpenAI pricing before using it.</>
+              )}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.55rem", flexWrap: "wrap" }}>
+              <button disabled={!canSaveSettings} onClick={handleSaveSettings} style={primaryButtonStyle}>
+                Save Model
+              </button>
+              {saveError && !editMode && <span style={{ fontSize: "0.74rem", color: C.danger }}>{saveError}</span>}
+            </div>
+          </div>
+
           {editMode && (
             <>
               <div style={{ display: "grid", gap: "0.35rem" }}>
                 <label style={labelStyle}>Module title</label>
                 <input
                   value={metaDraft.title}
-                  onChange={(event) => setMetaDraft((current) => ({ ...current, title: event.currentTarget.value }))}
-                  style={inputStyle}
-                />
-              </div>
-              <div style={{ display: "grid", gap: "0.35rem" }}>
-                <label style={labelStyle}>Model</label>
-                <input
-                  value={metaDraft.model}
-                  onChange={(event) => setMetaDraft((current) => ({ ...current, model: event.currentTarget.value }))}
+                  onChange={(event) => {
+                    const nextTitle = event.currentTarget.value;
+                    setMetaDraft((current) => ({ ...current, title: nextTitle }));
+                  }}
                   style={inputStyle}
                 />
               </div>
@@ -8522,7 +8617,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                 <label style={labelStyle}>System prompt</label>
                 <textarea
                   value={metaDraft.systemPrompt}
-                  onChange={(event) => setMetaDraft((current) => ({ ...current, systemPrompt: event.currentTarget.value }))}
+                  onChange={(event) => {
+                    const nextSystemPrompt = event.currentTarget.value;
+                    setMetaDraft((current) => ({ ...current, systemPrompt: nextSystemPrompt }));
+                  }}
                   rows={4}
                   style={{ ...inputStyle, resize: "vertical", minHeight: 92 }}
                 />

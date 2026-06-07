@@ -5,7 +5,7 @@
     "layouts/tabs-left": "65a10157e89e34c54512ee9dd0f92cceb115496f648b06a15bbf2b99101c3388",
     "layouts/left-right-columns": "7c7652d4aeeb1e34bf51e1fd97921aa6498fc5f96250a4126a9ee0b0314712a6",
     "modules/webview": "20ee3bab0cbeba572eff750c94408f79a192d4752270e630d0cae0209ced2686",
-    "modules/oauth-badge": "28ff30400a2a284ae8e469d53baddefe477b89ef9c9d1e457a81ee926241954f",
+    "modules/oauth-badge": "5b6a2ba9816ddc7388a69f39b8645d6587524de239414a07f6cb496aedaa8560",
     "modules/markdown-viewer": "5d072e1fdaa56e15d15772c84a9cfbad73d9b0039c45270327c92c6fd428b8d3",
     "modules/document-viewer": "24506860847c28a833ee77724243b3a95500048762ebf89325780c2e86581219",
     "modules/documentation-viewer": "02bf5181ba3af79f92dc0c8075fd52113498d0a71150fa255f56ca507e6fc82d",
@@ -14,8 +14,8 @@
     "modules/task-tracker": "49dcf58e2ed945094b5ff279f378a0956e1434ea4f0e95f41a86a1ee87854ed6",
     "modules/kicad-board-viewer": "6ce2b36fc9f9aac99e5c855fe2508551243119b1d62b8349399cc16d96d83bf5",
     "modules/shell-core": "ba56fefa7f82f68738761e5dbc1b3bd38ab662e7f2a7dbd2eaf3c557f3e26d2f",
-    "apps/landing": "a9dc35613b7dcf574f600ff32edac2b904dd11d5f4d5f00f11627f39c785b2d6",
-    "modules/chat-codex": "5a744c8f0250514d3ecac1b4492c8c39eb866ab51b96e5e786f48eb802bd1383",
+    "apps/landing": "06477efd80bf8dafd67e14b0a46d0f8b8c6a67e037a743ab9784a2911d6ed83c",
+    "modules/chat-codex": "5c8b88567288d5e3ddfb3b07672d031fd775bf590f97bde444bcc731f5346d32",
     "modules/work-manager": "e8d2f45a7ace7cc8aef242b67b71f3f90f1b67e152e532be02ef1ea3b845f558",
     "modules/test-manager": "a6b8e971a8cd405d3ea8ba229fb8bcc35f45ccec4694c2a0442f2bd6e2f46646"
   }
