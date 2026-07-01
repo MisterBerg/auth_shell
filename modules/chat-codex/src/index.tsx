@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, KeyboardEvent } from "react";
+import type { CSSProperties, KeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -161,7 +161,7 @@ type GenericSlotToolArgs = {
 
 type BridgeConfig = {
   url: string;
-  token: string;
+  token?: string;
 };
 
 type BridgeStatus = {
@@ -215,6 +215,168 @@ type PersistedChatSession = {
   messages: ChatMessage[];
   composer: string;
   pendingContinuation: PendingContinuation | null;
+};
+
+type OrganizerItemKind = "note" | "todo" | "follow-up" | "waiting-on" | "idea" | "reminder";
+type OrganizerItemStatus = "open" | "active" | "done" | "archived";
+type WorkObjectiveStatus = "open" | "active" | "blocked" | "done" | "archived";
+type WorkScopeStatus = "open" | "active" | "blocked" | "done" | "archived";
+type OrganizerTimingState = "overdue" | "upcoming" | "no-dates";
+
+type WorkScope = {
+  id: string;
+  title: string;
+  scope: string;
+  status: WorkScopeStatus;
+  parentScopeId?: string;
+  subjects: string[];
+  notes: string;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  targetAt?: string;
+  linkedOrganizerItemIds: string[];
+  linkedWorkItemIds: string[];
+  linkedAssetIds: string[];
+};
+
+type WorkObjective = {
+  id: string;
+  title: string;
+  scope: string;
+  status: WorkObjectiveStatus;
+  subjects: string[];
+  notes: string;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  targetAt?: string;
+  linkedOrganizerItemIds: string[];
+  linkedWorkItemIds: string[];
+  linkedAssetIds: string[];
+};
+
+type OrganizerItem = {
+  id: string;
+  kind: OrganizerItemKind;
+  title: string;
+  details: string;
+  status: OrganizerItemStatus;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  dueAt?: string;
+  followUpAt?: string;
+  linkedWorkItemIds: string[];
+  objectiveIds: string[];
+  scopeIds: string[];
+};
+
+type SweepChecklistCategory = "do-now" | "blocked" | "follow-up";
+type SweepChecklistStatus = "pending" | "completed" | "ignored";
+
+type SweepChecklistItem = {
+  id: string;
+  title: string;
+  reason: string;
+  category: SweepChecklistCategory;
+  status: SweepChecklistStatus;
+  organizerItemId?: string;
+  scopeId?: string;
+  dueAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  ignoredAt?: string;
+  fingerprint: string;
+};
+
+type SweepStatusUpdate = {
+  id: string;
+  title: string;
+  summary: string;
+  scopeId?: string;
+};
+
+type SweepReview = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  statusUpdates: SweepStatusUpdate[];
+  checklist: SweepChecklistItem[];
+  ignoredFingerprints: string[];
+};
+
+type OrganizerStore = {
+  version: 1;
+  projectId: string;
+  items: OrganizerItem[];
+  scopes?: WorkScope[];
+  objectives: WorkObjective[];
+  sweepReview?: SweepReview;
+};
+
+type WorkScopeInput = {
+  id?: string;
+  title: string;
+  scope?: string;
+  status?: WorkScopeStatus;
+  parentScopeId?: string;
+  subjects?: string[];
+  notes?: string;
+  tags?: string[];
+  targetAt?: string;
+  linkedOrganizerItemIds?: string[];
+  linkedWorkItemIds?: string[];
+  linkedAssetIds?: string[];
+};
+
+type WorkObjectiveInput = {
+  id?: string;
+  title: string;
+  scope?: string;
+  status?: WorkObjectiveStatus;
+  subjects?: string[];
+  notes?: string;
+  tags?: string[];
+  targetAt?: string;
+  linkedOrganizerItemIds?: string[];
+  linkedWorkItemIds?: string[];
+  linkedAssetIds?: string[];
+};
+
+type OrganizerItemInput = {
+  id?: string;
+  kind?: OrganizerItemKind;
+  title: string;
+  details?: string;
+  status?: OrganizerItemStatus;
+  tags?: string[];
+  dueAt?: string;
+  followUpAt?: string;
+  linkedWorkItemIds?: string[];
+  objectiveIds?: string[];
+  scopeIds?: string[];
+};
+
+type SweepChecklistItemInput = {
+  id?: string;
+  title: string;
+  reason: string;
+  category: SweepChecklistCategory;
+  organizerItemId?: string;
+  scopeId?: string;
+  dueAt?: string;
+};
+
+type SweepStatusUpdateInput = {
+  id?: string;
+  title: string;
+  summary: string;
+  scopeId?: string;
 };
 
 type AgentRunResult = {
@@ -347,7 +509,66 @@ type WorkItemInput = Partial<WorkItem> & {
   dependencyTitles?: string[];
 };
 
-const DEFAULT_MODEL = "gpt-5.2-codex";
+const DEFAULT_MODEL = "gpt-5.4-mini";
+type ModelOption = {
+  id: string;
+  label: string;
+  price: string;
+};
+
+const MODEL_OPTIONS: Array<{ group: string; options: ModelOption[] }> = [
+  {
+    group: "Frontier",
+    options: [
+      {
+        id: "gpt-5.5",
+        label: "GPT-5.5 - frontier, highest cost",
+        price: "Input $5.00 / Cached $0.50 / Output $30.00 per 1M",
+      },
+      {
+        id: "gpt-5.4",
+        label: "GPT-5.4 - frontier value",
+        price: "Input $2.50 / Cached $0.25 / Output $15.00 per 1M",
+      },
+      {
+        id: "gpt-5-codex",
+        label: "GPT-5-Codex - coding agent",
+        price: "Input $1.25 / Cached $0.125 / Output $10.00 per 1M",
+      },
+    ],
+  },
+  {
+    group: "Budget",
+    options: [
+      {
+        id: "gpt-5.4-mini",
+        label: "GPT-5.4 mini - default, strong budget agent",
+        price: "Input $0.75 / Cached $0.075 / Output $4.50 per 1M",
+      },
+      {
+        id: "gpt-5.4-nano",
+        label: "GPT-5.4 nano - fast/simple tasks",
+        price: "Input $0.20 / Cached $0.02 / Output $1.25 per 1M",
+      },
+      {
+        id: "gpt-5-mini",
+        label: "GPT-5 mini - older cheap reasoning",
+        price: "Input $0.25 / Cached $0.025 / Output $2.00 per 1M",
+      },
+      {
+        id: "gpt-5-nano",
+        label: "GPT-5 nano - cheapest legacy option",
+        price: "Input $0.05 / Cached $0.005 / Output $0.40 per 1M",
+      },
+      {
+        id: "gpt-4o-mini",
+        label: "GPT-4o mini - very cheap compatibility",
+        price: "Input $0.15 / Cached input not shown / Output $0.60 per 1M",
+      },
+    ],
+  },
+] as const;
+const FLAT_MODEL_OPTIONS = MODEL_OPTIONS.flatMap((group) => group.options);
 const DEFAULT_TITLE = "Codex Chat";
 const TOOL_ITERATION_LIMIT = 20;
 const BROWSER_CONTEXT_ITEM_LIMIT = 18;
@@ -417,6 +638,148 @@ const WORK_ITEM_PATCH_SCHEMA = {
     lane: { type: "string" },
   },
   additionalProperties: false,
+} as const;
+
+const ORGANIZER_ITEM_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    kind: { type: "string", enum: ["note", "todo", "follow-up", "waiting-on", "idea", "reminder"] },
+    title: { type: "string" },
+    details: { type: "string" },
+    status: { type: "string", enum: ["open", "active", "done", "archived"] },
+    tags: { type: "array", items: { type: "string" } },
+    dueAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+    followUpAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    objectiveIds: { type: "array", items: { type: "string" } },
+    scopeIds: { type: "array", items: { type: "string" } },
+  },
+  required: ["title"],
+  additionalProperties: false,
+} as const;
+
+const WORK_SCOPE_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    title: { type: "string" },
+    scope: { type: "string", description: "What this scope covers and why it matters." },
+    status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
+    parentScopeId: { type: "string", description: "Optional upstream scope id. Omit for top-level scopes." },
+    subjects: { type: "array", items: { type: "string" }, description: "Major subjects or workstreams under this scope." },
+    notes: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    targetAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+    linkedOrganizerItemIds: { type: "array", items: { type: "string" } },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    linkedAssetIds: { type: "array", items: { type: "string" } },
+  },
+  required: ["title"],
+  additionalProperties: false,
+} as const;
+
+const WORK_SCOPE_PATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    scope: { type: "string" },
+    status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
+    parentScopeId: { type: "string", description: "Optional upstream scope id. Empty string clears the parent." },
+    subjects: { type: "array", items: { type: "string" } },
+    notes: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    targetAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
+    linkedOrganizerItemIds: { type: "array", items: { type: "string" } },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    linkedAssetIds: { type: "array", items: { type: "string" } },
+  },
+  additionalProperties: false,
+} as const;
+
+const SWEEP_STATUS_UPDATE_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    title: { type: "string", description: "Plain-language work area name." },
+    summary: { type: "string", description: "One useful status update in simple language. Avoid talking about graph structure or data shape." },
+    scopeId: { type: "string" },
+  },
+  required: ["title", "summary"],
+  additionalProperties: false,
+} as const;
+
+const SWEEP_CHECKLIST_ITEM_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    title: { type: "string" },
+    reason: { type: "string", description: "One-line reason this is worth doing, blocked, or followed up." },
+    category: { type: "string", enum: ["do-now", "blocked", "follow-up"] },
+    organizerItemId: { type: "string", description: "Organizer item id when this checklist entry corresponds to a real organizer item." },
+    scopeId: { type: "string" },
+    dueAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+  },
+  required: ["title", "reason", "category"],
+  additionalProperties: false,
+} as const;
+
+const WORK_OBJECTIVE_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    title: { type: "string" },
+    scope: { type: "string", description: "What this objective covers and why it matters." },
+    status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
+    subjects: { type: "array", items: { type: "string" }, description: "Major subjects or workstreams under the objective." },
+    notes: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    targetAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+    linkedOrganizerItemIds: { type: "array", items: { type: "string" } },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    linkedAssetIds: { type: "array", items: { type: "string" } },
+  },
+  required: ["title"],
+  additionalProperties: false,
+} as const;
+
+const WORK_OBJECTIVE_PATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    scope: { type: "string" },
+    status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
+    subjects: { type: "array", items: { type: "string" } },
+    notes: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    targetAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
+    linkedOrganizerItemIds: { type: "array", items: { type: "string" } },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    linkedAssetIds: { type: "array", items: { type: "string" } },
+  },
+  additionalProperties: false,
+} as const;
+
+const ORGANIZER_ITEM_PATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: { type: "string", enum: ["note", "todo", "follow-up", "waiting-on", "idea", "reminder"] },
+    title: { type: "string" },
+    details: { type: "string" },
+    status: { type: "string", enum: ["open", "active", "done", "archived"] },
+    tags: { type: "array", items: { type: "string" } },
+    dueAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
+    followUpAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
+    linkedWorkItemIds: { type: "array", items: { type: "string" } },
+    objectiveIds: { type: "array", items: { type: "string" } },
+    scopeIds: { type: "array", items: { type: "string" } },
+  },
+  additionalProperties: false,
+} as const;
+
+const ORGANIZER_TIMING_STATE_SCHEMA = {
+  type: "string",
+  enum: ["overdue", "upcoming", "no-dates"],
 } as const;
 
 const TOOL_DEFINITIONS: ToolDefinition[] = [
@@ -684,6 +1047,313 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
       },
       required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "get_organizer_overview",
+    description: "Return one coherent organizer board snapshot with the work-scope graph, board-visible organizer items, hidden scope duplicates, unassigned items, and per-scope linked items. Prefer this for explanations, counts, and organizer sweeps.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_work_scopes",
+    description: "List work scope graph nodes. A scope may have an upstream parentScopeId and downstream child scopes.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
+        parentScopeId: { type: "string" },
+        includeArchived: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 200 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_work_scope_index",
+    description: "Return a compact index of all visible work scope graph nodes. Use this when the agent has no context and needs to choose a starting scope.",
+    parameters: {
+      type: "object",
+      properties: {
+        includeArchived: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "search_work_scope_graph",
+    description: "Search work scope titles, excerpts, subjects, tags, and linked organizer item text. Returns compact candidate records without full content.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        includeArchived: { type: "boolean" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "get_work_scope_context",
+    description: "Expand graph context around a selected work scope, including upstream chain, downstream subtree, and linked organizer items.",
+    parameters: {
+      type: "object",
+      properties: {
+        scopeId: { type: "string" },
+        direction: { type: "string", enum: ["self", "upstream", "downstream", "both"] },
+        depth: { type: "integer", minimum: 0, maximum: 20 },
+        includeLinkedItems: { type: "boolean" },
+      },
+      required: ["scopeId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_work_scopes",
+    description: "Create one or more work scope graph nodes. Use parentScopeId to place a scope under an upstream scope.",
+    parameters: {
+      type: "object",
+      properties: {
+        scopes: {
+          type: "array",
+          minItems: 1,
+          items: WORK_SCOPE_INPUT_SCHEMA,
+        },
+      },
+      required: ["scopes"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "replace_organizer_store",
+    description: "Replace the organizer graph and organizer items in one operation. Use only for explicit reset/import/test-data requests.",
+    parameters: {
+      type: "object",
+      properties: {
+        scopes: {
+          type: "array",
+          items: WORK_SCOPE_INPUT_SCHEMA,
+        },
+        items: {
+          type: "array",
+          items: ORGANIZER_ITEM_INPUT_SCHEMA,
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_work_scope",
+    description: "Update a work scope graph node, including reparenting it with parentScopeId.",
+    parameters: {
+      type: "object",
+      properties: {
+        scopeId: { type: "string" },
+        patch: WORK_SCOPE_PATCH_SCHEMA,
+      },
+      required: ["scopeId", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "archive_work_scope",
+    description: "Archive a work scope graph node by id.",
+    parameters: {
+      type: "object",
+      properties: {
+        scopeId: { type: "string" },
+      },
+      required: ["scopeId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_organizer_items",
+    description: "List organizer memory items stored for this chat module instance. Supports text, kind, status, and semantic timing filters such as overdue or upcoming.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        kind: { type: "string", enum: ["note", "todo", "follow-up", "waiting-on", "idea", "reminder"] },
+        status: { type: "string", enum: ["open", "active", "done", "archived"] },
+        timingState: ORGANIZER_TIMING_STATE_SCHEMA,
+        includeArchived: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 200 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_organizer_items",
+    description: "Create one or more organizer memory items such as notes, todos, follow-ups, reminders, or waiting-on entries.",
+    parameters: {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          minItems: 1,
+          items: ORGANIZER_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["items"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_work_objectives",
+    description: "List larger work objectives that group notes, todos, work-manager tasks, assets, and project subjects into an overarching scope.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
+        includeArchived: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_work_objectives",
+    description: "Create one or more larger work objectives. Use objectives for durable context such as hardware validation scope, vendor testing scope, document procurement scope, or investigation scope.",
+    parameters: {
+      type: "object",
+      properties: {
+        objectives: {
+          type: "array",
+          minItems: 1,
+          items: WORK_OBJECTIVE_INPUT_SCHEMA,
+        },
+      },
+      required: ["objectives"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_work_objective",
+    description: "Update a larger work objective by id, including its scope, status, subjects, notes, and links to organizer items, work-manager items, or assets.",
+    parameters: {
+      type: "object",
+      properties: {
+        objectiveId: { type: "string" },
+        patch: WORK_OBJECTIVE_PATCH_SCHEMA,
+      },
+      required: ["objectiveId", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "archive_work_objective",
+    description: "Archive a larger work objective by id.",
+    parameters: {
+      type: "object",
+      properties: {
+        objectiveId: { type: "string" },
+      },
+      required: ["objectiveId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_organizer_item",
+    description: "Update an existing organizer memory item by id.",
+    parameters: {
+      type: "object",
+      properties: {
+        itemId: { type: "string" },
+        patch: ORGANIZER_ITEM_PATCH_SCHEMA,
+      },
+      required: ["itemId", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "delete_organizer_item",
+    description: "Delete an organizer memory item by id.",
+    parameters: {
+      type: "object",
+      properties: {
+        itemId: { type: "string" },
+      },
+      required: ["itemId"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "batch_update_organizer_items",
+    description: "Update several organizer memory items in one call using the same patch.",
+    parameters: {
+      type: "object",
+      properties: {
+        itemIds: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string" },
+        },
+        patch: ORGANIZER_ITEM_PATCH_SCHEMA,
+      },
+      required: ["itemIds", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "mark_organizer_items_complete",
+    description: "Mark one or more organizer memory items complete by setting their status to done.",
+    parameters: {
+      type: "object",
+      properties: {
+        itemIds: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string" },
+        },
+      },
+      required: ["itemIds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "upsert_sweep_review",
+    description: "Create or update the single persisted organizer sweep review. Carries forward pending checklist items, appends new useful entries, and preserves ignored entries so they stay hidden.",
+    parameters: {
+      type: "object",
+      properties: {
+        statusUpdates: {
+          type: "array",
+          items: SWEEP_STATUS_UPDATE_INPUT_SCHEMA,
+        },
+        checklist: {
+          type: "array",
+          items: SWEEP_CHECKLIST_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["statusUpdates", "checklist"],
       additionalProperties: false,
     },
   },
@@ -1793,9 +2463,843 @@ function makeWorkId(): string {
   return cryptoId ? `work-${cryptoId}` : `work-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function makeOrganizerItemId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `org-${cryptoId}` : `org-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeWorkObjectiveId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `obj-${cryptoId}` : `obj-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeWorkScopeId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `scope-${cryptoId}` : `scope-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeSweepReviewId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `sweep-${cryptoId}` : `sweep-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeSweepEntryId(): string {
+  const cryptoId = globalThis.crypto?.randomUUID?.();
+  return cryptoId ? `sweep-item-${cryptoId}` : `sweep-item-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function dirnamePath(path: string): string {
   const idx = path.lastIndexOf("/");
   return idx >= 0 ? path.slice(0, idx) : "";
+}
+
+function normalizeOptionalDate(value: unknown, fieldName: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new Error(`${fieldName} must be a string.`);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? new Date(`${value}T00:00:00`)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error(`Invalid ${fieldName}: ${value}`);
+  return date.toISOString();
+}
+
+function defaultOrganizerItem(userEmail?: string, partial?: Partial<OrganizerItem>): OrganizerItem {
+  const at = nowIso();
+  return {
+    id: partial?.id ?? makeOrganizerItemId(),
+    kind: partial?.kind ?? "note",
+    title: partial?.title ?? "New note",
+    details: partial?.details ?? "",
+    status: partial?.status ?? "open",
+    tags: partial?.tags ?? [],
+    createdAt: partial?.createdAt ?? at,
+    updatedAt: partial?.updatedAt ?? at,
+    createdBy: partial?.createdBy ?? userEmail,
+    dueAt: partial?.dueAt,
+    followUpAt: partial?.followUpAt,
+    linkedWorkItemIds: partial?.linkedWorkItemIds ?? [],
+    objectiveIds: partial?.objectiveIds ?? [],
+    scopeIds: partial?.scopeIds ?? partial?.objectiveIds ?? [],
+  };
+}
+
+function normalizeOrganizerItem(args: {
+  input: OrganizerItemInput | Partial<OrganizerItem>;
+  existing?: OrganizerItem;
+  userEmail?: string;
+}): OrganizerItem {
+  const at = nowIso();
+  return {
+    id: args.input.id ?? args.existing?.id ?? makeOrganizerItemId(),
+    kind: (args.input.kind ?? args.existing?.kind ?? "note") as OrganizerItemKind,
+    title: args.input.title ?? args.existing?.title ?? "New note",
+    details: args.input.details ?? args.existing?.details ?? "",
+    status: (args.input.status ?? args.existing?.status ?? "open") as OrganizerItemStatus,
+    tags: args.input.tags ?? args.existing?.tags ?? [],
+    createdAt: args.existing?.createdAt ?? at,
+    updatedAt: at,
+    createdBy: args.existing?.createdBy ?? args.userEmail,
+    dueAt: "dueAt" in args.input ? normalizeOptionalDate(args.input.dueAt, "dueAt") : args.existing?.dueAt,
+    followUpAt: "followUpAt" in args.input ? normalizeOptionalDate(args.input.followUpAt, "followUpAt") : args.existing?.followUpAt,
+    linkedWorkItemIds: args.input.linkedWorkItemIds ?? args.existing?.linkedWorkItemIds ?? [],
+    objectiveIds: args.input.objectiveIds ?? args.existing?.objectiveIds ?? [],
+    scopeIds: args.input.scopeIds ?? args.existing?.scopeIds ?? args.input.objectiveIds ?? args.existing?.objectiveIds ?? [],
+  };
+}
+
+function normalizeOptionalParentScopeId(value: unknown, existing?: string): string | undefined {
+  if (value === undefined) return existing;
+  if (value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new Error("parentScopeId must be a string.");
+  return value;
+}
+
+function normalizeWorkScope(args: {
+  input: WorkScopeInput | Partial<WorkScope>;
+  existing?: WorkScope;
+  userEmail?: string;
+}): WorkScope {
+  const at = nowIso();
+  return {
+    id: args.input.id ?? args.existing?.id ?? makeWorkScopeId(),
+    title: args.input.title ?? args.existing?.title ?? "New work scope",
+    scope: args.input.scope ?? args.existing?.scope ?? "",
+    status: (args.input.status ?? args.existing?.status ?? "open") as WorkScopeStatus,
+    parentScopeId: normalizeOptionalParentScopeId(args.input.parentScopeId, args.existing?.parentScopeId),
+    subjects: args.input.subjects ?? args.existing?.subjects ?? [],
+    notes: args.input.notes ?? args.existing?.notes ?? "",
+    tags: args.input.tags ?? args.existing?.tags ?? [],
+    createdAt: args.existing?.createdAt ?? at,
+    updatedAt: at,
+    createdBy: args.existing?.createdBy ?? args.userEmail,
+    targetAt: "targetAt" in args.input ? normalizeOptionalDate(args.input.targetAt, "targetAt") : args.existing?.targetAt,
+    linkedOrganizerItemIds: args.input.linkedOrganizerItemIds ?? args.existing?.linkedOrganizerItemIds ?? [],
+    linkedWorkItemIds: args.input.linkedWorkItemIds ?? args.existing?.linkedWorkItemIds ?? [],
+    linkedAssetIds: args.input.linkedAssetIds ?? args.existing?.linkedAssetIds ?? [],
+  };
+}
+
+function objectiveToScope(objective: WorkObjective): WorkScope {
+  return {
+    id: objective.id,
+    title: objective.title,
+    scope: objective.scope,
+    status: objective.status,
+    parentScopeId: undefined,
+    subjects: objective.subjects,
+    notes: objective.notes,
+    tags: objective.tags,
+    createdAt: objective.createdAt,
+    updatedAt: objective.updatedAt,
+    createdBy: objective.createdBy,
+    targetAt: objective.targetAt,
+    linkedOrganizerItemIds: objective.linkedOrganizerItemIds,
+    linkedWorkItemIds: objective.linkedWorkItemIds,
+    linkedAssetIds: objective.linkedAssetIds,
+  };
+}
+
+function normalizeWorkObjective(args: {
+  input: WorkObjectiveInput | Partial<WorkObjective>;
+  existing?: WorkObjective;
+  userEmail?: string;
+}): WorkObjective {
+  const at = nowIso();
+  return {
+    id: args.input.id ?? args.existing?.id ?? makeWorkObjectiveId(),
+    title: args.input.title ?? args.existing?.title ?? "New objective",
+    scope: args.input.scope ?? args.existing?.scope ?? "",
+    status: (args.input.status ?? args.existing?.status ?? "open") as WorkObjectiveStatus,
+    subjects: args.input.subjects ?? args.existing?.subjects ?? [],
+    notes: args.input.notes ?? args.existing?.notes ?? "",
+    tags: args.input.tags ?? args.existing?.tags ?? [],
+    createdAt: args.existing?.createdAt ?? at,
+    updatedAt: at,
+    createdBy: args.existing?.createdBy ?? args.userEmail,
+    targetAt: "targetAt" in args.input ? normalizeOptionalDate(args.input.targetAt, "targetAt") : args.existing?.targetAt,
+    linkedOrganizerItemIds: args.input.linkedOrganizerItemIds ?? args.existing?.linkedOrganizerItemIds ?? [],
+    linkedWorkItemIds: args.input.linkedWorkItemIds ?? args.existing?.linkedWorkItemIds ?? [],
+    linkedAssetIds: args.input.linkedAssetIds ?? args.existing?.linkedAssetIds ?? [],
+  };
+}
+
+function normalizeLoadedOrganizerStore(store: OrganizerStore | null, projectId: string): OrganizerStore {
+  const at = nowIso();
+  const objectives = (store?.objectives ?? []).map((objective) => ({
+    id: objective.id ?? makeWorkObjectiveId(),
+    title: objective.title ?? "New objective",
+    scope: objective.scope ?? "",
+    status: objective.status ?? "open",
+    subjects: objective.subjects ?? [],
+    notes: objective.notes ?? "",
+    tags: objective.tags ?? [],
+    createdAt: objective.createdAt ?? at,
+    updatedAt: objective.updatedAt ?? objective.createdAt ?? at,
+    createdBy: objective.createdBy,
+    targetAt: objective.targetAt,
+    linkedOrganizerItemIds: objective.linkedOrganizerItemIds ?? [],
+    linkedWorkItemIds: objective.linkedWorkItemIds ?? [],
+    linkedAssetIds: objective.linkedAssetIds ?? [],
+  }));
+  const scopeIds = new Set<string>();
+  const scopeTitleKeys = new Set<string>();
+  const scopes = [
+    ...(store?.scopes ?? []).map((scope) => ({
+      id: scope.id ?? makeWorkScopeId(),
+      title: scope.title ?? "New work scope",
+      scope: scope.scope ?? "",
+      status: scope.status ?? "open",
+      parentScopeId: scope.parentScopeId,
+      subjects: scope.subjects ?? [],
+      notes: scope.notes ?? "",
+      tags: scope.tags ?? [],
+      createdAt: scope.createdAt ?? at,
+      updatedAt: scope.updatedAt ?? scope.createdAt ?? at,
+      createdBy: scope.createdBy,
+      targetAt: scope.targetAt,
+      linkedOrganizerItemIds: scope.linkedOrganizerItemIds ?? [],
+      linkedWorkItemIds: scope.linkedWorkItemIds ?? [],
+      linkedAssetIds: scope.linkedAssetIds ?? [],
+    })),
+    ...objectives.map(objectiveToScope),
+  ].filter((scope) => {
+    if (scopeIds.has(scope.id)) return false;
+    const titleKey = scopeTitleKey(scope.title);
+    if (titleKey && scopeTitleKeys.has(titleKey)) return false;
+    scopeIds.add(scope.id);
+    if (titleKey) scopeTitleKeys.add(titleKey);
+    return true;
+  });
+  return {
+    version: 1,
+    projectId: store?.projectId ?? projectId,
+    items: (store?.items ?? []).map((item) => defaultOrganizerItem(item.createdBy, item)),
+    scopes,
+    objectives,
+    sweepReview: store?.sweepReview ? normalizeSweepReview(store.sweepReview) : undefined,
+  };
+}
+
+function normalizeSweepCategory(value: unknown): SweepChecklistCategory {
+  return value === "blocked" || value === "follow-up" || value === "do-now" ? value : "do-now";
+}
+
+function normalizeSweepStatus(value: unknown): SweepChecklistStatus {
+  return value === "completed" || value === "ignored" || value === "pending" ? value : "pending";
+}
+
+function sweepFingerprint(input: Pick<SweepChecklistItemInput, "title" | "category" | "organizerItemId" | "scopeId">): string {
+  return [
+    input.organizerItemId?.trim().toLowerCase() ?? "",
+    input.scopeId?.trim().toLowerCase() ?? "",
+    input.category,
+    input.title.trim().toLowerCase().replace(/\s+/g, " "),
+  ].join("|");
+}
+
+function sweepOrganizerItemKind(category: SweepChecklistCategory): OrganizerItemKind {
+  if (category === "follow-up") return "follow-up";
+  if (category === "blocked") return "waiting-on";
+  return "todo";
+}
+
+function normalizedTitleKey(title: string): string {
+  return title.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function findSweepOrganizerItem(items: OrganizerItem[], input: SweepChecklistItemInput): OrganizerItem | undefined {
+  const titleKey = normalizedTitleKey(input.title);
+  const kind = sweepOrganizerItemKind(normalizeSweepCategory(input.category));
+  const scopeId = input.scopeId?.trim();
+  return items.find((item) => {
+    if (item.status === "archived") return false;
+    if (item.kind !== kind) return false;
+    if (normalizedTitleKey(item.title) !== titleKey) return false;
+    if (!scopeId) return true;
+    return item.scopeIds.includes(scopeId) || item.objectiveIds.includes(scopeId);
+  });
+}
+
+function materializeSweepChecklistItems<T extends SweepChecklistItemInput>(args: {
+  items: OrganizerItem[];
+  checklist: T[];
+  userEmail?: string;
+}): { items: OrganizerItem[]; checklist: T[] } {
+  let items = args.items;
+  const checklist = args.checklist.map((input) => {
+    if (input.organizerItemId?.trim()) return input;
+    const existing = findSweepOrganizerItem(items, input);
+    if (existing) {
+      return { ...input, organizerItemId: existing.id };
+    }
+
+    const category = normalizeSweepCategory(input.category);
+    const scopeIds = input.scopeId ? [input.scopeId] : [];
+    const item = normalizeOrganizerItem({
+      input: {
+        kind: sweepOrganizerItemKind(category),
+        title: input.title,
+        details: input.reason,
+        status: "open",
+        tags: ["sweep", category],
+        dueAt: input.dueAt,
+        scopeIds,
+      },
+      userEmail: args.userEmail,
+    });
+    items = [...items, item];
+    return { ...input, organizerItemId: item.id };
+  });
+
+  return { items, checklist };
+}
+
+function normalizeSweepChecklistItem(input: Partial<SweepChecklistItem> & SweepChecklistItemInput, existing?: SweepChecklistItem): SweepChecklistItem {
+  const at = nowIso();
+  const category = normalizeSweepCategory(input.category ?? existing?.category);
+  const base = {
+    organizerItemId: input.organizerItemId ?? existing?.organizerItemId,
+    scopeId: input.scopeId ?? existing?.scopeId,
+    category,
+    title: input.title ?? existing?.title ?? "Sweep item",
+  };
+  return {
+    id: input.id ?? existing?.id ?? makeSweepEntryId(),
+    title: base.title,
+    reason: input.reason ?? existing?.reason ?? "",
+    category,
+    status: normalizeSweepStatus(input.status ?? existing?.status),
+    organizerItemId: base.organizerItemId,
+    scopeId: base.scopeId,
+    dueAt: input.dueAt ? normalizeOptionalDate(input.dueAt, "dueAt") : existing?.dueAt,
+    createdAt: existing?.createdAt ?? input.createdAt ?? at,
+    updatedAt: at,
+    completedAt: input.completedAt ?? existing?.completedAt,
+    ignoredAt: input.ignoredAt ?? existing?.ignoredAt,
+    fingerprint: input.fingerprint ?? existing?.fingerprint ?? sweepFingerprint(base),
+  };
+}
+
+function normalizeSweepReview(review: SweepReview): SweepReview {
+  const at = nowIso();
+  return {
+    id: review.id ?? makeSweepReviewId(),
+    createdAt: review.createdAt ?? at,
+    updatedAt: review.updatedAt ?? review.createdAt ?? at,
+    statusUpdates: (review.statusUpdates ?? []).map((update, index) => ({
+      id: update.id ?? `status-${index + 1}`,
+      title: update.title ?? "Status update",
+      summary: update.summary ?? "",
+      scopeId: update.scopeId,
+    })),
+    checklist: (review.checklist ?? []).map((item) => normalizeSweepChecklistItem(item)),
+    ignoredFingerprints: review.ignoredFingerprints ?? [],
+  };
+}
+
+function mergeSweepReview(
+  existing: SweepReview | undefined,
+  input: { statusUpdates: SweepStatusUpdateInput[]; checklist: SweepChecklistItemInput[] },
+): SweepReview {
+  const at = nowIso();
+  const previous = existing ? normalizeSweepReview(existing) : undefined;
+  const ignoredFingerprints = new Set(previous?.ignoredFingerprints ?? []);
+  for (const item of previous?.checklist ?? []) {
+    if (item.status === "ignored") ignoredFingerprints.add(item.fingerprint);
+  }
+  const byFingerprint = new Map<string, SweepChecklistItem>();
+
+  for (const item of previous?.checklist ?? []) {
+    if (item.status !== "pending") continue;
+    if (ignoredFingerprints.has(item.fingerprint)) continue;
+    byFingerprint.set(item.fingerprint, item);
+  }
+
+  for (const item of input.checklist) {
+    const fingerprint = sweepFingerprint(item);
+    if (ignoredFingerprints.has(fingerprint)) continue;
+    const existingItem = byFingerprint.get(fingerprint);
+    byFingerprint.set(fingerprint, normalizeSweepChecklistItem({ ...item, fingerprint, status: "pending" }, existingItem));
+  }
+
+  return {
+    id: previous?.id ?? makeSweepReviewId(),
+    createdAt: previous?.createdAt ?? at,
+    updatedAt: at,
+    statusUpdates: input.statusUpdates.map((update, index) => ({
+      id: update.id ?? `status-${index + 1}`,
+      title: update.title,
+      summary: update.summary,
+      scopeId: update.scopeId,
+    })),
+    checklist: [...byFingerprint.values()],
+    ignoredFingerprints: [...ignoredFingerprints],
+  };
+}
+
+function getOrganizerStorage(configBucket: string, configPath: string, projectId: string, moduleId: string) {
+  const projectDir = dirnamePath(configPath);
+  const basePrefix = projectDir ? `${projectDir}/chat-codex/${moduleId}` : `chat-codex/${moduleId}`;
+  return {
+    bucket: configBucket,
+    projectId,
+    storeKey: `${basePrefix}/organizer.json`,
+  };
+}
+
+async function loadOrganizerStore(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  configBucket: string,
+  configPath: string,
+  projectId: string,
+  moduleId: string,
+): Promise<{ storage: ReturnType<typeof getOrganizerStorage>; store: OrganizerStore }> {
+  const storage = getOrganizerStorage(configBucket, configPath, projectId, moduleId);
+  const store = await readOptionalJsonObject<OrganizerStore>(getS3Client, storage.bucket, storage.storeKey);
+  return {
+    storage,
+    store: normalizeLoadedOrganizerStore(store, storage.projectId),
+  };
+}
+
+async function saveOrganizerStore(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  storage: ReturnType<typeof getOrganizerStorage>,
+  store: OrganizerStore,
+): Promise<void> {
+  await writeJsonObject(getS3Client, storage.bucket, storage.storeKey, store);
+}
+
+function buildOrganizerQueryText(item: OrganizerItem): string {
+  return [
+    item.id,
+    item.kind,
+    item.title,
+    item.details,
+    item.status,
+    item.tags.join(" "),
+    item.createdBy ?? "",
+    item.dueAt ?? "",
+    item.followUpAt ?? "",
+    item.linkedWorkItemIds.join(" "),
+    item.objectiveIds.join(" "),
+  ].join(" ").toLowerCase();
+}
+
+function buildScopeQueryText(scope: WorkScope): string {
+  return [
+    scope.id,
+    scope.title,
+    scope.scope,
+    scope.status,
+    scope.parentScopeId ?? "",
+    scope.subjects.join(" "),
+    scope.notes,
+    scope.tags.join(" "),
+    scope.targetAt ?? "",
+    scope.linkedOrganizerItemIds.join(" "),
+    scope.linkedWorkItemIds.join(" "),
+    scope.linkedAssetIds.join(" "),
+  ].join(" ").toLowerCase();
+}
+
+function buildObjectiveQueryText(objective: WorkObjective): string {
+  return buildScopeQueryText(objectiveToScope(objective));
+}
+
+function getOrganizerAnchorDate(item: OrganizerItem): string | undefined {
+  return item.dueAt ?? item.followUpAt;
+}
+
+function matchesOrganizerTimingState(
+  item: OrganizerItem,
+  timingState: OrganizerTimingState | undefined,
+  now = Date.now(),
+): boolean {
+  if (!timingState) return true;
+  const anchor = getOrganizerAnchorDate(item);
+  if (timingState === "no-dates") {
+    return !anchor;
+  }
+  if (!anchor) return false;
+  if (item.status === "done" || item.status === "archived") {
+    return false;
+  }
+  const anchorTime = new Date(anchor).getTime();
+  if (Number.isNaN(anchorTime)) {
+    return false;
+  }
+  return timingState === "overdue" ? anchorTime < now : anchorTime >= now;
+}
+
+function scopeTitleKey(title: string): string {
+  return title.trim().toLowerCase();
+}
+
+function organizerScopeIds(scopes: WorkScope[]): Set<string> {
+  return new Set(scopes.map((scope) => scope.id));
+}
+
+function organizerScopeTitleKeys(scopes: WorkScope[]): Set<string> {
+  return new Set(scopes.map((scope) => scopeTitleKey(scope.title)).filter(Boolean));
+}
+
+function isScopeDuplicateOrganizerItem(item: OrganizerItem, scopes: WorkScope[]): boolean {
+  if (organizerScopeIds(scopes).has(item.id)) return true;
+  return item.kind === "note" && organizerScopeTitleKeys(scopes).has(scopeTitleKey(item.title));
+}
+
+function getBoardVisibleOrganizerItems(store: OrganizerStore): OrganizerItem[] {
+  const scopes = (store.scopes ?? []).filter((scope) => scope.status !== "archived");
+  return store.items
+    .filter((item) => item.status !== "archived")
+    .filter((item) => !isScopeDuplicateOrganizerItem(item, scopes));
+}
+
+function buildOrganizerOverview(store: OrganizerStore) {
+  const scopes = (store.scopes ?? [])
+    .filter((scope) => scope.status !== "archived")
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const boardItems = getBoardVisibleOrganizerItems(store)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const hiddenObjectiveDuplicates = store.items
+    .filter((item) => item.status !== "archived")
+    .filter((item) => isScopeDuplicateOrganizerItem(item, scopes));
+  const childrenByScopeId = Object.fromEntries(scopes.map((scope) => [scope.id, scopes.filter((candidate) => candidate.parentScopeId === scope.id).map((child) => child.id)]));
+  const linkedByScope = scopes.map((scope) => {
+    const linkedIds = new Set(scope.linkedOrganizerItemIds);
+    const items = boardItems.filter((item) => item.scopeIds.includes(scope.id) || item.objectiveIds.includes(scope.id) || linkedIds.has(item.id));
+    return {
+      scope,
+      childScopeIds: childrenByScopeId[scope.id] ?? [],
+      itemCount: items.length,
+      items,
+    };
+  });
+  const linkedItemIds = new Set(linkedByScope.flatMap((entry) => entry.items.map((item) => item.id)));
+  const unassignedItems = boardItems.filter((item) => item.scopeIds.length === 0 && item.objectiveIds.length === 0 && !linkedItemIds.has(item.id));
+
+  return {
+    counts: {
+      visibleScopes: scopes.length,
+      visibleObjectives: scopes.length,
+      visibleBoardItems: boardItems.length,
+      rawVisibleItems: store.items.filter((item) => item.status !== "archived").length,
+      hiddenObjectiveDuplicates: hiddenObjectiveDuplicates.length,
+      unassignedItems: unassignedItems.length,
+      openBoardItems: boardItems.filter((item) => item.status === "open").length,
+      activeBoardItems: boardItems.filter((item) => item.status === "active").length,
+      waitingOnBoardItems: boardItems.filter((item) => item.kind === "waiting-on" && item.status !== "done").length,
+    },
+    scopes,
+    objectives: scopes,
+    linkedByScope,
+    linkedByObjective: linkedByScope.map((entry) => ({ objective: entry.scope, itemCount: entry.itemCount, items: entry.items })),
+    unassignedItems,
+    hiddenObjectiveDuplicates,
+  };
+}
+
+function buildScopeDepths(scopes: WorkScope[]): Map<string, number> {
+  const byId = new Map(scopes.map((scope) => [scope.id, scope]));
+  const depths = new Map<string, number>();
+
+  function depthFor(scope: WorkScope, visiting = new Set<string>()): number {
+    const cached = depths.get(scope.id);
+    if (cached !== undefined) return cached;
+    if (!scope.parentScopeId || !byId.has(scope.parentScopeId) || visiting.has(scope.id)) {
+      depths.set(scope.id, 0);
+      return 0;
+    }
+    visiting.add(scope.id);
+    const parent = byId.get(scope.parentScopeId)!;
+    const depth = depthFor(parent, visiting) + 1;
+    visiting.delete(scope.id);
+    depths.set(scope.id, depth);
+    return depth;
+  }
+
+  for (const scope of scopes) depthFor(scope);
+  return depths;
+}
+
+function getAncestorScopeIds(scopeId: string | null, scopes: WorkScope[]): Set<string> {
+  const byId = new Map(scopes.map((scope) => [scope.id, scope]));
+  const ancestors = new Set<string>();
+  let current = scopeId ? byId.get(scopeId) : undefined;
+  while (current?.parentScopeId && byId.has(current.parentScopeId)) {
+    ancestors.add(current.parentScopeId);
+    current = byId.get(current.parentScopeId);
+  }
+  return ancestors;
+}
+
+function getDescendantScopeIds(scopeId: string | null, scopes: WorkScope[]): Set<string> {
+  if (!scopeId) return new Set();
+  const descendants = new Set<string>();
+  const childrenByParent = new Map<string, WorkScope[]>();
+  for (const scope of scopes) {
+    if (!scope.parentScopeId) continue;
+    childrenByParent.set(scope.parentScopeId, [...(childrenByParent.get(scope.parentScopeId) ?? []), scope]);
+  }
+
+  const stack = [...(childrenByParent.get(scopeId) ?? [])];
+  while (stack.length) {
+    const scope = stack.pop()!;
+    if (descendants.has(scope.id)) continue;
+    descendants.add(scope.id);
+    stack.push(...(childrenByParent.get(scope.id) ?? []));
+  }
+  return descendants;
+}
+
+function scopeExcerpt(scope: WorkScope): string {
+  const text = [scope.scope, scope.notes, scope.subjects.join(", "), scope.tags.join(", ")]
+    .filter(Boolean)
+    .join(" ");
+  return text.length > 180 ? `${text.slice(0, 177)}...` : text;
+}
+
+function compactScopeRecord(scope: WorkScope, scopes: WorkScope[], boardItems: OrganizerItem[]) {
+  return {
+    scopeId: scope.id,
+    title: scope.title,
+    status: scope.status,
+    parentScopeId: scope.parentScopeId,
+    excerpt: scopeExcerpt(scope),
+    childCount: scopes.filter((candidate) => candidate.parentScopeId === scope.id).length,
+    linkedItemCount: boardItems.filter((item) => item.scopeIds.includes(scope.id) || item.objectiveIds.includes(scope.id) || scope.linkedOrganizerItemIds.includes(item.id)).length,
+  };
+}
+
+function scoreScopeSearch(scope: WorkScope, boardItems: OrganizerItem[], query: string): number {
+  const terms = query.toLowerCase().split(/\s+/).map((term) => term.trim()).filter(Boolean);
+  if (!terms.length) return 1;
+  const linkedItems = boardItems.filter((item) => item.scopeIds.includes(scope.id) || item.objectiveIds.includes(scope.id) || scope.linkedOrganizerItemIds.includes(item.id));
+  const haystacks = [
+    [scope.title, 6],
+    [scope.subjects.join(" "), 4],
+    [scope.tags.join(" "), 3],
+    [scope.scope, 2],
+    [scope.notes, 2],
+    [linkedItems.map((item) => `${item.title} ${item.details} ${item.tags.join(" ")}`).join(" "), 2],
+  ] as Array<[string, number]>;
+  return terms.reduce((score, term) => {
+    for (const [text, weight] of haystacks) {
+      if (text.toLowerCase().includes(term)) score += weight;
+    }
+    return score;
+  }, 0);
+}
+
+function getScopeContext(args: {
+  scopeId: string;
+  scopes: WorkScope[];
+  boardItems: OrganizerItem[];
+  direction: "self" | "upstream" | "downstream" | "both";
+  depth: number;
+  includeLinkedItems: boolean;
+}) {
+  const byId = new Map(args.scopes.map((scope) => [scope.id, scope]));
+  const scope = byId.get(args.scopeId);
+  if (!scope) throw new Error(`Work scope not found: ${args.scopeId}`);
+
+  const upstream: WorkScope[] = [];
+  let current = scope;
+  let upstreamDepth = 0;
+  while ((args.direction === "upstream" || args.direction === "both") && current.parentScopeId && byId.has(current.parentScopeId) && upstreamDepth < args.depth) {
+    const parent = byId.get(current.parentScopeId)!;
+    upstream.unshift(parent);
+    current = parent;
+    upstreamDepth++;
+  }
+
+  const downstream: WorkScope[] = [];
+  if (args.direction === "downstream" || args.direction === "both") {
+    const queue = [{ id: scope.id, depth: 0 }];
+    while (queue.length) {
+      const next = queue.shift()!;
+      if (next.depth >= args.depth) continue;
+      const children = args.scopes.filter((candidate) => candidate.parentScopeId === next.id);
+      for (const child of children) {
+        downstream.push(child);
+        queue.push({ id: child.id, depth: next.depth + 1 });
+      }
+    }
+  }
+
+  const contextScopes = args.direction === "self"
+    ? [scope]
+    : [...upstream, scope, ...downstream];
+  const contextScopeIds = new Set(contextScopes.map((entry) => entry.id));
+  const linkedItems = args.includeLinkedItems
+    ? args.boardItems.filter((item) =>
+        item.scopeIds.some((id) => contextScopeIds.has(id)) ||
+        item.objectiveIds.some((id) => contextScopeIds.has(id)) ||
+        contextScopes.some((entry) => entry.linkedOrganizerItemIds.includes(item.id))
+      )
+    : [];
+
+  return {
+    selected: scope,
+    upstream,
+    downstream,
+    scopes: contextScopes,
+    linkedItems,
+  };
+}
+
+function createTestOrganizerStore(projectId: string, userEmail?: string): OrganizerStore {
+  const at = nowIso();
+  const makeScope = (input: Omit<WorkScope, "createdAt" | "updatedAt" | "createdBy" | "linkedOrganizerItemIds" | "linkedWorkItemIds" | "linkedAssetIds"> & Partial<Pick<WorkScope, "linkedOrganizerItemIds" | "linkedWorkItemIds" | "linkedAssetIds">>): WorkScope => ({
+    ...input,
+    createdAt: at,
+    updatedAt: at,
+    createdBy: userEmail,
+    linkedOrganizerItemIds: input.linkedOrganizerItemIds ?? [],
+    linkedWorkItemIds: input.linkedWorkItemIds ?? [],
+    linkedAssetIds: input.linkedAssetIds ?? [],
+  });
+  const makeItem = (input: Omit<OrganizerItem, "createdAt" | "updatedAt" | "createdBy" | "linkedWorkItemIds" | "objectiveIds"> & Partial<Pick<OrganizerItem, "linkedWorkItemIds" | "objectiveIds">>): OrganizerItem => ({
+    ...input,
+    createdAt: at,
+    updatedAt: at,
+    createdBy: userEmail,
+    linkedWorkItemIds: input.linkedWorkItemIds ?? [],
+    objectiveIds: input.objectiveIds ?? [],
+  });
+
+  const scopes: WorkScope[] = [
+    makeScope({ id: "scope-validation", title: "Hardware Validation", scope: "Coordinate the full validation effort from planning through final evidence review and sign-off.", status: "active", subjects: ["planning", "execution", "reporting"], notes: "Top-level scope used to test broad organizer graph navigation.", tags: ["validation"], targetAt: "2026-07-31T04:00:00.000Z" }),
+    makeScope({ id: "scope-docs", parentScopeId: "scope-validation", title: "Documentation Intake", scope: "Collect vendor and internal documents needed before validation decisions.", status: "active", subjects: ["datasheets", "test reports", "drawings"], notes: "Missing documents block safety review and report closure.", tags: ["docs"], targetAt: "2026-06-18T04:00:00.000Z" }),
+    makeScope({ id: "scope-docs-regulator", parentScopeId: "scope-docs", title: "Regulator Evidence", scope: "Verify 5 V and 3.3 V regulator limits, derating, failure behavior, and relevant application notes.", status: "active", subjects: ["5v buck", "3.3v regulator", "derating"], notes: "Use vendor notes to justify short-test acceptance criteria.", tags: ["docs", "regulator"] }),
+    makeScope({ id: "scope-tests", parentScopeId: "scope-validation", title: "Test Execution", scope: "Prepare, outsource, run, and review required validation tests.", status: "active", subjects: ["fire hazard", "thermal", "functional"], notes: "Central execution branch for validation work.", tags: ["test"], targetAt: "2026-07-10T04:00:00.000Z" }),
+    makeScope({ id: "scope-fire", parentScopeId: "scope-tests", title: "Fire Hazard Investigation", scope: "Evaluate short-circuit behavior and downstream thermal or smoke risk.", status: "active", subjects: ["power tree", "short test", "smoke criteria"], notes: "Includes the 5 V to 3.3 V regulator and zener clamp scenario.", tags: ["safety"], targetAt: "2026-06-28T04:00:00.000Z" }),
+    makeScope({ id: "scope-fire-zener", parentScopeId: "scope-fire", title: "3.3 V Zener Clamp Path", scope: "Characterize the short path through the 3.3 V regulator into the zener clamp to ground.", status: "active", subjects: ["zener", "short path", "current"], notes: "Depth level 4 scope for testing graph context expansion.", tags: ["safety", "zener"] }),
+    makeScope({ id: "scope-fire-bench", parentScopeId: "scope-fire-zener", title: "Bench Execution Window", scope: "Run the controlled bench sequence, capture thermal evidence, and record acceptance observations.", status: "open", subjects: ["bench", "thermal camera", "smoke"], notes: "Depth level 5 scope; should remain visible as downstream context.", tags: ["bench"] }),
+    makeScope({ id: "scope-vendor", parentScopeId: "scope-tests", title: "Vendor Outsourced Tests", scope: "Track tests that the vendor or external lab must perform.", status: "blocked", subjects: ["quote", "sample shipment", "report review"], notes: "Waiting for vendor response on lab capacity and sample handling.", tags: ["vendor"], targetAt: "2026-06-24T04:00:00.000Z" }),
+    makeScope({ id: "scope-thermal", parentScopeId: "scope-tests", title: "Thermal Soak Validation", scope: "Confirm thermal margin under nominal and elevated ambient operating cases.", status: "open", subjects: ["ambient", "load", "thermal image"], notes: "Depends on fixture readiness and document intake.", tags: ["thermal"] }),
+    makeScope({ id: "scope-fixtures", parentScopeId: "scope-tests", title: "Fixture Readiness", scope: "Ensure test fixtures, harnesses, and measurement setup are ready.", status: "open", subjects: ["harness", "current limit", "thermal camera"], notes: "Fixture issues can invalidate otherwise good data.", tags: ["fixture"], targetAt: "2026-06-20T04:00:00.000Z" }),
+    makeScope({ id: "scope-reporting", parentScopeId: "scope-validation", title: "Validation Reporting", scope: "Aggregate findings into the report package and sign-off notes.", status: "open", subjects: ["summary", "evidence", "approval"], notes: "Report structure should pull from test-manager exports.", tags: ["report"], targetAt: "2026-07-24T04:00:00.000Z" }),
+    makeScope({ id: "scope-signoff", parentScopeId: "scope-reporting", title: "Sign-off Review", scope: "Resolve open evidence questions and prepare final stakeholder review.", status: "open", subjects: ["approval", "risk", "open issues"], notes: "Use this to test late-stage organizer state.", tags: ["approval"] }),
+  ];
+
+  type OrganizerSeedItemSpec = [
+    OrganizerItemKind,
+    string,
+    string,
+    OrganizerItemStatus,
+    string[],
+    string | undefined,
+    string | undefined,
+    string[],
+  ];
+
+  const itemSpecs: OrganizerSeedItemSpec[] = [
+    ["todo", "Request missing safety packet from vendor", "Vendor email on May 29 included the schematic excerpt but not the formal safety packet. Ask for the signed safety report, regulator derating statement, and any prior fire enclosure assessment. This blocks the documentation intake branch and should be followed up before the June 18 review.", "open", ["vendor", "docs"], "2026-06-10T04:00:00.000Z", undefined, ["scope-docs"]],
+    ["follow-up", "Confirm outsourced lab quote status", "External lab quote was requested after the May 31 planning call. Vendor said they would check schedule availability and sample handling requirements. Follow up with a concise note asking for the quote, earliest start date, and whether they can run the zener short condition.", "open", ["vendor", "lab"], undefined, "2026-06-07T04:00:00.000Z", ["scope-vendor"]],
+    ["note", "Fire hazard power tree scenario", "Short path is through the 3.3 V regulator into the zener clamp to ground. The useful observation is whether the downstream path from the 5 V regulator overheats, smokes, or causes sustained damage beyond expected sacrificial behavior.", "active", ["safety", "diagram"], undefined, undefined, ["scope-fire", "scope-fire-zener"]],
+    ["todo", "Confirm bench supply current-limit values", "Before running the short test, define the starting current limit, maximum permitted current, and the increment plan. Capture the reason for each value so the report can defend the setup rather than just listing equipment settings.", "open", ["fixture", "bench"], "2026-06-12T04:00:00.000Z", undefined, ["scope-fire-bench", "scope-fixtures"]],
+    ["idea", "Use test-manager report export for evidence packet", "The test-manager markdown/zip/PDF export could become the skeleton for the validation evidence package. Include diagrams, procedure steps, runtime inputs, and result status so the report is not manually reconstructed later.", "open", ["report", "test-manager"], undefined, undefined, ["scope-reporting"]],
+    ["reminder", "Reply to vendor about sample serial numbers", "Send the serial number list for the two available validation samples. Include which sample is approved for destructive fire hazard testing and which should remain reserved for thermal soak.", "open", ["email", "vendor"], "2026-06-06T04:00:00.000Z", "2026-06-06T13:00:00.000Z", ["scope-vendor"]],
+    ["todo", "Extract regulator absolute maximum ratings", "Pull the absolute maximum ratings for VIN, switch node, enable, feedback, and thermal shutdown from the 5 V buck regulator datasheet. Add a short note about whether the fire hazard setup can exceed any pin limit.", "active", ["docs", "regulator"], "2026-06-13T04:00:00.000Z", undefined, ["scope-docs-regulator"]],
+    ["todo", "Find 3.3 V regulator reverse-current behavior", "Search the datasheet and application notes for reverse-current or output forced-high behavior. The zener short case may stress the 3.3 V regulator in a way not covered by normal load operation.", "open", ["docs", "3.3v"], "2026-06-14T04:00:00.000Z", undefined, ["scope-docs-regulator", "scope-fire-zener"]],
+    ["note", "Prior bench observation: no smoke at 1.2 A", "Earlier informal bench check at 1.2 A current limit caused the zener area to warm quickly but did not produce smoke during the short observation window. This is not final evidence because thermals were not captured and setup details were incomplete.", "active", ["history", "bench"], undefined, undefined, ["scope-fire-bench"]],
+    ["follow-up", "Ask mechanical team for enclosure material rating", "Mechanical team mentioned the enclosure material may have an existing flammability rating, but the exact grade was not in the shared folder. Ask for the resin grade, UL card if available, and whether the tested configuration matches the production stack.", "open", ["mechanical", "docs"], undefined, "2026-06-09T04:00:00.000Z", ["scope-docs"]],
+    ["todo", "Create thermal camera setup photo", "Take a photo showing camera position, distance, lens angle, and the board orientation. This should be included in the fire hazard and thermal soak evidence packet to make the measurement setup repeatable.", "open", ["thermal", "evidence"], "2026-06-16T04:00:00.000Z", undefined, ["scope-fire-bench", "scope-thermal"]],
+    ["todo", "Prepare fixture harness continuity check", "Define a short continuity check for the harness before applying power. Include expected resistance or open-circuit observations for the power input, regulator output, zener clamp node, and ground reference.", "open", ["fixture", "harness"], "2026-06-15T04:00:00.000Z", undefined, ["scope-fixtures"]],
+    ["reminder", "Call lab about destructive-test shipping label", "The lab may require a specific hazardous or destructive-test shipping label. Call before sending samples so the package does not sit in receiving or get rejected.", "open", ["call", "lab"], "2026-06-11T04:00:00.000Z", "2026-06-11T14:30:00.000Z", ["scope-vendor"]],
+    ["note", "Vendor report review concern", "Vendor reports tend to summarize pass/fail but omit raw setup details. When the outsourced test report arrives, check for input voltage, current limit, ambient, load state, sample ID, and exact failure simulation method.", "open", ["vendor", "report"], undefined, undefined, ["scope-vendor", "scope-reporting"]],
+    ["todo", "Draft acceptance criteria for smoke observation", "Write the acceptance criteria in practical language: no flame, no sustained smoke after power removal, no propagation beyond local clamp path, and no damage that compromises protective enclosure assumptions.", "active", ["safety", "criteria"], "2026-06-17T04:00:00.000Z", undefined, ["scope-fire"]],
+    ["todo", "Verify 12 V input filter component ratings", "Review input capacitor voltage rating, inrush path, ferrite or common-mode choke current rating, and whether the filter can see abnormal current during downstream short testing.", "open", ["input", "docs"], "2026-06-19T04:00:00.000Z", undefined, ["scope-docs"]],
+    ["idea", "Add power tree overlay to report diagram", "Use the reusable diagram system to show normal current flow and short-test current flow as separate overlays. This will make the fire hazard report easier to inspect than raw prose.", "open", ["diagram", "report"], undefined, undefined, ["scope-fire", "scope-reporting"]],
+    ["follow-up", "Ping firmware owner about test mode", "Firmware owner mentioned a low-power diagnostic mode that keeps switching quiet. Ask whether that mode can be used during thermal soak without invalidating normal operating assumptions.", "open", ["firmware", "thermal"], undefined, "2026-06-10T15:00:00.000Z", ["scope-thermal"]],
+    ["todo", "Collect load profile for thermal soak", "Document the expected load current on 5 V and 3.3 V rails during nominal, peak, and idle operation. Thermal soak needs a defensible load case rather than an arbitrary resistor setup.", "open", ["thermal", "load"], "2026-06-21T04:00:00.000Z", undefined, ["scope-thermal"]],
+    ["note", "Scope boundary: validation vs product redesign", "If the zener clamp overheats, the immediate validation question is whether the condition is acceptable or contained. Design changes should be captured separately so validation scope does not silently become redesign scope.", "active", ["scope", "risk"], undefined, undefined, ["scope-validation"]],
+    ["todo", "Create report outline with evidence placeholders", "Build a report outline that includes scope, sample IDs, setup diagrams, procedure steps, raw observations, result tables, deviations, and sign-off. Use placeholders for missing evidence so gaps are visible.", "open", ["report"], "2026-06-20T04:00:00.000Z", undefined, ["scope-reporting"]],
+    ["reminder", "Send Friday status email", "Send a brief status email summarizing document gaps, outsourced lab quote status, and the next bench test date. Keep it short but include blockers so stakeholders understand what is holding the schedule.", "open", ["email", "status"], "2026-06-07T04:00:00.000Z", "2026-06-07T19:00:00.000Z", ["scope-validation"]],
+    ["waiting-on", "Waiting for vendor zener derating note", "Vendor contact said on June 2 that the zener derating note exists but is in an internal component review folder. This is needed to justify whether repeated short tests can damage the clamp path before functional validation.", "active", ["vendor", "zener"], undefined, "2026-06-09T04:00:00.000Z", ["scope-docs-regulator", "scope-fire-zener"]],
+    ["waiting-on", "Waiting for fixture connector delivery", "The replacement connector for the high-current harness was ordered after the crimp issue was found. Without it, the fire hazard bench execution may need a temporary harness or schedule shift.", "active", ["fixture", "procurement"], undefined, "2026-06-13T04:00:00.000Z", ["scope-fixtures"]],
+    ["note", "Thermal soak dependency on enclosure", "Thermal soak results should be captured both open-board and enclosed if schedule allows. If only one can be run before review, prioritize enclosed because airflow assumptions matter for sign-off.", "open", ["thermal", "enclosure"], undefined, undefined, ["scope-thermal", "scope-signoff"]],
+    ["todo", "Check sample history before destructive testing", "Confirm whether the sample planned for destructive testing has already been reworked or stressed. If it has prior damage, note the history or choose a cleaner sample for the formal evidence run.", "open", ["sample", "history"], "2026-06-11T04:00:00.000Z", undefined, ["scope-fire-bench"]],
+    ["todo", "Define retest trigger conditions", "List conditions that force a retest: smoke, fixture anomaly, missing thermal capture, incorrect current limit, wrong sample configuration, or deviation from procedure steps.", "open", ["procedure", "retest"], "2026-06-18T04:00:00.000Z", undefined, ["scope-reporting", "scope-fire-bench"]],
+    ["follow-up", "Ask compliance reviewer about report wording", "Compliance reviewer previously preferred wording that separates observation from judgment. Ask whether the fire hazard section should use their standard phrasing for abnormal operation evidence.", "open", ["compliance", "report"], undefined, "2026-06-18T14:00:00.000Z", ["scope-reporting", "scope-signoff"]],
+    ["idea", "Split vendor tests into quote, shipment, and report nodes", "The vendor outsourced test branch may be too broad. If the graph gets cluttered, split it into quote management, sample shipment, and report review downstream scopes.", "open", ["graph", "vendor"], undefined, undefined, ["scope-vendor"]],
+    ["todo", "Review open deviations before sign-off", "Before the sign-off meeting, scan all report deviations and decide whether each one is acceptable, requires retest, or should become a product issue. This prevents vague approval notes.", "open", ["approval", "deviation"], "2026-07-22T04:00:00.000Z", undefined, ["scope-signoff"]],
+    ["note", "Email history: vendor promised quote by Wednesday", "In the June 3 email thread, vendor said they expected outsourced lab pricing by Wednesday afternoon. If no quote arrives, escalate through the program manager rather than waiting another full week.", "active", ["email", "vendor"], undefined, undefined, ["scope-vendor"]],
+    ["reminder", "Book thermal chamber time", "Reserve chamber time for the week after fixture readiness. If the current schedule slips, move this reminder rather than leaving the chamber booking as an implicit assumption.", "open", ["calendar", "thermal"], "2026-06-14T04:00:00.000Z", "2026-06-14T13:00:00.000Z", ["scope-thermal"]],
+    ["todo", "Capture initial power-up waveform", "Before fault insertion, capture 12 V input, 5 V rail, 3.3 V rail, and zener node during normal power-up. This gives a baseline for interpreting the short-test waveform.", "open", ["waveform", "bench"], "2026-06-17T04:00:00.000Z", undefined, ["scope-fire-bench"]],
+    ["todo", "Write fixture calibration note", "Record meter serial numbers, thermal camera emissivity setting, bench supply model, and calibration assumptions. It does not need to be formal calibration paperwork, but the evidence packet needs traceability.", "open", ["fixture", "calibration"], "2026-06-18T04:00:00.000Z", undefined, ["scope-fixtures", "scope-reporting"]],
+    ["note", "Risk: report may lag test execution", "The report branch is likely to lag because evidence capture and review happen after test execution. Keep report placeholders updated during testing so the final packet is not a memory exercise.", "open", ["report", "risk"], undefined, undefined, ["scope-reporting"]],
+    ["waiting-on", "Waiting for board rework confirmation", "Manufacturing needs to confirm whether the zener clamp on sample B was reworked. If it was, sample B should not be used as the primary formal evidence sample without a deviation note.", "active", ["sample", "manufacturing"], undefined, "2026-06-08T04:00:00.000Z", ["scope-fire-zener"]],
+    ["follow-up", "Check with purchasing on connector ETA", "Purchasing may have an updated ETA for the fixture connector. If delivery is after June 13, decide whether to build a temporary harness or move the bench window.", "open", ["purchasing", "fixture"], undefined, "2026-06-09T16:00:00.000Z", ["scope-fixtures"]],
+    ["todo", "Prepare sample shipment checklist", "Create a small checklist for sample shipment: sample ID, photos, protective packaging, declared test intent, return/disposal instruction, and contact phone number for lab receiving.", "open", ["vendor", "shipping"], "2026-06-12T04:00:00.000Z", undefined, ["scope-vendor"]],
+    ["note", "Potential conflict: destructive sample also needed for thermal", "The current sample plan may accidentally assign the same cleaner unit to destructive fire testing and thermal soak. Resolve sample assignment before either branch commits dates.", "active", ["sample", "schedule"], undefined, undefined, ["scope-fire", "scope-thermal"]],
+    ["todo", "Add downstream-node evidence links after tests", "After each formal test run, link the result artifact to the most specific downstream scope rather than only the top-level validation scope. This will make graph search more useful later.", "open", ["graph", "assets"], "2026-06-28T04:00:00.000Z", undefined, ["scope-reporting"]],
+    ["reminder", "Call mechanical before enclosure test", "Before running enclosed thermal soak, call mechanical to confirm the enclosure screws, gasket, and vent configuration match the intended production state.", "open", ["call", "mechanical"], "2026-06-20T04:00:00.000Z", "2026-06-20T13:30:00.000Z", ["scope-thermal"]],
+    ["todo", "Draft issue template for unexpected smoke", "Prepare a short issue template in case the short test produces smoke: condition, observed location, duration, power removal behavior, photos, thermal peak, immediate containment judgment, and next action.", "open", ["safety", "issue"], "2026-06-19T04:00:00.000Z", undefined, ["scope-fire"]],
+    ["note", "Completed: created first reusable diagram YAML", "The first reusable diagram approach was tested with base graph plus modifications. Keep this as historical context, but avoid letting old raw SVG payloads dominate the test-manager YAML.", "done", ["done", "diagram"], undefined, undefined, ["scope-reporting"]],
+    ["todo", "Decide whether to add automated closed-item compaction", "Once this organizer test has enough data, decide if old done items should be summarized into a compact archive note after a retention window instead of staying as individual records forever.", "open", ["organizer", "cleanup"], "2026-07-01T04:00:00.000Z", undefined, ["scope-validation"]],
+    ["follow-up", "Ask Jeff for preferred sweep output after dense-data test", "After testing this 50-item dataset, ask whether the sweep should produce a brief executive readout, a checklist-first view, or a scope-by-scope readout. The preferred format should drive future UI work.", "open", ["ux", "sweep"], undefined, "2026-06-21T04:00:00.000Z", ["scope-validation"]],
+    ["idea", "Use graph search to find copied-email context", "When pasted email text arrives, the agent should search the scope graph first, identify likely nodes, then decide whether to add a note, create a new downstream scope, or link the material to an existing item.", "open", ["agent", "ingestion"], undefined, undefined, ["scope-validation"]],
+    ["todo", "Validate graph search with zener query", "Test a no-context search using terms like 'zener regulator smoke short'. The expected first candidate should be the 3.3 V Zener Clamp Path or Fire Hazard Investigation scope.", "open", ["graph-search", "test"], "2026-06-08T04:00:00.000Z", undefined, ["scope-fire-zener"]],
+    ["reminder", "Review organizer graph after adding dense seed data", "Open the organizer popup, scroll horizontally across levels, click a middle node, and verify upstream/downstream highlighting remains understandable with many linked items.", "open", ["ui", "test"], "2026-06-05T04:00:00.000Z", "2026-06-05T15:00:00.000Z", ["scope-validation"]],
+    ["waiting-on", "Waiting for final sample disposition decision", "Program team needs to decide whether the destructive sample is discarded after fire testing or returned for inspection. This affects shipping instructions and report language.", "active", ["sample", "program"], undefined, "2026-06-16T04:00:00.000Z", ["scope-vendor", "scope-signoff"]],
+    ["todo", "Create one-page validation status snapshot", "Make a concise one-page status snapshot for the next stakeholder sync: document gaps, fixture status, vendor lab status, fire hazard readiness, thermal readiness, and report risk.", "open", ["status", "stakeholder"], "2026-06-09T04:00:00.000Z", undefined, ["scope-validation", "scope-reporting"]],
+  ];
+
+  const items = itemSpecs.map(([kind, title, details, status, tags, dueAt, followUpAt, scopeIds], index) => makeItem({
+    id: `org-seed-${String(index + 1).padStart(2, "0")}`,
+    kind: kind as OrganizerItemKind,
+    title,
+    details,
+    status: status as OrganizerItemStatus,
+    tags,
+    dueAt,
+    followUpAt,
+    scopeIds,
+  }));
+
+  return { version: 1, projectId, scopes, objectives: [], items };
+}
+
+function summarizeOrganizerStore(store: OrganizerStore): string {
+  const overview = buildOrganizerOverview(store);
+  const visible = getBoardVisibleOrganizerItems(store);
+  const scopes = overview.scopes;
+  const open = overview.counts.openBoardItems;
+  const active = overview.counts.activeBoardItems;
+  const waiting = overview.counts.waitingOnBoardItems;
+  const dueSoon = visible
+    .filter((item) => item.dueAt && item.status !== "done")
+    .sort((a, b) => String(a.dueAt).localeCompare(String(b.dueAt)))
+    .slice(0, 3)
+    .map((item) => `${item.title} (${item.dueAt?.slice(0, 10)})`);
+  const recent = visible
+    .slice()
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 4)
+    .map((item) => `${item.kind}:${item.title}`);
+  const activeScopes = scopes
+    .filter((scope) => scope.status === "active" || scope.status === "blocked")
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 4)
+    .map((scope) => `${scope.status}:${scope.title}`);
+  return [
+    `Organizer board currently has ${scopes.length} visible work scopes and ${overview.counts.visibleBoardItems} visible organizer items (${open} open, ${active} active, ${waiting} waiting-on).`,
+    overview.counts.hiddenObjectiveDuplicates ? `${overview.counts.hiddenObjectiveDuplicates} scope duplicate item${overview.counts.hiddenObjectiveDuplicates === 1 ? " is" : "s are"} hidden from the board count.` : "No scope duplicate items are hidden from the board.",
+    activeScopes.length ? `Active or blocked scopes: ${activeScopes.join("; ")}.` : "No active scopes are currently recorded.",
+    dueSoon.length ? `Upcoming due items: ${dueSoon.join("; ")}.` : "No due items are currently recorded.",
+    recent.length ? `Recently updated items: ${recent.join("; ")}.` : "No organizer items have been captured yet.",
+  ].join(" ");
+}
+
+function formatOrganizerDate(value?: string): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
 async function readOptionalJsonObject<T>(
@@ -2505,14 +4009,127 @@ function summarizeInputItem(item: InputMessageItem | ResponsesApiOutputItem | Fu
   return raw.length > 240 ? `${raw.slice(0, 240)}...` : raw;
 }
 
+function inputItemType(item: InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem): string | undefined {
+  return (item as { type?: string }).type;
+}
+
+function addResponseBlockForIndex(
+  inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>,
+  keepIndexes: Set<number>,
+  index: number,
+): boolean {
+  let changed = false;
+  let start = index;
+  while (start > 0) {
+    const previousType = inputItemType(inputItems[start - 1]!);
+    if (previousType === "message" || previousType === "function_call_output") break;
+    start--;
+  }
+
+  let end = index + 1;
+  while (end < inputItems.length) {
+    const type = inputItemType(inputItems[end]!);
+    if (type === "message" || type === "function_call_output") break;
+    end++;
+  }
+
+  for (let cursor = start; cursor < end; cursor++) {
+    if (!keepIndexes.has(cursor)) {
+      keepIndexes.add(cursor);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function repairToolHistoryItems(inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>) {
+  const seenCallIds = new Set<string>();
+  return inputItems.filter((item) => {
+    if ((item as ResponsesApiFunctionCall).type === "function_call") {
+      const callId = (item as ResponsesApiFunctionCall).call_id;
+      if (typeof callId === "string") seenCallIds.add(callId);
+      return true;
+    }
+    if ((item as FunctionCallOutputItem).type === "function_call_output") {
+      const callId = (item as FunctionCallOutputItem).call_id;
+      return typeof callId === "string" && seenCallIds.has(callId);
+    }
+    return true;
+  });
+}
+
 function compactInputItems(inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>) {
+  const repairedItems = repairToolHistoryItems(inputItems);
+  if (repairedItems.length !== inputItems.length) {
+    inputItems = repairedItems;
+  }
+
   const serializedLength = inputItems.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
   if (inputItems.length <= BROWSER_CONTEXT_ITEM_LIMIT && serializedLength <= BROWSER_CONTEXT_CHAR_BUDGET) {
     return { inputItems, truncatedSummary: "" };
   }
 
-  const recentItems = inputItems.slice(-BROWSER_CONTEXT_ITEM_LIMIT);
-  const droppedItems = inputItems.slice(0, Math.max(0, inputItems.length - recentItems.length));
+  const keepIndexes = new Set<number>();
+  const trailingStart = Math.max(0, inputItems.length - BROWSER_CONTEXT_ITEM_LIMIT);
+  for (let index = trailingStart; index < inputItems.length; index++) {
+    keepIndexes.add(index);
+  }
+
+  const callIndexesById = new Map<string, number[]>();
+  const outputIndexesByCallId = new Map<string, number[]>();
+  inputItems.forEach((item, index) => {
+    if ((item as ResponsesApiFunctionCall).type === "function_call") {
+      const callId = (item as ResponsesApiFunctionCall).call_id;
+      if (typeof callId === "string") {
+        callIndexesById.set(callId, [...(callIndexesById.get(callId) ?? []), index]);
+      }
+    }
+    if ((item as FunctionCallOutputItem).type === "function_call_output") {
+      const callId = (item as FunctionCallOutputItem).call_id;
+      if (typeof callId === "string") {
+        outputIndexesByCallId.set(callId, [...(outputIndexesByCallId.get(callId) ?? []), index]);
+      }
+    }
+  });
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const index of [...keepIndexes].sort((a, b) => a - b)) {
+      const item = inputItems[index]!;
+      const type = inputItemType(item);
+
+      if (type === "function_call_output") {
+        const output = item as FunctionCallOutputItem;
+        const matchingCallIndex = (callIndexesById.get(output.call_id) ?? [])
+          .filter((candidateIndex) => candidateIndex < index)
+          .at(-1);
+        if (matchingCallIndex !== undefined) {
+          changed = addResponseBlockForIndex(inputItems, keepIndexes, matchingCallIndex) || changed;
+        }
+        continue;
+      }
+
+      if (type === "function_call") {
+        const call = item as ResponsesApiFunctionCall;
+        changed = addResponseBlockForIndex(inputItems, keepIndexes, index) || changed;
+        for (const outputIndex of outputIndexesByCallId.get(call.call_id) ?? []) {
+          if (!keepIndexes.has(outputIndex)) {
+            keepIndexes.add(outputIndex);
+            changed = true;
+          }
+        }
+        continue;
+      }
+
+      if (type !== "message") {
+        changed = addResponseBlockForIndex(inputItems, keepIndexes, index) || changed;
+      }
+    }
+  }
+
+  const recentItems = repairToolHistoryItems(inputItems.filter((_, index) => keepIndexes.has(index)));
+  const droppedItems = inputItems.filter((item) => !recentItems.includes(item));
   const summaryLines: string[] = [];
   let used = 0;
   for (const item of droppedItems) {
@@ -2576,6 +4193,14 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
 }
 
+function isFunctionCallOutputMismatchError(error: unknown): boolean {
+  return error instanceof Error && /No tool call found for function call output with call_id/i.test(error.message);
+}
+
+function isReasoningItemMismatchError(error: unknown): boolean {
+  return error instanceof Error && /was provided without its required 'reasoning' item/i.test(error.message);
+}
+
 function readBridgeDefaults(): AgentBridgeDefaults {
   const win = window as unknown as { __AgentBridgeDefaults?: AgentBridgeDefaults };
   return win.__AgentBridgeDefaults ?? {};
@@ -2589,12 +4214,16 @@ function parentPath(path: string): string {
 }
 
 async function callBridge<T>(bridge: BridgeConfig, method: string, params: Record<string, unknown> = {}): Promise<T> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (bridge.token?.trim()) {
+    headers.Authorization = `Bearer ${bridge.token.trim()}`;
+  }
+
   const response = await fetch(`${bridge.url.replace(/\/$/, "")}/rpc`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${bridge.token}`,
-    },
+    headers,
     body: JSON.stringify({ method, params }),
   });
 
@@ -2651,30 +4280,62 @@ async function buildAppspaceContextSnapshot(args: {
   registryEntries: ModuleRegistryEntry[];
   bridgeWorkspaceRoot?: string;
 }) {
-  const context = await loadWorkspaceContext(args.getS3Client, args.configBucket, args.configPath, args.projectId);
+  const syncWarnings: string[] = [];
+  let context: WorkspaceContext;
+  try {
+    context = await loadWorkspaceContext(args.getS3Client, args.configBucket, args.configPath, args.projectId);
+  } catch (error) {
+    syncWarnings.push(`Root config could not be loaded from storage: ${(error as Error).message}`);
+    context = {
+      projectId: args.projectId,
+      configBucket: args.configBucket,
+      configPath: args.configPath,
+      rootConfig: args.config,
+      resources: collectResources(args.config),
+    };
+  }
   const slots = buildSlotTree(context.rootConfig.children);
+  const organizerStorage = getOrganizerStorage(args.configBucket, args.configPath, args.projectId, args.config.id);
+  let organizerStore: OrganizerStore = { version: 1, projectId: args.projectId, items: [], scopes: [], objectives: [] };
+  try {
+    const loaded = await loadOrganizerStore(
+      args.getS3Client,
+      args.configBucket,
+      args.configPath,
+      args.projectId,
+      args.config.id,
+    );
+    organizerStore = loaded.store;
+  } catch (error) {
+    syncWarnings.push(`Organizer store could not be loaded: ${(error as Error).message}`);
+  }
   let assets: Array<Record<string, unknown>> = [];
 
   if (args.assetsTable) {
-    const ddb = await args.getDdbClient();
-    const records = await listAssets({ ddb, tableName: args.assetsTable, projectId: args.projectId });
-    assets = records.map((asset) => {
-      const version = getCurrentAssetVersion(asset);
-      return {
-        assetId: asset.assetId,
-        label: asset.label,
-        bucket: version.bucket,
-        key: version.key,
-        versionId: version.versionId,
-        mimeType: version.mimeType,
-        sizeBytes: version.sizeBytes,
-        meta: asset.meta ?? {},
-      };
-    });
+    try {
+      const ddb = await args.getDdbClient();
+      const records = await listAssets({ ddb, tableName: args.assetsTable, projectId: args.projectId });
+      assets = records.map((asset) => {
+        const version = getCurrentAssetVersion(asset);
+        return {
+          assetId: asset.assetId,
+          label: asset.label,
+          bucket: version.bucket,
+          key: version.key,
+          versionId: version.versionId,
+          mimeType: version.mimeType,
+          sizeBytes: version.sizeBytes,
+          meta: asset.meta ?? {},
+        };
+      });
+    } catch (error) {
+      syncWarnings.push(`Project assets could not be listed from ${args.assetsTable}: ${(error as Error).message}`);
+    }
   }
 
   return {
     schemaVersion: 1,
+    syncWarnings,
     project: {
       projectId: args.projectId,
       configBucket: args.configBucket,
@@ -2713,6 +4374,18 @@ async function buildAppspaceContextSnapshot(args: {
     })),
     bridge: {
       workspaceRoot: args.bridgeWorkspaceRoot || undefined,
+    },
+    organizer: {
+      bucket: organizerStorage.bucket,
+      storeKey: organizerStorage.storeKey,
+      summary: summarizeOrganizerStore(organizerStore),
+      visibleCount: organizerStore.items.filter((item) => item.status !== "archived").length,
+      visibleScopeCount: (organizerStore.scopes ?? []).filter((scope) => scope.status !== "archived").length,
+      scopes: organizerStore.scopes ?? [],
+      visibleObjectiveCount: (organizerStore.scopes ?? []).filter((scope) => scope.status !== "archived").length,
+      objectives: organizerStore.scopes ?? [],
+      items: organizerStore.items,
+      sweepReview: organizerStore.sweepReview,
     },
     capabilities: {
       browserAgentCanExecuteAppspaceOperations: true,
@@ -3409,6 +5082,451 @@ async function executeTool(args: {
         }, null, 2),
         toolMessage: `Created work-manager slot ${[...parentPath, parsed.slotId].join(" / ")} with ${items.length} item${items.length === 1 ? "" : "s"}.`,
         mutatedWorkspace: true,
+      };
+    }
+
+    case "get_organizer_overview": {
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const overview = buildOrganizerOverview(store);
+      return {
+        output: JSON.stringify({
+          summary: summarizeOrganizerStore(store),
+          ...overview,
+        }, null, 2),
+        toolMessage: `Read organizer overview: ${overview.counts.visibleScopes} work scope${overview.counts.visibleScopes === 1 ? "" : "s"}, ${overview.counts.visibleBoardItems} board item${overview.counts.visibleBoardItems === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "list_work_scopes": {
+      const parsed = parseToolArgs<{
+        query?: string;
+        status?: WorkScopeStatus;
+        parentScopeId?: string;
+        includeArchived?: boolean;
+        limit?: number;
+      }>(toolCall.arguments);
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const limit = Math.max(1, Math.min(200, parsed.limit ?? 100));
+      const scopes = (store.scopes ?? [])
+        .filter((scope) => (parsed.includeArchived ? true : scope.status !== "archived"))
+        .filter((scope) => (parsed.status ? scope.status === parsed.status : true))
+        .filter((scope) => (parsed.parentScopeId === undefined ? true : (scope.parentScopeId ?? "") === parsed.parentScopeId))
+        .filter((scope) => matchesQuery(buildScopeQueryText(scope), parsed.query ?? ""))
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        .slice(0, limit);
+      return {
+        output: JSON.stringify({
+          count: scopes.length,
+          totalVisible: (store.scopes ?? []).filter((scope) => scope.status !== "archived").length,
+          scopes,
+        }, null, 2),
+        toolMessage: `Listed ${scopes.length} work scope${scopes.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "list_work_scope_index": {
+      const parsed = parseToolArgs<{ includeArchived?: boolean }>(toolCall.arguments);
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const boardItems = getBoardVisibleOrganizerItems(store);
+      const scopes = (store.scopes ?? [])
+        .filter((scope) => (parsed.includeArchived ? true : scope.status !== "archived"))
+        .sort((a, b) => (a.parentScopeId ?? "").localeCompare(b.parentScopeId ?? "") || a.title.localeCompare(b.title));
+      const index = scopes.map((scope) => compactScopeRecord(scope, scopes, boardItems));
+      return {
+        output: JSON.stringify({ count: index.length, index }, null, 2),
+        toolMessage: `Listed compact index for ${index.length} work scope${index.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "search_work_scope_graph": {
+      const parsed = parseToolArgs<{ query: string; includeArchived?: boolean }>(toolCall.arguments);
+      const query = parsed.query.trim();
+      if (!query) throw new Error("query is required.");
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const boardItems = getBoardVisibleOrganizerItems(store);
+      const scopes = (store.scopes ?? [])
+        .filter((scope) => (parsed.includeArchived ? true : scope.status !== "archived"));
+      const results = scopes
+        .map((scope) => ({ scope, score: scoreScopeSearch(scope, boardItems, query) }))
+        .filter((entry) => entry.score > 0)
+        .sort((a, b) => b.score - a.score || a.scope.title.localeCompare(b.scope.title))
+        .map((entry) => ({ ...compactScopeRecord(entry.scope, scopes, boardItems), score: entry.score }));
+      return {
+        output: JSON.stringify({ query, count: results.length, results }, null, 2),
+        toolMessage: `Found ${results.length} work scope candidate${results.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "get_work_scope_context": {
+      const parsed = parseToolArgs<{ scopeId: string; direction?: "self" | "upstream" | "downstream" | "both"; depth?: number; includeLinkedItems?: boolean }>(toolCall.arguments);
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const scopes = (store.scopes ?? []).filter((scope) => scope.status !== "archived");
+      const boardItems = getBoardVisibleOrganizerItems(store);
+      const context = getScopeContext({
+        scopeId: parsed.scopeId,
+        scopes,
+        boardItems,
+        direction: parsed.direction ?? "both",
+        depth: Math.max(0, Math.min(20, parsed.depth ?? 3)),
+        includeLinkedItems: parsed.includeLinkedItems ?? true,
+      });
+      return {
+        output: JSON.stringify(context, null, 2),
+        toolMessage: `Loaded context for work scope ${context.selected.title}.`,
+      };
+    }
+
+    case "create_work_scopes": {
+      const parsed = parseToolArgs<{ scopes: WorkScopeInput[] }>(toolCall.arguments);
+      if (!parsed.scopes?.length) {
+        throw new Error("At least one work scope is required.");
+      }
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const created = parsed.scopes.map((input) => normalizeWorkScope({ input, userEmail }));
+      const nextStore: OrganizerStore = {
+        ...store,
+        scopes: [...created, ...(store.scopes ?? [])],
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, created }, null, 2),
+        toolMessage: `Created ${created.length} work scope${created.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "replace_organizer_store": {
+      const parsed = parseToolArgs<{ scopes?: WorkScopeInput[]; items?: OrganizerItemInput[] }>(toolCall.arguments);
+      const { storage } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const scopes = (parsed.scopes ?? []).map((input) => normalizeWorkScope({ input, userEmail }));
+      const scopeIds = new Set(scopes.map((scope) => scope.id));
+      const invalidParents = scopes
+        .filter((scope) => scope.parentScopeId && !scopeIds.has(scope.parentScopeId))
+        .map((scope) => `${scope.id}->${scope.parentScopeId}`);
+      if (invalidParents.length) {
+        throw new Error(`Organizer scope parents were not found in replacement graph: ${invalidParents.join(", ")}`);
+      }
+      const items = (parsed.items ?? []).map((input) => normalizeOrganizerItem({ input, userEmail }));
+      const nextStore: OrganizerStore = {
+        version: 1,
+        projectId,
+        scopes,
+        objectives: [],
+        items,
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, scopeCount: scopes.length, itemCount: items.length }, null, 2),
+        toolMessage: `Replaced organizer store with ${scopes.length} work scope${scopes.length === 1 ? "" : "s"} and ${items.length} item${items.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "update_work_scope": {
+      const parsed = parseToolArgs<{ scopeId: string; patch: Partial<WorkScope> }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = (store.scopes ?? []).find((scope) => scope.id === parsed.scopeId);
+      if (!existing) {
+        throw new Error(`Work scope not found: ${parsed.scopeId}`);
+      }
+      if (parsed.patch.parentScopeId === parsed.scopeId) {
+        throw new Error("A work scope cannot be its own parent.");
+      }
+      const updated = normalizeWorkScope({ input: parsed.patch, existing, userEmail });
+      const nextStore: OrganizerStore = {
+        ...store,
+        scopes: (store.scopes ?? []).map((scope) => scope.id === parsed.scopeId ? updated : scope),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, scope: updated }, null, 2),
+        toolMessage: `Updated work scope ${updated.title}.`,
+      };
+    }
+
+    case "archive_work_scope": {
+      const parsed = parseToolArgs<{ scopeId: string }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = (store.scopes ?? []).find((scope) => scope.id === parsed.scopeId);
+      if (!existing) {
+        throw new Error(`Work scope not found: ${parsed.scopeId}`);
+      }
+      const archived = normalizeWorkScope({ input: { status: "archived" }, existing, userEmail });
+      const nextStore: OrganizerStore = {
+        ...store,
+        scopes: (store.scopes ?? []).map((scope) => scope.id === parsed.scopeId ? archived : scope),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, scope: archived }, null, 2),
+        toolMessage: `Archived work scope ${archived.title}.`,
+      };
+    }
+
+    case "list_organizer_items": {
+      const parsed = parseToolArgs<{
+        query?: string;
+        kind?: OrganizerItemKind;
+        status?: OrganizerItemStatus;
+        timingState?: OrganizerTimingState;
+        includeArchived?: boolean;
+        limit?: number;
+      }>(toolCall.arguments);
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const limit = Math.max(1, Math.min(200, parsed.limit ?? 50));
+      const items = store.items
+        .filter((item) => (parsed.includeArchived ? true : item.status !== "archived"))
+        .filter((item) => (parsed.kind ? item.kind === parsed.kind : true))
+        .filter((item) => (parsed.status ? item.status === parsed.status : true))
+        .filter((item) => matchesOrganizerTimingState(item, parsed.timingState))
+        .filter((item) => matchesQuery(buildOrganizerQueryText(item), parsed.query ?? ""))
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        .slice(0, limit);
+      return {
+        output: JSON.stringify({
+          count: items.length,
+          totalVisible: store.items.filter((item) => item.status !== "archived").length,
+          boardVisibleCount: getBoardVisibleOrganizerItems(store).length,
+          items,
+        }, null, 2),
+        toolMessage: `Listed ${items.length} organizer item${items.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "list_work_objectives": {
+      const parsed = parseToolArgs<{
+        query?: string;
+        status?: WorkScopeStatus;
+        includeArchived?: boolean;
+        limit?: number;
+      }>(toolCall.arguments);
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const limit = Math.max(1, Math.min(100, parsed.limit ?? 50));
+      const objectives = (store.scopes ?? [])
+        .filter((scope) => (parsed.includeArchived ? true : scope.status !== "archived"))
+        .filter((scope) => (parsed.status ? scope.status === parsed.status : true))
+        .filter((scope) => matchesQuery(buildScopeQueryText(scope), parsed.query ?? ""))
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        .slice(0, limit);
+      return {
+        output: JSON.stringify({
+          count: objectives.length,
+          totalVisible: (store.scopes ?? []).filter((scope) => scope.status !== "archived").length,
+          objectives,
+        }, null, 2),
+        toolMessage: `Listed ${objectives.length} work scope${objectives.length === 1 ? "" : "s"} through the legacy objective tool.`,
+      };
+    }
+
+    case "create_work_objectives": {
+      const parsed = parseToolArgs<{ objectives: WorkObjectiveInput[] }>(toolCall.arguments);
+      if (!parsed.objectives?.length) {
+        throw new Error("At least one work objective is required.");
+      }
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const created = parsed.objectives.map((input) => normalizeWorkScope({ input, userEmail }));
+      const nextStore: OrganizerStore = {
+        ...store,
+        scopes: [...created, ...(store.scopes ?? [])],
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, created }, null, 2),
+        toolMessage: `Created ${created.length} work scope${created.length === 1 ? "" : "s"} through the legacy objective tool.`,
+      };
+    }
+
+    case "update_work_objective": {
+      const parsed = parseToolArgs<{ objectiveId: string; patch: Partial<WorkScope> }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = (store.scopes ?? []).find((scope) => scope.id === parsed.objectiveId);
+      if (!existing) {
+        throw new Error(`Work scope not found: ${parsed.objectiveId}`);
+      }
+      const updated = normalizeWorkScope({ input: parsed.patch, existing, userEmail });
+      const nextStore: OrganizerStore = {
+        ...store,
+        scopes: (store.scopes ?? []).map((scope) => scope.id === parsed.objectiveId ? updated : scope),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, objective: updated }, null, 2),
+        toolMessage: `Updated work scope ${updated.title} through the legacy objective tool.`,
+      };
+    }
+
+    case "archive_work_objective": {
+      const parsed = parseToolArgs<{ objectiveId: string }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = (store.scopes ?? []).find((scope) => scope.id === parsed.objectiveId);
+      if (!existing) {
+        throw new Error(`Work scope not found: ${parsed.objectiveId}`);
+      }
+      const archived = normalizeWorkScope({ input: { status: "archived" }, existing, userEmail });
+      const nextStore: OrganizerStore = {
+        ...store,
+        scopes: (store.scopes ?? []).map((scope) => scope.id === parsed.objectiveId ? archived : scope),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, objective: archived }, null, 2),
+        toolMessage: `Archived work scope ${archived.title} through the legacy objective tool.`,
+      };
+    }
+
+    case "batch_update_organizer_items": {
+      const parsed = parseToolArgs<{ itemIds: string[]; patch: Partial<OrganizerItem> }>(toolCall.arguments);
+      if (!parsed.itemIds?.length) {
+        throw new Error("At least one organizer item id is required.");
+      }
+      const itemIds = new Set(parsed.itemIds.map((id) => id.trim()).filter(Boolean));
+      if (!itemIds.size) {
+        throw new Error("At least one valid organizer item id is required.");
+      }
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const missing = [...itemIds].filter((id) => !store.items.some((item) => item.id === id));
+      if (missing.length) {
+        throw new Error(`Organizer items not found: ${missing.join(", ")}`);
+      }
+      const updatedItems: OrganizerItem[] = [];
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: store.items.map((item) => {
+          if (!itemIds.has(item.id)) return item;
+          const updated = normalizeOrganizerItem({ input: parsed.patch, existing: item, userEmail });
+          updatedItems.push(updated);
+          return updated;
+        }),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, updatedCount: updatedItems.length, items: updatedItems }, null, 2),
+        toolMessage: `Updated ${updatedItems.length} organizer item${updatedItems.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "mark_organizer_items_complete": {
+      const parsed = parseToolArgs<{ itemIds: string[] }>(toolCall.arguments);
+      if (!parsed.itemIds?.length) {
+        throw new Error("At least one organizer item id is required.");
+      }
+      const itemIds = new Set(parsed.itemIds.map((id) => id.trim()).filter(Boolean));
+      if (!itemIds.size) {
+        throw new Error("At least one valid organizer item id is required.");
+      }
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const missing = [...itemIds].filter((id) => !store.items.some((item) => item.id === id));
+      if (missing.length) {
+        throw new Error(`Organizer items not found: ${missing.join(", ")}`);
+      }
+      const completedItems: OrganizerItem[] = [];
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: store.items.map((item) => {
+          if (!itemIds.has(item.id)) return item;
+          const updated = normalizeOrganizerItem({
+            input: { status: "done" },
+            existing: item,
+            userEmail,
+          });
+          completedItems.push(updated);
+          return updated;
+        }),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, updatedCount: completedItems.length, items: completedItems }, null, 2),
+        toolMessage: `Marked ${completedItems.length} organizer item${completedItems.length === 1 ? "" : "s"} complete.`,
+      };
+    }
+
+    case "upsert_sweep_review": {
+      const parsed = parseToolArgs<{
+        statusUpdates: SweepStatusUpdateInput[];
+        checklist: SweepChecklistItemInput[];
+      }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existingMaterialized = store.sweepReview
+        ? materializeSweepChecklistItems({
+            items: store.items,
+            checklist: store.sweepReview.checklist,
+            userEmail,
+          })
+        : { items: store.items, checklist: [] };
+      const materialized = materializeSweepChecklistItems({
+        items: existingMaterialized.items,
+        checklist: parsed.checklist ?? [],
+        userEmail,
+      });
+      const existingReview = store.sweepReview
+        ? { ...store.sweepReview, checklist: existingMaterialized.checklist }
+        : undefined;
+      const nextReview = mergeSweepReview(existingReview, {
+        statusUpdates: parsed.statusUpdates ?? [],
+        checklist: materialized.checklist,
+      });
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: materialized.items,
+        sweepReview: nextReview,
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, sweepReview: nextReview }, null, 2),
+        toolMessage: `Updated sweep review with ${nextReview.statusUpdates.length} status update${nextReview.statusUpdates.length === 1 ? "" : "s"} and ${nextReview.checklist.filter((item) => item.status === "pending").length} pending checklist item${nextReview.checklist.filter((item) => item.status === "pending").length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "create_organizer_items": {
+      const parsed = parseToolArgs<{ items: OrganizerItemInput[] }>(toolCall.arguments);
+      if (!parsed.items?.length) {
+        throw new Error("At least one organizer item is required.");
+      }
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const created = parsed.items.map((input) => normalizeOrganizerItem({ input, userEmail }));
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: [...created, ...store.items],
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, created }, null, 2),
+        toolMessage: `Created ${created.length} organizer item${created.length === 1 ? "" : "s"}.`,
+      };
+    }
+
+    case "update_organizer_item": {
+      const parsed = parseToolArgs<{ itemId: string; patch: Partial<OrganizerItem> }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = store.items.find((item) => item.id === parsed.itemId);
+      if (!existing) {
+        throw new Error(`Organizer item not found: ${parsed.itemId}`);
+      }
+      const updated = normalizeOrganizerItem({ input: parsed.patch, existing, userEmail });
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: store.items.map((item) => item.id === parsed.itemId ? updated : item),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, item: updated }, null, 2),
+        toolMessage: `Updated organizer item ${updated.title}.`,
+      };
+    }
+
+    case "delete_organizer_item": {
+      const parsed = parseToolArgs<{ itemId: string }>(toolCall.arguments);
+      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      const existing = store.items.find((item) => item.id === parsed.itemId);
+      if (!existing) {
+        throw new Error(`Organizer item not found: ${parsed.itemId}`);
+      }
+      const nextStore: OrganizerStore = {
+        ...store,
+        items: store.items.filter((item) => item.id !== parsed.itemId),
+      };
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      return {
+        output: JSON.stringify({ ok: true, deletedId: parsed.itemId }, null, 2),
+        toolMessage: `Deleted organizer item ${existing.title}.`,
       };
     }
 
@@ -4900,6 +7018,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const [bridgeHealth, setBridgeHealth] = useState<BridgeHealth | null>(null);
   const [bridgeCheckLoading, setBridgeCheckLoading] = useState(false);
   const [bridgeWorkspaceRoot, setBridgeWorkspaceRoot] = useState("");
+  const [bridgeLastSyncedAt, setBridgeLastSyncedAt] = useState("");
+  const [bridgeSyncError, setBridgeSyncError] = useState<string | undefined>();
   const [draftBridgeUrl, setDraftBridgeUrl] = useState("");
   const [draftBridgeToken, setDraftBridgeToken] = useState("");
   const [bridgeBrowserOpen, setBridgeBrowserOpen] = useState(false);
@@ -4910,6 +7030,16 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   const [newFolderName, setNewFolderName] = useState("");
   const [composer, setComposer] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [organizerStore, setOrganizerStore] = useState<OrganizerStore>({ version: 1, projectId, items: [], scopes: [], objectives: [] });
+  const [organizerOpen, setOrganizerOpen] = useState(false);
+  const [organizerLoading, setOrganizerLoading] = useState(false);
+  const [organizerError, setOrganizerError] = useState<string | undefined>();
+  const [selectedOrganizerItemId, setSelectedOrganizerItemId] = useState<string | null>(null);
+  const [selectedScopeId, setSelectedScopeId] = useState<string | null>(null);
+  const [selectedSweepChecklistIds, setSelectedSweepChecklistIds] = useState<string[]>([]);
+  const [scopeNoteDraft, setScopeNoteDraft] = useState("");
+  const [itemNoteDraft, setItemNoteDraft] = useState("");
+  const [organizerWindow, setOrganizerWindow] = useState({ left: 80, top: 72, width: 1120, height: 720 });
   const [busy, setBusy] = useState(false);
   const [stopRequested, setStopRequested] = useState(false);
   const [pendingContinuation, setPendingContinuation] = useState<PendingContinuation | null>(null);
@@ -4924,6 +7054,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   });
   const scrollRef = useRef<HTMLDivElement>(null);
   const runAbortRef = useRef<AbortController | null>(null);
+  const organizerDragRef = useRef<{ startX: number; startY: number; left: number; top: number } | null>(null);
+  const organizerWindowRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const stored = safeReadLocalStorage(storageKey);
@@ -4968,6 +7100,23 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     }
   }, [bridgeDefaults, bridgeEnabledKey, bridgeTokenKey, bridgeUrlKey, bridgeWorkspaceRootKey]);
 
+  async function refreshOrganizerStore() {
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      setOrganizerStore(store);
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refreshOrganizerStore();
+  }, [config.id, configBucket, configPath, getS3Client, projectId]);
+
   useEffect(() => {
     setMetaDraft({ title, model, systemPrompt });
   }, [title, model, systemPrompt]);
@@ -4979,6 +7128,14 @@ export default function ChatCodexModule({ config }: ModuleProps) {
   }, [messages, busy]);
 
   useEffect(() => {
+    setScopeNoteDraft("");
+  }, [selectedScopeId]);
+
+  useEffect(() => {
+    setItemNoteDraft("");
+  }, [selectedOrganizerItemId]);
+
+  useEffect(() => {
     if (hydratedSessionKey !== chatSessionKey) return;
     safeWriteLocalStorage(chatSessionKey, JSON.stringify({
       messages,
@@ -4987,18 +7144,228 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     } satisfies PersistedChatSession));
   }, [chatSessionKey, composer, hydratedSessionKey, messages, pendingContinuation]);
 
+  useEffect(() => () => {
+    window.removeEventListener("mousemove", handleOrganizerDragMove);
+  }, []);
+
+  function formatUserOrganizerNote(text: string): string {
+    const author = user?.email?.toLowerCase() ?? "user";
+    return `[${new Date().toLocaleString()} ${author}]\n${text.trim()}`;
+  }
+
+  async function persistOrganizerStore(nextStore: OrganizerStore) {
+    const { storage } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+    await saveOrganizerStore(getS3Client, storage, nextStore);
+    setOrganizerStore(nextStore);
+  }
+
+  async function updateSelectedScopeStatus(status: WorkScopeStatus) {
+    if (!selectedScope) return;
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const updated = normalizeWorkScope({
+        input: { status },
+        existing: selectedScope,
+        userEmail: user?.email?.toLowerCase(),
+      });
+      await persistOrganizerStore({
+        ...organizerStore,
+        scopes: (organizerStore.scopes ?? []).map((scope) => scope.id === selectedScope.id ? updated : scope),
+      });
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
+  async function addSelectedScopeNote() {
+    if (!selectedScope || !scopeNoteDraft.trim()) return;
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const note = formatUserOrganizerNote(scopeNoteDraft);
+      const nextNotes = selectedScope.notes ? `${selectedScope.notes}\n\n${note}` : note;
+      const updated = normalizeWorkScope({
+        input: { notes: nextNotes },
+        existing: selectedScope,
+        userEmail: user?.email?.toLowerCase(),
+      });
+      await persistOrganizerStore({
+        ...organizerStore,
+        scopes: (organizerStore.scopes ?? []).map((scope) => scope.id === selectedScope.id ? updated : scope),
+      });
+      setScopeNoteDraft("");
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
+  async function updateSelectedOrganizerItemStatus(status: OrganizerItemStatus) {
+    if (!selectedOrganizerItem) return;
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const updated = normalizeOrganizerItem({
+        input: { status },
+        existing: selectedOrganizerItem,
+        userEmail: user?.email?.toLowerCase(),
+      });
+      await persistOrganizerStore({
+        ...organizerStore,
+        items: organizerStore.items.map((item) => item.id === selectedOrganizerItem.id ? updated : item),
+      });
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
+  async function addSelectedOrganizerItemNote() {
+    if (!selectedOrganizerItem || !itemNoteDraft.trim()) return;
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const note = formatUserOrganizerNote(itemNoteDraft);
+      const nextDetails = selectedOrganizerItem.details ? `${selectedOrganizerItem.details}\n\n${note}` : note;
+      const updated = normalizeOrganizerItem({
+        input: { details: nextDetails },
+        existing: selectedOrganizerItem,
+        userEmail: user?.email?.toLowerCase(),
+      });
+      await persistOrganizerStore({
+        ...organizerStore,
+        items: organizerStore.items.map((item) => item.id === selectedOrganizerItem.id ? updated : item),
+      });
+      setItemNoteDraft("");
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
+  async function updateSweepChecklistStatus(itemIds: string[], status: "completed" | "ignored") {
+    if (!itemIds.length || !organizerStore.sweepReview) return;
+    setOrganizerLoading(true);
+    setOrganizerError(undefined);
+    try {
+      const at = nowIso();
+      const itemIdSet = new Set(itemIds);
+      const completedOrganizerItemIds = status === "completed"
+        ? organizerStore.sweepReview.checklist
+            .filter((item) => itemIdSet.has(item.id))
+            .map((item) => item.organizerItemId)
+            .filter((id): id is string => Boolean(id))
+        : [];
+      const nextChecklist = organizerStore.sweepReview.checklist.map((item) => {
+        if (!itemIdSet.has(item.id)) return item;
+        return {
+          ...item,
+          status,
+          updatedAt: at,
+          completedAt: status === "completed" ? at : item.completedAt,
+          ignoredAt: status === "ignored" ? at : item.ignoredAt,
+        };
+      });
+      const ignoredFingerprints = new Set(organizerStore.sweepReview.ignoredFingerprints);
+      if (status === "ignored") {
+        for (const item of nextChecklist) {
+          if (itemIdSet.has(item.id)) ignoredFingerprints.add(item.fingerprint);
+        }
+      }
+      const nextItems = completedOrganizerItemIds.length
+        ? organizerStore.items.map((item) => completedOrganizerItemIds.includes(item.id) ? normalizeOrganizerItem({ input: { status: "done" }, existing: item, userEmail: user?.email?.toLowerCase() }) : item)
+        : organizerStore.items;
+      const nextStore: OrganizerStore = {
+        ...organizerStore,
+        items: nextItems,
+        sweepReview: {
+          ...organizerStore.sweepReview,
+          updatedAt: at,
+          checklist: nextChecklist,
+          ignoredFingerprints: [...ignoredFingerprints],
+        },
+      };
+      const { storage } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
+      await saveOrganizerStore(getS3Client, storage, nextStore);
+      setOrganizerStore(nextStore);
+      setSelectedSweepChecklistIds((current) => current.filter((id) => !itemIdSet.has(id)));
+      setMessages((current) => [
+        ...current,
+        createMessage("tool", status === "completed"
+          ? `Sweep review updated: marked ${itemIds.length} checklist item${itemIds.length === 1 ? "" : "s"} complete.`
+          : `Sweep review updated: ignored ${itemIds.length} checklist item${itemIds.length === 1 ? "" : "s"}.`),
+      ]);
+    } catch (error) {
+      setOrganizerError((error as Error).message);
+    } finally {
+      setOrganizerLoading(false);
+    }
+  }
+
   const connectionLabel = apiKey ? maskKey(apiKey) : "Not connected";
-  const activeBridge = localRuntimeEnabled && bridgeUrl.trim() && bridgeToken.trim()
-    ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
+  const activeBridge = localRuntimeEnabled && bridgeUrl.trim()
+    ? { url: bridgeUrl.trim(), token: bridgeToken.trim() || undefined }
     : null;
   const bridgeLabel = localRuntimeEnabled
     ? bridgeUrl
-      ? `${bridgeUrl} · ${maskBridgeToken(bridgeToken)}`
+      ? `${bridgeUrl}${bridgeToken ? ` · ${maskBridgeToken(bridgeToken)}` : ""}`
       : "Enabled, not configured"
     : "Disabled";
   const canSend = !!apiKey.trim() && !!composer.trim() && !busy;
   const canSaveSettings = !!metaDraft.title.trim() && !!metaDraft.model.trim() && !!metaDraft.systemPrompt.trim() && !busy;
+  const selectedModelOption = FLAT_MODEL_OPTIONS.find((option) => option.id === metaDraft.model);
   const continuationPending = Boolean(pendingContinuation);
+  const organizerOverview = buildOrganizerOverview(organizerStore);
+  const organizerVisibleItems = organizerOverview.unassignedItems.concat(organizerOverview.linkedByObjective.flatMap((entry) => entry.items));
+  const organizerVisibleScopes = organizerOverview.scopes;
+  const organizerSummary = summarizeOrganizerStore(organizerStore);
+  const organizerSortedScopes = organizerVisibleScopes
+    .slice()
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const organizerSortedItems = getBoardVisibleOrganizerItems(organizerStore)
+    .slice()
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const pendingSweepItems = (organizerStore.sweepReview?.checklist ?? [])
+    .filter((item) => item.status === "pending")
+    .sort((a, b) => {
+      const categoryOrder: Record<SweepChecklistCategory, number> = { "do-now": 0, blocked: 1, "follow-up": 2 };
+      return categoryOrder[a.category] - categoryOrder[b.category] || String(a.dueAt ?? "").localeCompare(String(b.dueAt ?? "")) || a.title.localeCompare(b.title);
+    });
+  const selectedSweepItems = pendingSweepItems.filter((item) => selectedSweepChecklistIds.includes(item.id));
+  const selectedOrganizerItem = selectedOrganizerItemId
+    ? organizerVisibleItems.find((item) => item.id === selectedOrganizerItemId) ?? null
+    : null;
+  const selectedScope = selectedScopeId
+    ? organizerVisibleScopes.find((scope) => scope.id === selectedScopeId) ?? null
+    : null;
+  const selectedScopeItemIds = selectedScope ? new Set(selectedScope.linkedOrganizerItemIds) : new Set<string>();
+  const selectedScopeItems = selectedScope
+    ? organizerSortedItems.filter((item) => item.scopeIds.includes(selectedScope.id) || item.objectiveIds.includes(selectedScope.id) || selectedScopeItemIds.has(item.id))
+    : [];
+  const unassignedOrganizerItems = organizerOverview.unassignedItems;
+  const organizerDisplayedItems = selectedScope ? selectedScopeItems : unassignedOrganizerItems;
+  const scopeDepths = useMemo(() => buildScopeDepths(organizerSortedScopes), [organizerSortedScopes]);
+  const scopeColumns = useMemo(() => {
+    const columns = new Map<number, WorkScope[]>();
+    for (const scope of organizerSortedScopes) {
+      const depth = scopeDepths.get(scope.id) ?? 0;
+      columns.set(depth, [...(columns.get(depth) ?? []), scope]);
+    }
+    return [...columns.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([depth, scopes]) => ({
+        depth,
+        scopes: scopes.sort((a, b) => a.title.localeCompare(b.title)),
+      }));
+  }, [organizerSortedScopes, scopeDepths]);
+  const selectedAncestorScopeIds = useMemo(() => getAncestorScopeIds(selectedScope?.id ?? null, organizerSortedScopes), [organizerSortedScopes, selectedScope?.id]);
+  const selectedDescendantScopeIds = useMemo(() => getDescendantScopeIds(selectedScope?.id ?? null, organizerSortedScopes), [organizerSortedScopes, selectedScope?.id]);
 
   async function syncBridgeAppspaceContext(bridge: BridgeConfig | null = activeBridge) {
     if (!bridge) return;
@@ -5018,6 +7385,8 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       sessionId: bridgeAppspaceSessionId,
       context: snapshot,
     });
+    setBridgeLastSyncedAt(new Date().toLocaleTimeString());
+    setBridgeSyncError(undefined);
   }
 
   async function executeBrowserWorkspaceOperation(
@@ -5054,10 +7423,23 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       limit: 25,
     });
     let mutatedWorkspace = false;
+    let mutatedOrganizer = false;
     for (const operation of queued.operations) {
       try {
         const result = await executeBrowserWorkspaceOperation(operation.operation, operation.args ?? {}, bridge);
         mutatedWorkspace = mutatedWorkspace || Boolean(result.mutatedWorkspace);
+        mutatedOrganizer = mutatedOrganizer || [
+          "create_work_scopes",
+          "replace_organizer_store",
+          "update_work_scope",
+          "archive_work_scope",
+          "create_organizer_items",
+          "update_organizer_item",
+          "delete_organizer_item",
+          "batch_update_organizer_items",
+          "mark_organizer_items_complete",
+          "upsert_sweep_review",
+        ].includes(operation.operation);
         await callBridge(bridge, "complete_appspace_operation", {
           sessionId: bridgeAppspaceSessionId,
           operationId: operation.id,
@@ -5081,6 +7463,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       await syncBridgeAppspaceContext(bridge);
       window.dispatchEvent(new Event("shell:navigate"));
     }
+    if (mutatedOrganizer) {
+      await refreshOrganizerStore();
+      await syncBridgeAppspaceContext(bridge);
+    }
   }
 
   useEffect(() => {
@@ -5094,6 +7480,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         await syncBridgeAppspaceContext(bridge);
         await processQueuedBridgeAppspaceOperations(bridge);
       } catch (error) {
+        setBridgeSyncError((error as Error).message);
         console.debug("[chat-codex] bridge appspace sync failed", {
           message: (error as Error).message,
         });
@@ -5141,13 +7528,13 @@ export default function ChatCodexModule({ config }: ModuleProps) {
 
   async function handleSaveBridge() {
     if (!localRuntimeEnabled) {
-      setConnectionError("Enable the local runtime before saving or checking a pairing token.");
+      setConnectionError("Enable the local runtime before connecting.");
       return;
     }
     const normalizedUrl = draftBridgeUrl.trim().replace(/\/$/, "");
-    const normalizedToken = draftBridgeToken.trim();
-    if (!normalizedUrl || !normalizedToken) {
-      setConnectionError("Bridge URL and bridge token are both required.");
+    const normalizedToken = draftBridgeToken.trim() || undefined;
+    if (!normalizedUrl) {
+      setConnectionError("Bridge URL is required.");
       return;
     }
 
@@ -5155,12 +7542,13 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       const bridge = { url: normalizedUrl, token: normalizedToken };
       const status = await getBridgeStatus(bridge);
       safeWriteLocalStorage(bridgeUrlKey, normalizedUrl);
-      safeWriteLocalStorage(bridgeTokenKey, normalizedToken);
+      safeWriteLocalStorage(bridgeTokenKey, normalizedToken ?? "");
       safeWriteLocalStorage(bridgeWorkspaceRootKey, status.workspaceRoot ?? "");
       setBridgeUrl(normalizedUrl);
-      setBridgeToken(normalizedToken);
+      setBridgeToken(normalizedToken ?? "");
       setBridgeWorkspaceRoot(status.workspaceRoot ?? "");
       setConnectionError(undefined);
+      await syncBridgeAppspaceContext(bridge);
     } catch (error) {
       setConnectionError((error as Error).message);
     }
@@ -5176,8 +7564,16 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     setLocalRuntimeEnabled(false);
     setBridgeHealth(null);
     setBridgeWorkspaceRoot("");
+    setBridgeLastSyncedAt("");
+    setBridgeSyncError(undefined);
     setDraftBridgeUrl("");
     setDraftBridgeToken("");
+  }
+
+  function resolveDraftOrSavedBridge(): BridgeConfig | null {
+    const resolvedUrl = (draftBridgeUrl.trim() || bridgeUrl.trim()).replace(/\/$/, "");
+    const resolvedToken = draftBridgeToken.trim() || bridgeToken.trim() || undefined;
+    return resolvedUrl ? { url: resolvedUrl, token: resolvedToken } : null;
   }
 
   async function checkLocalRuntime(urlOverride?: string) {
@@ -5217,14 +7613,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setBridgeBrowserError("Enable the local runtime before browsing local folders.");
       return;
     }
-    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
-      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
-      : bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+    const bridge = resolveDraftOrSavedBridge();
 
     if (!bridge) {
-      setBridgeBrowserError("Save the bridge URL and token before browsing.");
+      setBridgeBrowserError("Save the bridge URL before browsing.");
       return;
     }
 
@@ -5250,14 +7642,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setConnectionError("Check Enable local runtime before choosing a workspace root.");
       return;
     }
-    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
-      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
-      : bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+    const bridge = resolveDraftOrSavedBridge();
 
     if (!bridge) {
-      setConnectionError("Save the bridge URL and token before choosing a workspace root.");
+      setConnectionError("Save the bridge URL before choosing a workspace root.");
       return;
     }
 
@@ -5278,14 +7666,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setConnectionError("Enable the local runtime before changing the workspace root.");
       return;
     }
-    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
-      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
-      : bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+    const bridge = resolveDraftOrSavedBridge();
 
     if (!bridge) {
-      setConnectionError("Save the bridge URL and token before changing the workspace root.");
+      setConnectionError("Save the bridge URL before changing the workspace root.");
       return;
     }
 
@@ -5301,14 +7685,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setBridgeBrowserError("Enable the local runtime before creating local folders.");
       return;
     }
-    const bridge = draftBridgeUrl.trim() && draftBridgeToken.trim()
-      ? { url: draftBridgeUrl.trim().replace(/\/$/, ""), token: draftBridgeToken.trim() }
-      : bridgeUrl.trim() && bridgeToken.trim()
-        ? { url: bridgeUrl.trim(), token: bridgeToken.trim() }
-        : null;
+    const bridge = resolveDraftOrSavedBridge();
 
     if (!bridge) {
-      setBridgeBrowserError("Save the bridge URL and token before creating folders.");
+      setBridgeBrowserError("Save the bridge URL before creating folders.");
       return;
     }
 
@@ -5382,14 +7762,53 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         kind: "status",
         text: `Working step ${i + 1} of up to ${TOOL_ITERATION_LIMIT}...`,
       });
-      const response = await createOpenAiResponse({
-        apiKey: apiKey.trim(),
-        input: compacted.inputItems,
-        model,
-        instructions,
-        tools: TOOL_DEFINITIONS,
-        signal: args.signal,
-      });
+      let response: ResponsesApiResponse;
+      try {
+        response = await createOpenAiResponse({
+          apiKey: apiKey.trim(),
+          input: compacted.inputItems,
+          model,
+          instructions,
+          tools: TOOL_DEFINITIONS,
+          signal: args.signal,
+        });
+      } catch (error) {
+        if (isFunctionCallOutputMismatchError(error)) {
+          const message =
+            "The agent hit an OpenAI tool-history mismatch while continuing a multi-step run. " +
+            "A tool output no longer matched a preserved tool call in the browser context. " +
+            "I compacted context more safely for future steps, but this run stopped before the model could recover.";
+          args.onProgress({
+            kind: "tool_result",
+            name: "tool_loop",
+            text: message,
+          });
+          return {
+            assistantText: `${message} Original error: ${(error as Error).message}`,
+            lastToolMessages: [message],
+            pending: null,
+            shouldNavigate,
+          };
+        }
+        if (isReasoningItemMismatchError(error)) {
+          const message =
+            "The agent hit an OpenAI reasoning-history mismatch while continuing a multi-step run. " +
+            "A preserved function call no longer had its required reasoning item in browser context. " +
+            "I updated compaction to keep entire tool-response blocks together, but this run stopped before the model could recover.";
+          args.onProgress({
+            kind: "tool_result",
+            name: "tool_loop",
+            text: message,
+          });
+          return {
+            assistantText: `${message} Original error: ${(error as Error).message}`,
+            lastToolMessages: [message],
+            pending: null,
+            shouldNavigate,
+          };
+        }
+        throw error;
+      }
 
       const functionCalls = (response.output ?? []).filter(
         (item): item is ResponsesApiFunctionCall =>
@@ -5432,6 +7851,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             projectId,
             configBucket,
             configPath,
+            userEmail: user?.email?.toLowerCase(),
             getS3Client,
             getDdbClient,
             assetsTable,
@@ -5475,22 +7895,24 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       ];
     }
 
+    const pendingCompacted = compactInputItems(inputItems);
     return {
       assistantText:
         `I reached the current tool-work limit of ${TOOL_ITERATION_LIMIT} steps. ` +
         "I still have my current working context and can keep going from here if you want.",
       lastToolMessages,
       pending: {
-        inputItems,
-        contextBits: args.contextBits,
+        inputItems: pendingCompacted.inputItems,
+        contextBits: pendingCompacted.truncatedSummary
+          ? [...args.contextBits, pendingCompacted.truncatedSummary]
+          : args.contextBits,
         lastToolMessages,
       },
       shouldNavigate,
     };
   }
 
-  async function handleSend() {
-    const input = composer.trim();
+  async function submitUserPrompt(input: string) {
     if (!apiKey.trim() || !input) return;
 
     const userMessage = createMessage("user", input);
@@ -5515,6 +7937,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       await processQueuedBridgeAppspaceOperations(bridge);
       const contextBits: string[] = [
         systemPrompt,
+        `Current user request for this run: ${input}`,
         "You are running inside a browser-based project workspace shell.",
         "Prefer calling tools before making assumptions about project structure or available files/modules.",
         "The browser agent and local runtime share the same appspace operation names. When the local runtime is enabled, it can read the synced appspace context from the bridge and queue appspace operations for the browser to execute.",
@@ -5527,6 +7950,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         bridge
           ? `Local runtime is enabled with workspace root ${bridgeWorkspaceRoot || "unknown"}.`
           : "Local runtime is disabled for this project/module. Do not use local filesystem, shell, Python, or PDF bridge tools unless the user enables it in settings.",
+        organizerSummary,
+        "Work scopes are the durable graph layer for broad-to-narrow work context. Each scope can have an upstream parentScopeId and downstream child scopes. With little context, start with list_work_scope_index or search_work_scope_graph, then call get_work_scope_context on the best candidate.",
+        "Organizer memory is available through get_organizer_overview, list_work_scope_index, search_work_scope_graph, get_work_scope_context, list_work_scopes, create_work_scopes, update_work_scope, archive_work_scope, list_organizer_items, create_organizer_items, update_organizer_item, delete_organizer_item, batch_update_organizer_items, mark_organizer_items_complete, and upsert_sweep_review. Use scopes for work context and organizer items for small notes, todos, reminders, follow-ups, and waiting-on items.",
         user?.email ? `Signed-in user: ${user.email}.` : undefined,
       ].filter((value): value is string => Boolean(value));
 
@@ -5558,6 +7984,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       if (session.shouldNavigate) {
         window.dispatchEvent(new Event("shell:navigate"));
       }
+      await refreshOrganizerStore();
     } catch (error) {
       console.debug("[chat-codex] tool loop error", {
         message: (error as Error).message,
@@ -5579,6 +8006,32 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       setBusy(false);
       setStopRequested(false);
     }
+  }
+
+  async function handleSend() {
+    await submitUserPrompt(composer.trim());
+  }
+
+  async function handleOrganizerSweep() {
+    const today = new Date().toLocaleDateString(undefined, {
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+    });
+    await submitUserPrompt(
+      [
+        `Run an organizer sweep for ${today}.`,
+        "Do not just summarize counts or list everything visible in the organizer UI.",
+        "Call list_work_scope_index or get_organizer_overview first. For the most relevant active or blocked scopes, call get_work_scope_context with direction='both' and includeLinkedItems=true.",
+        "Use judgment to choose useful work areas and task granularity: focus on work item status, what can or should be done now, what is blocked, what is stale, and what risks falling through the cracks.",
+        "Write in simple work-status language. Do not talk about graph structure, nodes, chains, data shape, context expansion, or what you can see in the execution environment.",
+        "Break the work status into useful work-area updates. Each update should state what is happening, what is blocked or ready, and why it matters.",
+        "Call upsert_sweep_review before your final answer. Put short work-area status updates in statusUpdates. Put actionable one-line checklist entries in checklist with category do-now, blocked, or follow-up. Include organizerItemId when a real organizer item already exists; otherwise the sweep tool will create one and link it automatically. Include scopeId when known so the UI can show the work context.",
+        "Write the final answer with these sections: 1) Work status, 2) Do now, 3) Blocked or stale, 4) Quick follow-ups. Keep it concise and plain.",
+        "Ignore done or archived organizer items unless I explicitly ask for closed history.",
+        "Only update scopes or organizer items if it clearly improves continuity; otherwise propose the updates.",
+      ].join(" "),
+    );
   }
 
   async function handleContinueWorking() {
@@ -5624,6 +8077,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       if (session.shouldNavigate) {
         window.dispatchEvent(new Event("shell:navigate"));
       }
+      await refreshOrganizerStore();
     } catch (error) {
       console.debug("[chat-codex] continuation error", {
         message: (error as Error).message,
@@ -5671,6 +8125,45 @@ export default function ChatCodexModule({ config }: ModuleProps) {
     });
   }
 
+  function handleOrganizerDragStart(event: ReactMouseEvent<HTMLDivElement>) {
+    const target = event.target as HTMLElement;
+    if (target.closest("button")) return;
+    organizerDragRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      left: organizerWindow.left,
+      top: organizerWindow.top,
+    };
+    window.addEventListener("mousemove", handleOrganizerDragMove);
+    window.addEventListener("mouseup", handleOrganizerDragEnd, { once: true });
+  }
+
+  function handleOrganizerDragMove(event: globalThis.MouseEvent) {
+    const drag = organizerDragRef.current;
+    if (!drag) return;
+    const nextLeft = Math.max(8, Math.min(window.innerWidth - 220, drag.left + event.clientX - drag.startX));
+    const nextTop = Math.max(8, Math.min(window.innerHeight - 120, drag.top + event.clientY - drag.startY));
+    setOrganizerWindow((current) => ({ ...current, left: nextLeft, top: nextTop }));
+  }
+
+  function handleOrganizerDragEnd() {
+    organizerDragRef.current = null;
+    window.removeEventListener("mousemove", handleOrganizerDragMove);
+    syncOrganizerWindowBounds();
+  }
+
+  function syncOrganizerWindowBounds() {
+    const element = organizerWindowRef.current;
+    if (!element) return;
+    const rect = element.getBoundingClientRect();
+    setOrganizerWindow({
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+    });
+  }
+
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "auto 1fr auto", background: C.bg, color: C.text, fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
       <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", padding: "0.75rem 0.9rem", borderBottom: `1px solid ${C.border}`, background: C.panel }}>
@@ -5683,10 +8176,360 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         <button onClick={clearConversation} style={ghostButtonStyle}>
           Clear
         </button>
+        <button onClick={() => setOrganizerOpen((value) => !value)} style={ghostButtonStyle}>
+          {organizerOpen ? "Hide Organizer" : "Organizer"}
+        </button>
         <button onClick={() => setSettingsOpen((value) => !value)} style={ghostButtonStyle}>
           {settingsOpen ? "Close" : "Settings"}
         </button>
       </div>
+
+      {organizerOpen && (
+        <div
+          ref={organizerWindowRef}
+          onMouseUp={syncOrganizerWindowBounds}
+          style={{
+            position: "fixed",
+            left: organizerWindow.left,
+            top: organizerWindow.top,
+            width: organizerWindow.width,
+            height: organizerWindow.height,
+            minWidth: 560,
+            minHeight: 520,
+            maxWidth: "calc(100vw - 16px)",
+            maxHeight: "calc(100vh - 16px)",
+            zIndex: 35,
+            display: "grid",
+            gridTemplateRows: "auto auto auto 1fr",
+            border: `1px solid ${C.accent}`,
+            borderRadius: 12,
+            background: "linear-gradient(180deg, #102319 0%, #0b1a2d 100%)",
+            boxShadow: "0 24px 90px rgba(0,0,0,0.5)",
+            resize: "both",
+            overflow: "hidden",
+          }}
+        >
+          <div onMouseDown={handleOrganizerDragStart} style={{ padding: "0.75rem 0.85rem 0.6rem", borderBottom: `1px solid ${C.border}`, cursor: "move", userSelect: "none" }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: "0.78rem", textTransform: "uppercase", letterSpacing: "0.08em", color: C.accent, fontWeight: 800 }}>Organizer Graph</div>
+              <div style={{ marginTop: "0.2rem", fontSize: "0.76rem", color: C.muted, lineHeight: 1.35, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{organizerSummary}</div>
+            </div>
+          </div>
+
+          <div onMouseDown={(event) => event.stopPropagation()} style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", padding: "0.55rem 0.75rem", borderBottom: `1px solid ${C.border}`, background: "rgba(7,19,33,0.72)" }}>
+            <div style={{ minWidth: 0, fontSize: "0.74rem", color: C.muted }}>
+              Click a scope to inspect its linked items.
+            </div>
+            <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap", justifyContent: "flex-end" }}>
+              <button onClick={() => void refreshOrganizerStore()} style={ghostButtonStyle} disabled={organizerLoading || busy}>{organizerLoading ? "Refreshing..." : "Refresh"}</button>
+              <button onClick={() => void handleOrganizerSweep()} style={primaryButtonStyle} disabled={!apiKey.trim() || busy}>Sweep</button>
+              <button onClick={() => setOrganizerOpen(false)} style={ghostButtonStyle}>Close</button>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(88px, 1fr))", gap: "0.45rem", padding: "0.65rem 0.75rem", borderBottom: `1px solid ${C.border}` }}>
+            {[
+              ["Items", String(organizerOverview.counts.visibleBoardItems)],
+              ["Scopes", String(organizerOverview.counts.visibleScopes)],
+              ["Open", String(organizerOverview.counts.openBoardItems)],
+              ["Active", String(organizerOverview.counts.activeBoardItems)],
+              ["Waiting", String(organizerOverview.counts.waitingOnBoardItems)],
+            ].map(([label, value]) => (
+              <div key={label} style={{ padding: "0.55rem 0.65rem", border: `1px solid ${C.border}`, borderRadius: 8, background: "#071321" }}>
+                <div style={{ fontSize: "0.66rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</div>
+                <div style={{ marginTop: "0.2rem", fontSize: "0.98rem", fontWeight: 750 }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ minHeight: 0, display: "grid", gridTemplateRows: "auto minmax(220px, 1fr) minmax(220px, 0.8fr)", gap: "0.65rem", padding: "0.75rem", overflow: "hidden" }}>
+            {organizerStore.sweepReview ? (
+              <div style={{ display: "grid", gap: "0.65rem", padding: "0.75rem", border: `1px solid ${C.border}`, borderRadius: 10, background: "#071321", maxHeight: 260, overflow: "auto" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
+                  <div>
+                    <div style={{ fontSize: "0.76rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 800 }}>Sweep Review</div>
+                    <div style={{ marginTop: "0.18rem", fontSize: "0.72rem", color: C.muted }}>
+                      {pendingSweepItems.length} pending · updated {formatOrganizerDate(organizerStore.sweepReview.updatedAt)}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap" }}>
+                    <button
+                      onClick={() => void updateSweepChecklistStatus(selectedSweepItems.map((item) => item.id), "completed")}
+                      style={primaryButtonStyle}
+                      disabled={!selectedSweepItems.length || organizerLoading}
+                    >
+                      Complete Selected
+                    </button>
+                    <button
+                      onClick={() => void updateSweepChecklistStatus(selectedSweepItems.map((item) => item.id), "ignored")}
+                      style={ghostButtonStyle}
+                      disabled={!selectedSweepItems.length || organizerLoading}
+                    >
+                      Ignore Selected
+                    </button>
+                  </div>
+                </div>
+
+                {organizerStore.sweepReview.statusUpdates.length ? (
+                  <div style={{ display: "grid", gap: "0.45rem" }}>
+                    {organizerStore.sweepReview.statusUpdates.map((update) => (
+                      <div key={update.id} style={{ padding: "0.6rem 0.7rem", border: `1px solid ${C.border}`, borderRadius: 8, background: "#091522" }}>
+                        <div style={{ fontSize: "0.8rem", fontWeight: 760 }}>{update.title}</div>
+                        <div style={{ marginTop: "0.22rem", fontSize: "0.76rem", lineHeight: 1.45, color: C.muted }}>{update.summary}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {pendingSweepItems.length ? (
+                  <div style={{ display: "grid", gap: "0.42rem" }}>
+                    {pendingSweepItems.map((item) => {
+                      const selected = selectedSweepChecklistIds.includes(item.id);
+                      const linked = item.organizerItemId ? organizerStore.items.find((candidate) => candidate.id === item.organizerItemId) : undefined;
+                      return (
+                        <label key={item.id} style={{ display: "grid", gridTemplateColumns: "auto minmax(0, 1fr) auto", gap: "0.55rem", alignItems: "start", padding: "0.62rem 0.7rem", border: `1px solid ${selected ? C.accent : C.border}`, borderRadius: 8, background: selected ? "rgba(45,212,191,0.12)" : "#091522", cursor: "pointer" }}>
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={(event) => {
+                              const checked = event.currentTarget.checked;
+                              setSelectedSweepChecklistIds((current) => checked ? [...new Set([...current, item.id])] : current.filter((id) => id !== item.id));
+                            }}
+                            style={{ marginTop: "0.18rem" }}
+                          />
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ display: "flex", gap: "0.45rem", alignItems: "baseline", flexWrap: "wrap" }}>
+                              <span style={{ fontSize: "0.8rem", fontWeight: 760 }}>{item.title}</span>
+                              <span style={{ fontSize: "0.66rem", color: item.category === "blocked" ? C.warning : item.category === "follow-up" ? C.accent : C.accentStrong, textTransform: "uppercase", letterSpacing: "0.06em" }}>{item.category.replace("-", " ")}</span>
+                            </div>
+                            <div style={{ marginTop: "0.2rem", fontSize: "0.74rem", lineHeight: 1.4, color: C.muted }}>{item.reason}</div>
+                            {linked ? <div style={{ marginTop: "0.22rem", fontSize: "0.68rem", color: C.muted }}>Linked: {linked.kind} · {linked.status}</div> : null}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              void updateSweepChecklistStatus([item.id], "ignored");
+                            }}
+                            style={ghostButtonStyle}
+                            disabled={organizerLoading}
+                          >
+                            Ignore
+                          </button>
+                        </label>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div style={{ padding: "0.6rem 0.7rem", border: `1px solid ${C.border}`, borderRadius: 8, background: "#091522", fontSize: "0.78rem", color: C.muted }}>No pending sweep checklist items.</div>
+                )}
+              </div>
+            ) : null}
+
+            <div style={{ minHeight: 0, overflow: "auto", border: `1px solid ${C.border}`, borderRadius: 10, background: "#071321" }}>
+              {scopeColumns.length === 0 ? (
+                <div style={{ padding: "1rem", fontSize: "0.84rem", color: C.muted }}>No work scopes yet. Ask Codex to create scope nodes or queue organizer graph operations through the local bridge.</div>
+              ) : (
+                <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start", minWidth: Math.max(900, scopeColumns.length * 270), padding: "1rem" }}>
+                  {scopeColumns.map((column) => (
+                    <div key={column.depth} style={{ display: "grid", gap: "0.75rem", width: 250, flex: "0 0 250px" }}>
+                      <div style={{ fontSize: "0.68rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Level {column.depth + 1}</div>
+                      {column.scopes.map((scope) => {
+                        const selected = selectedScope?.id === scope.id;
+                        const upstream = selectedAncestorScopeIds.has(scope.id);
+                        const downstream = selectedDescendantScopeIds.has(scope.id);
+                        const related = selected || upstream || downstream;
+                        return (
+                          <button
+                            key={scope.id}
+                            onClick={() => setSelectedScopeId(scope.id)}
+                            style={{
+                              display: "grid",
+                              gap: "0.35rem",
+                              textAlign: "left",
+                              padding: related ? "0.85rem" : "0.72rem 0.78rem",
+                              border: `1px solid ${selected ? C.accent : upstream ? C.warning : downstream ? C.accentStrong : C.border}`,
+                              borderRadius: 8,
+                              background: selected
+                                ? "rgba(45,212,191,0.18)"
+                                : upstream
+                                  ? "rgba(251,191,36,0.12)"
+                                  : downstream
+                                    ? "rgba(52,211,153,0.11)"
+                                    : "#091522",
+                              color: C.text,
+                              cursor: "pointer",
+                              opacity: selectedScope && !related ? 0.52 : 1,
+                              boxShadow: related ? "0 8px 24px rgba(0,0,0,0.25)" : "none",
+                            }}
+                          >
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: "0.5rem" }}>
+                              <div style={{ minWidth: 0, fontSize: selected || downstream ? "0.88rem" : "0.82rem", fontWeight: 780, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{scope.title}</div>
+                              <div style={{ fontSize: "0.68rem", color: C.muted, whiteSpace: "nowrap" }}>{scope.status}</div>
+                            </div>
+                            <div style={{ fontSize: "0.74rem", lineHeight: 1.4, color: C.muted, display: "-webkit-box", WebkitLineClamp: related ? 3 : 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{scope.scope || scope.notes || "No scope recorded."}</div>
+                            <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap", fontSize: "0.68rem", color: C.muted }}>
+                              {upstream ? <span>Upstream</span> : null}
+                              {downstream ? <span>Downstream</span> : null}
+                              {scope.parentScopeId ? <span>Parent set</span> : <span>Top</span>}
+                              {scope.subjects.length ? <span>{scope.subjects.length} subjects</span> : null}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div style={{ minHeight: 0, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "0.65rem", overflow: "hidden" }}>
+              <div style={{ overflow: "auto", padding: "0.8rem 0.85rem", border: `1px solid ${C.border}`, borderRadius: 10, background: "#091522" }}>
+                {selectedScope ? (
+                  <div style={{ display: "grid", gap: "0.55rem" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: "0.7rem", flexWrap: "wrap" }}>
+                      <div style={{ fontSize: "0.92rem", fontWeight: 800 }}>{selectedScope.title}</div>
+                      <div style={{ fontSize: "0.72rem", color: C.muted }}>{selectedScope.status}</div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "0.45rem" }}>
+                      {[["Parent", selectedScope.parentScopeId || "Top-level"], ["Updated", formatOrganizerDate(selectedScope.updatedAt)], ["Target", selectedScope.targetAt ? formatOrganizerDate(selectedScope.targetAt) : "None"]].map(([label, value]) => (
+                        <div key={label} style={{ padding: "0.5rem 0.55rem", border: `1px solid ${C.border}`, borderRadius: 8, background: "#071321" }}>
+                          <div style={{ fontSize: "0.64rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</div>
+                          <div style={{ marginTop: "0.18rem", fontSize: "0.76rem", color: C.text, overflowWrap: "anywhere" }}>{value}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.45, fontSize: "0.78rem", color: C.text }}>{selectedScope.scope || "No scope recorded."}</div>
+                    {selectedScope.notes ? <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.45, fontSize: "0.76rem", color: C.muted }}>{selectedScope.notes}</div> : null}
+                    <div style={{ display: "grid", gap: "0.45rem", paddingTop: "0.2rem", borderTop: `1px solid ${C.border}` }}>
+                      <label style={labelStyle}>Manual status</label>
+                      <select
+                        value={selectedScope.status}
+                        onChange={(event) => void updateSelectedScopeStatus(event.currentTarget.value as WorkScopeStatus)}
+                        disabled={organizerLoading}
+                        style={inputStyle}
+                      >
+                        {["open", "active", "blocked", "done", "archived"].map((status) => (
+                          <option key={status} value={status}>{status}</option>
+                        ))}
+                      </select>
+                      <label style={labelStyle}>Add scope note</label>
+                      <textarea
+                        value={scopeNoteDraft}
+                        onChange={(event) => setScopeNoteDraft(event.currentTarget.value)}
+                        placeholder="Add a note for the agent to consider..."
+                        rows={3}
+                        style={{ ...inputStyle, resize: "vertical", minHeight: 76 }}
+                      />
+                      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                        <button onClick={() => void addSelectedScopeNote()} style={primaryButtonStyle} disabled={!scopeNoteDraft.trim() || organizerLoading}>Add Note</button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ fontSize: "0.82rem", color: C.muted, lineHeight: 1.55 }}>Click a scope node to highlight its upstream chain and downstream subtree. The graph scrolls horizontally and vertically.</div>
+                )}
+              </div>
+
+              <div style={{ overflow: "auto", paddingRight: "0.25rem" }}>
+                <div style={{ marginBottom: "0.45rem", fontSize: "0.7rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>{selectedScope ? "Linked Items" : "Unassigned Items"}</div>
+                {organizerDisplayedItems.length === 0 ? (
+                  <div style={{ padding: "0.8rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 8, background: "#091522", fontSize: "0.8rem", color: C.muted }}>{selectedScope ? "No organizer items are linked to this scope yet." : "No unassigned organizer items."}</div>
+                ) : (
+                  <div style={{ display: "grid", gap: "0.45rem" }}>
+                    {organizerDisplayedItems.map((item) => (
+                      <button key={item.id} onClick={() => setSelectedOrganizerItemId(item.id)} style={{ display: "grid", gap: "0.25rem", width: "100%", textAlign: "left", padding: "0.65rem 0.75rem", border: `1px solid ${C.border}`, borderRadius: 8, background: "#091522", color: C.text, cursor: "pointer" }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: "0.65rem" }}>
+                          <div style={{ minWidth: 0, fontSize: "0.82rem", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.title}</div>
+                          <div style={{ fontSize: "0.7rem", color: C.muted }}>{item.kind} · {item.status}</div>
+                        </div>
+                        <div style={{ fontSize: "0.74rem", lineHeight: 1.4, color: C.muted, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{item.details || "No details recorded."}</div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedOrganizerItem && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 40, display: "grid", placeItems: "center", padding: "1rem", background: "rgba(0,0,0,0.55)" }}>
+          <div style={{ width: "min(720px, 100%)", maxHeight: "82vh", overflow: "auto", border: `1px solid ${C.border}`, borderRadius: 16, background: C.panel, boxShadow: "0 24px 80px rgba(0,0,0,0.45)" }}>
+            <div style={{ position: "sticky", top: 0, zIndex: 1, display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "start", padding: "1rem 1.05rem", borderBottom: `1px solid ${C.border}`, background: C.panel }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: "0.74rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                  Organizer Item
+                </div>
+                <div style={{ marginTop: "0.3rem", fontSize: "1rem", fontWeight: 750, overflowWrap: "anywhere" }}>
+                  {selectedOrganizerItem.title}
+                </div>
+              </div>
+              <button onClick={() => setSelectedOrganizerItemId(null)} style={ghostButtonStyle}>
+                Close
+              </button>
+            </div>
+            <div style={{ display: "grid", gap: "0.9rem", padding: "1rem 1.05rem" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.6rem" }}>
+                {[
+                  ["Kind", selectedOrganizerItem.kind],
+                  ["Status", selectedOrganizerItem.status],
+                  ["Updated", formatOrganizerDate(selectedOrganizerItem.updatedAt)],
+                  ["Created", formatOrganizerDate(selectedOrganizerItem.createdAt)],
+                ].map(([label, value]) => (
+                  <div key={label} style={{ padding: "0.7rem 0.75rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                    <div style={{ fontSize: "0.68rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</div>
+                    <div style={{ marginTop: "0.25rem", fontSize: "0.84rem", color: C.text }}>{value || "None"}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ display: "grid", gap: "0.35rem" }}>
+                <div style={{ fontSize: "0.72rem", color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>Details</div>
+                <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", lineHeight: 1.55, fontSize: "0.86rem", color: C.text, padding: "0.85rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                  {selectedOrganizerItem.details || "No details recorded."}
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gap: "0.55rem", padding: "0.85rem 0.9rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#071321" }}>
+                <label style={labelStyle}>Manual status</label>
+                <select
+                  value={selectedOrganizerItem.status}
+                  onChange={(event) => void updateSelectedOrganizerItemStatus(event.currentTarget.value as OrganizerItemStatus)}
+                  disabled={organizerLoading}
+                  style={inputStyle}
+                >
+                  {["open", "active", "done", "archived"].map((status) => (
+                    <option key={status} value={status}>{status}</option>
+                  ))}
+                </select>
+                <label style={labelStyle}>Add item note</label>
+                <textarea
+                  value={itemNoteDraft}
+                  onChange={(event) => setItemNoteDraft(event.currentTarget.value)}
+                  placeholder="Add a note or completion detail..."
+                  rows={4}
+                  style={{ ...inputStyle, resize: "vertical", minHeight: 92 }}
+                />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <button onClick={() => void addSelectedOrganizerItemNote()} style={primaryButtonStyle} disabled={!itemNoteDraft.trim() || organizerLoading}>Add Note</button>
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0.6rem", fontSize: "0.8rem", color: C.muted }}>
+                <div>Due: {selectedOrganizerItem.dueAt ? formatOrganizerDate(selectedOrganizerItem.dueAt) : "None"}</div>
+                <div>Follow up: {selectedOrganizerItem.followUpAt ? formatOrganizerDate(selectedOrganizerItem.followUpAt) : "None"}</div>
+                <div>Tags: {selectedOrganizerItem.tags.length ? selectedOrganizerItem.tags.join(", ") : "None"}</div>
+                <div>Scopes: {selectedOrganizerItem.scopeIds.length ? selectedOrganizerItem.scopeIds.join(", ") : "None"}</div>
+                {selectedOrganizerItem.objectiveIds.length ? <div>Legacy objective IDs: {selectedOrganizerItem.objectiveIds.join(", ")}</div> : null}
+                <div>Linked work items: {selectedOrganizerItem.linkedWorkItemIds.length ? selectedOrganizerItem.linkedWorkItemIds.join(", ") : "None"}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {settingsOpen && (
         <div style={{ padding: "0.9rem", borderBottom: `1px solid ${C.border}`, background: C.panelAlt, display: "grid", gap: "0.7rem" }}>
@@ -5725,7 +8568,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                 style={{ marginTop: 3 }}
               />
               <span>
-                Enable local runtime for this project. This allows the agent to use local files, commands, Python tools, and future native Codex runtime features after pairing.
+                Enable local runtime for this project. This allows the agent to use local files, commands, Python tools, and native runtime features when the local service is running.
               </span>
             </label>
             <input
@@ -5737,7 +8580,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             <input
               value={draftBridgeToken}
               onChange={(event) => setDraftBridgeToken(event.currentTarget.value)}
-              placeholder="Bridge token"
+              placeholder="Optional bridge token"
               type="password"
               style={inputStyle}
             />
@@ -5750,7 +8593,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                 {bridgeCheckLoading ? "Checking..." : "Check Runtime"}
               </button>
               <button onClick={handleSaveBridge} style={primaryButtonStyle}>
-                Save Pairing Token
+                Save Runtime
               </button>
               {(bridgeUrl || bridgeToken) && (
                 <button onClick={handleForgetBridge} style={dangerButtonStyle}>
@@ -5759,7 +8602,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
               )}
             </div>
             <div style={{ fontSize: "0.72rem", color: C.muted }}>
-              Disabled means no local runtime calls are made, even if the service is installed or a token is saved.
+              Disabled means no local runtime calls are made, even if the service is installed.
             </div>
             {bridgeHealth ? (
               <div style={{ fontSize: "0.72rem", color: C.muted }}>
@@ -5777,6 +8620,9 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                 </div>
               </div>
             )}
+            <div style={{ fontSize: "0.72rem", color: bridgeSyncError ? C.danger : C.muted }}>
+              Appspace sync: {bridgeSyncError ? `failed - ${bridgeSyncError}` : bridgeLastSyncedAt ? `last synced ${bridgeLastSyncedAt}` : "not synced yet"}
+            </div>
             <div style={{ display: "flex", gap: "0.55rem", flexWrap: "wrap", alignItems: "center" }}>
               <button onClick={() => void openBridgeBrowser()} style={primaryButtonStyle} disabled={!localRuntimeEnabled}>
                 Set Workspace Root
@@ -5787,21 +8633,56 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             </div>
           </div>
 
+          <div style={{ display: "grid", gap: "0.35rem" }}>
+            <label style={labelStyle}>Model</label>
+            <select
+              value={metaDraft.model}
+              onChange={(event) => {
+                const nextModel = event.currentTarget.value;
+                setMetaDraft((current) => ({ ...current, model: nextModel }));
+              }}
+              style={inputStyle}
+            >
+              {!MODEL_OPTIONS.some((group) => group.options.some((option) => option.id === metaDraft.model)) && metaDraft.model.trim() ? (
+                <option value={metaDraft.model}>{metaDraft.model} - custom current value</option>
+              ) : null}
+              {MODEL_OPTIONS.map((group) => (
+                <optgroup key={group.group} label={group.group}>
+                  {group.options.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label} - {option.price}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+            <div style={{ fontSize: "0.72rem", color: C.muted, lineHeight: 1.45 }}>
+              {selectedModelOption ? (
+                <>
+                  {selectedModelOption.id}: {selectedModelOption.price}. Standard token pricing; tool calls may add separate costs.
+                </>
+              ) : (
+                <>Custom model. Check OpenAI pricing before using it.</>
+              )}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.55rem", flexWrap: "wrap" }}>
+              <button disabled={!canSaveSettings} onClick={handleSaveSettings} style={primaryButtonStyle}>
+                Save Model
+              </button>
+              {saveError && !editMode && <span style={{ fontSize: "0.74rem", color: C.danger }}>{saveError}</span>}
+            </div>
+          </div>
+
           {editMode && (
             <>
               <div style={{ display: "grid", gap: "0.35rem" }}>
                 <label style={labelStyle}>Module title</label>
                 <input
                   value={metaDraft.title}
-                  onChange={(event) => setMetaDraft((current) => ({ ...current, title: event.currentTarget.value }))}
-                  style={inputStyle}
-                />
-              </div>
-              <div style={{ display: "grid", gap: "0.35rem" }}>
-                <label style={labelStyle}>Model</label>
-                <input
-                  value={metaDraft.model}
-                  onChange={(event) => setMetaDraft((current) => ({ ...current, model: event.currentTarget.value }))}
+                  onChange={(event) => {
+                    const nextTitle = event.currentTarget.value;
+                    setMetaDraft((current) => ({ ...current, title: nextTitle }));
+                  }}
                   style={inputStyle}
                 />
               </div>
@@ -5809,7 +8690,10 @@ export default function ChatCodexModule({ config }: ModuleProps) {
                 <label style={labelStyle}>System prompt</label>
                 <textarea
                   value={metaDraft.systemPrompt}
-                  onChange={(event) => setMetaDraft((current) => ({ ...current, systemPrompt: event.currentTarget.value }))}
+                  onChange={(event) => {
+                    const nextSystemPrompt = event.currentTarget.value;
+                    setMetaDraft((current) => ({ ...current, systemPrompt: nextSystemPrompt }));
+                  }}
                   rows={4}
                   style={{ ...inputStyle, resize: "vertical", minHeight: 92 }}
                 />
@@ -5830,7 +8714,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
           <div style={{ maxWidth: 720, margin: "0 auto", padding: "1.2rem 1.25rem", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 16 }}>
             <div style={{ fontSize: "0.95rem", fontWeight: 700, marginBottom: "0.45rem" }}>Workspace-side Codex test module</div>
             <div style={{ fontSize: "0.82rem", lineHeight: 1.6, color: C.muted }}>
-              This version can inspect the workspace, browse assets and resources, list published modules, add, update, or remove top-level slots, and use a local bridge for files, commands, and PDF analysis.
+              This version can inspect the workspace, browse assets and resources, manage organizer memory, list published modules, add or update slots, and use a local bridge for files, commands, and PDF analysis.
             </div>
           </div>
         ) : (
@@ -5878,7 +8762,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
             value={composer}
             onChange={(event) => setComposer(event.currentTarget.value)}
             onKeyDown={handleComposerKeyDown}
-            placeholder="Ask Codex to inspect the workspace or make a concrete module/config change..."
+            placeholder="Ask Codex to inspect the workspace, remember a follow-up, sweep your open items, or make a concrete module/config change..."
             rows={3}
             style={{ ...inputStyle, resize: "none", minHeight: 84 }}
           />

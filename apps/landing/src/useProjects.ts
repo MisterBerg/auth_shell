@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { QueryCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { QueryCommand, PutCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 import { useAwsDdbClient, useTableNames } from "module-core";
 import type { ProjectRecord } from "./types.ts";
 
@@ -156,6 +156,28 @@ export function useCreateProject() {
       await ddb.send(new PutCommand({ TableName: projectsTable, Item: record }));
     } catch (err: unknown) {
       throw new Error(`Failed to create project: ${(err as Error).message}`);
+    }
+  }, [projectsTable]);
+}
+
+export function useDeleteProject() {
+  const getDdbClient = useAwsDdbClient();
+  const getDdbClientRef = useRef(getDdbClient);
+  useEffect(() => { getDdbClientRef.current = getDdbClient; });
+  const { projects: projectsTable } = useTableNames();
+
+  return useCallback(async (project: Pick<ProjectRecord, "userId" | "projectId">): Promise<void> => {
+    const ddb = await getDdbClientRef.current();
+    try {
+      await ddb.send(new DeleteCommand({
+        TableName: projectsTable,
+        Key: {
+          userId: project.userId.toLowerCase(),
+          projectId: project.projectId,
+        },
+      }));
+    } catch (err: unknown) {
+      throw new Error(`Failed to delete project: ${(err as Error).message}`);
     }
   }, [projectsTable]);
 }

@@ -1,13 +1,19 @@
 
+import { useState } from "react";
 import type { ProjectRecord } from "./types.ts";
 
 type ProjectDetailsProps = {
   project: ProjectRecord;
   onOpen: (project: ProjectRecord) => void;
   onClose: () => void;
+  onDelete?: (project: ProjectRecord) => Promise<void>;
 };
 
-export function ProjectDetails({ project, onOpen, onClose }: ProjectDetailsProps) {
+export function ProjectDetails({ project, onOpen, onClose, onDelete }: ProjectDetailsProps) {
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | undefined>();
   const createdDate = new Date(project.createdAt).toLocaleDateString(undefined, {
     year: "numeric",
     month: "long",
@@ -18,6 +24,19 @@ export function ProjectDetails({ project, onOpen, onClose }: ProjectDetailsProps
     month: "long",
     day: "numeric",
   });
+  const canDelete = project.role === "owner" && Boolean(onDelete);
+
+  async function handleDelete() {
+    if (!onDelete || confirmText !== project.projectId) return;
+    setDeleteBusy(true);
+    setDeleteError(undefined);
+    try {
+      await onDelete(project);
+    } catch (error) {
+      setDeleteError((error as Error).message);
+      setDeleteBusy(false);
+    }
+  }
 
   return (
     <div
@@ -128,6 +147,98 @@ export function ProjectDetails({ project, onOpen, onClose }: ProjectDetailsProps
         >
           Open Project
         </button>
+
+        {canDelete && (
+          <div style={{ marginTop: "0.75rem", padding: "0.85rem", border: "1px solid #7f1d1d", borderRadius: 8, background: "#130b12" }}>
+            <div style={{ fontSize: "0.82rem", fontWeight: 650, color: "#fca5a5" }}>Delete project</div>
+            <p style={{ margin: "0.45rem 0 0", fontSize: "0.78rem", lineHeight: 1.45, color: "#9ca3af" }}>
+              Removes this project from your Jeffspace project list. The project's S3 files remain in storage.
+            </p>
+            {!confirmingDelete ? (
+              <button
+                onClick={() => {
+                  setConfirmingDelete(true);
+                  setConfirmText("");
+                  setDeleteError(undefined);
+                }}
+                style={{
+                  marginTop: "0.65rem",
+                  padding: "0.45rem 0.75rem",
+                  borderRadius: 6,
+                  border: "1px solid #ef4444",
+                  background: "transparent",
+                  color: "#fca5a5",
+                  cursor: "pointer",
+                  fontSize: "0.8rem",
+                  fontWeight: 500,
+                }}
+              >
+                Delete project...
+              </button>
+            ) : (
+              <div style={{ display: "grid", gap: "0.5rem", marginTop: "0.65rem" }}>
+                <label style={{ display: "grid", gap: "0.35rem", fontSize: "0.76rem", color: "#9ca3af" }}>
+                  Type {project.projectId} to confirm
+                  <input
+                    value={confirmText}
+                    onChange={(event) => setConfirmText(event.currentTarget.value)}
+                    disabled={deleteBusy}
+                    placeholder={project.projectId}
+                    style={{
+                      width: "100%",
+                      boxSizing: "border-box",
+                      padding: "0.45rem 0.55rem",
+                      borderRadius: 6,
+                      border: "1px solid #7f1d1d",
+                      background: "#0a1525",
+                      color: "#e5e7eb",
+                      fontSize: "0.8rem",
+                      fontFamily: "monospace",
+                    }}
+                  />
+                </label>
+                {deleteError && <div style={{ fontSize: "0.76rem", color: "#fca5a5" }}>{deleteError}</div>}
+                <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                  <button
+                    onClick={() => void handleDelete()}
+                    disabled={deleteBusy || confirmText !== project.projectId}
+                    style={{
+                      padding: "0.45rem 0.75rem",
+                      borderRadius: 6,
+                      border: "none",
+                      background: confirmText === project.projectId && !deleteBusy ? "#ef4444" : "#7f1d1d",
+                      color: confirmText === project.projectId && !deleteBusy ? "#fff" : "#6b7280",
+                      cursor: confirmText === project.projectId && !deleteBusy ? "pointer" : "default",
+                      fontSize: "0.8rem",
+                      fontWeight: 500,
+                    }}
+                  >
+                    {deleteBusy ? "Deleting..." : "Confirm delete"}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setConfirmingDelete(false);
+                      setConfirmText("");
+                      setDeleteError(undefined);
+                    }}
+                    disabled={deleteBusy}
+                    style={{
+                      padding: "0.45rem 0.75rem",
+                      borderRadius: 6,
+                      border: "1px solid #1e2d40",
+                      background: "transparent",
+                      color: "#9ca3af",
+                      cursor: deleteBusy ? "default" : "pointer",
+                      fontSize: "0.8rem",
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

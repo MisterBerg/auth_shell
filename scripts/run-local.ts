@@ -13,6 +13,7 @@
  */
 
 import { execFileSync, execSync, spawn } from "child_process";
+import type { ChildProcess } from "child_process";
 import { createRequire } from "module";
 import { join, resolve } from "path";
 import { randomBytes } from "crypto";
@@ -32,7 +33,8 @@ function main() {
   killPort(BRIDGE_PORT);
 
   runTsx("scripts/compose-up.ts");
-  run(NPM_COMMAND, ["install"]);
+  run(NPM_COMMAND, ["install", "--include=optional"]);
+  ensureNativeBuildDependencies();
   runTsx("scripts/seed-local.ts", [`--developer=${developer}`]);
   runTsx("scripts/update-locals.ts");
 
@@ -51,10 +53,8 @@ function main() {
   console.log(`Project URL: http://localhost:${SHELL_PORT}/?bucket=hep-dev-modules&config=projects/${developer}-dev/config.json\n`);
   console.log(`Agent bridge: http://127.0.0.1:${BRIDGE_PORT}\n`);
 
-  const child = spawn(NPM_COMMAND, ["run", "dev", "--", "--host", "0.0.0.0", "--port", String(SHELL_PORT)], {
+  const child = spawnCommand(NPM_COMMAND, ["run", "dev", "--", "--host", "0.0.0.0", "--port", String(SHELL_PORT)], {
     cwd: SHELL_DIR,
-    stdio: "inherit",
-    shell: process.platform === "win32",
     env: {
       ...process.env,
       VITE_AGENT_BRIDGE_URL: `http://127.0.0.1:${BRIDGE_PORT}`,
@@ -66,6 +66,24 @@ function main() {
     bridgeChild.kill();
     if (signal) process.kill(process.pid, signal);
     process.exit(code ?? 0);
+  });
+}
+
+function spawnCommand(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }): ChildProcess {
+  if (process.platform === "win32" && /\.cmd$/i.test(command)) {
+    const shell = process.env["ComSpec"] || "cmd.exe";
+    const commandLine = [command, ...args.map(quoteWindowsArg)].join(" ");
+    return spawn(shell, ["/d", "/s", "/c", commandLine], {
+      cwd: options.cwd,
+      stdio: "inherit",
+      env: options.env,
+    });
+  }
+
+  return spawn(command, args, {
+    cwd: options.cwd,
+    stdio: "inherit",
+    env: options.env,
   });
 }
 
@@ -82,6 +100,16 @@ function parseDeveloper(): string {
 }
 
 function run(command: string, args: string[]): void {
+  if (process.platform === "win32" && /\.cmd$/i.test(command)) {
+    const shell = process.env["ComSpec"] || "cmd.exe";
+    const commandLine = [command, ...args.map(quoteWindowsArg)].join(" ");
+    execFileSync(shell, ["/d", "/s", "/c", commandLine], {
+      cwd: ROOT,
+      stdio: "inherit",
+    });
+    return;
+  }
+
   execFileSync(command, args, {
     cwd: ROOT,
     stdio: "inherit",
@@ -89,8 +117,47 @@ function run(command: string, args: string[]): void {
   });
 }
 
+function quoteWindowsArg(value: string): string {
+  if (!/[\s"]/u.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/"/g, '\\"')}"`;
+}
+
 function runTsx(scriptPath: string, scriptArgs: string[] = []): void {
   run(process.execPath, [TSX_CLI, scriptPath, ...scriptArgs]);
+}
+
+function ensureNativeBuildDependencies(): void {
+  ensureRollupNativePackage();
+  run(NPM_COMMAND, ["rebuild", "esbuild"]);
+}
+
+function ensureRollupNativePackage(): void {
+  const packageName = rollupNativePackageName();
+  if (!packageName) return;
+
+  try {
+    require.resolve(packageName, { paths: [ROOT] });
+    return;
+  } catch {
+    const rollupPkg = require("rollup/package.json") as { version?: string };
+    if (!rollupPkg.version) return;
+    console.log(`Installing missing Rollup native package for this host: ${packageName}@${rollupPkg.version}`);
+    run(NPM_COMMAND, ["install", "--no-save", `${packageName}@${rollupPkg.version}`]);
+  }
+}
+
+function rollupNativePackageName(): string | null {
+  if (process.platform === "darwin") {
+    return process.arch === "arm64" ? "@rollup/rollup-darwin-arm64" : "@rollup/rollup-darwin-x64";
+  }
+  if (process.platform === "win32") {
+    if (process.arch === "arm64") return "@rollup/rollup-win32-arm64-msvc";
+    if (process.arch === "ia32") return "@rollup/rollup-win32-ia32-msvc";
+    return "@rollup/rollup-win32-x64-msvc";
+  }
+  return null;
 }
 
 function killPort(port: number) {
