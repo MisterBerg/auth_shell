@@ -8,7 +8,7 @@ import { useAwsS3Client, useUserProfile } from "module-core";
 
 type Scalar = string | number | boolean | null;
 type ValueMap = Record<string, unknown>;
-type AppSection = "run" | "report";
+type AppSection = "overview" | "run" | "report";
 
 type FieldDefinition = {
   id: string;
@@ -44,6 +44,7 @@ type TestGroup = {
 
 type TestDefinition = {
   program: ValueMap;
+  programAssets: PreTestAsset[];
   diagrams: Record<string, DiagramDefinition>;
   steps: Record<string, ProcedureStep>;
   procedures: Record<string, ProcedureDefinition>;
@@ -258,7 +259,7 @@ const C = {
 
 const STRUCTURAL_REQUIRED_FIELDS = ["test_group_id", "test_id", "title", "failure_mode", "target_module"];
 const STATUS_OPTIONS = ["not-run", "in-progress", "pass", "fail", "blocked"];
-const SECTION_LABELS: Record<AppSection, string> = { run: "Run", report: "Report" };
+const SECTION_LABELS: Record<AppSection, string> = { overview: "Overview", run: "Run", report: "Report" };
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -844,9 +845,12 @@ function normalizePreTestAssets(value: unknown, diagrams: Record<string, Diagram
 
 function parseDefinition(text: string): TestDefinition {
   const parsed = toRecord(parseYaml(text));
+  const diagrams = normalizeDiagramDefinitions(parsed.diagrams);
+  const program = toRecord(parsed.program);
   return {
-    program: toRecord(parsed.program),
-    diagrams: normalizeDiagramDefinitions(parsed.diagrams),
+    program,
+    programAssets: normalizePreTestAssets(program.pre_test_assets, diagrams),
+    diagrams,
     steps: normalizeProcedureStepDefinitions(parsed.steps),
     procedures: normalizeProcedureDefinitions(parsed.procedures),
     linkedValues: normalizeLinkedValues(parsed.linked_values),
@@ -1263,6 +1267,20 @@ function generateReportPages(definition: TestDefinition, run: TestRun, tests: Re
   summary.push(`- Generated On: ${escapeMarkdownCell(formatDate(nowIso()))}`);
   summary.push(`- Tests in Scope: ${tests.length}`);
   summary.push("");
+  if (definition.programAssets.length > 0) {
+    summary.push("## Program Overview");
+    summary.push("");
+    for (const [index, asset] of definition.programAssets.entries()) {
+      if (asset.type === "image_url") {
+        summary.push(`![${escapeMarkdownCell(asset.label)}](${asset.content})`);
+      } else {
+        const assetPath = `assets/program-${String(index + 1)}-${safeFileSegment(asset.id)}.svg`;
+        assets[assetPath] = { content: asset.content, contentType: "image/svg+xml" };
+        summary.push(`![${escapeMarkdownCell(asset.label)}](${assetPath})`);
+      }
+      summary.push("");
+    }
+  }
   summary.push("## Results Summary");
   summary.push("");
   summary.push("| Test ID | Test Group | Status | Failure Mode | Target Module | Detail |");
@@ -1942,7 +1960,7 @@ function TestManagerInner({ config }: ModuleProps) {
       </header>
 
       <section style={{ padding: "0.8rem 1rem", display: "flex", gap: "0.55rem", borderBottom: `1px solid ${C.border}`, background: C.panel, flexWrap: "wrap" }}>
-        {(["run", "report"] as AppSection[]).map((candidate) => (
+        {(["overview", "run", "report"] as AppSection[]).map((candidate) => (
           <button key={candidate} onClick={() => setSection(candidate)} style={{ ...buttonStyle(section === candidate ? "primary" : "ghost"), minWidth: 110 }}>
             {SECTION_LABELS[candidate]}
           </button>
@@ -1973,7 +1991,7 @@ function TestManagerInner({ config }: ModuleProps) {
         </div>
       )}
 
-      <main style={{ minHeight: 0, display: "grid", gridTemplateColumns: section === "run" ? "330px 1fr" : "1fr", gap: "1px", background: C.border }}>
+      <main style={{ minHeight: 0, display: "grid", gridTemplateColumns: section === "run" ? "330px 1fr" : "1fr", gap: "1px", background: C.border, overflow: "hidden" }}>
         {section === "run" ? (
           <>
             <aside style={{ minHeight: 0, overflowY: "auto", background: C.panel }}>
@@ -2242,6 +2260,35 @@ function TestManagerInner({ config }: ModuleProps) {
               )}
             </section>
           </>
+        ) : section === "overview" ? (
+          <section style={{ minHeight: 0, overflowY: "auto", background: C.panel2, padding: "1rem 1.1rem 1.2rem" }}>
+            <div style={{ display: "grid", gap: "1rem" }}>
+              {!definition ? (
+                <div style={{ color: C.muted, lineHeight: 1.7 }}>Upload a YAML definition to see the program overview.</div>
+              ) : (
+                <>
+                  {getProgramDescription(definition) ? (
+                    <section style={cardStyle()}>
+                      <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Program Description</div>
+                      <p style={{ margin: "0.85rem 0 0", color: C.text, lineHeight: 1.65 }}>{getProgramDescription(definition)}</p>
+                    </section>
+                  ) : null}
+                  <section style={cardStyle()}>
+                    <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>System Diagrams</div>
+                    <div style={{ marginTop: "0.85rem" }}>
+                      {definition.programAssets.length > 0 ? (
+                        <PreTestAssetGallery assets={definition.programAssets} />
+                      ) : (
+                        <div style={{ color: C.muted, fontSize: "0.84rem" }}>
+                          No program diagrams defined. Add <code style={{ background: C.panel, padding: "0.1rem 0.3rem", borderRadius: 4 }}>pre_test_assets:</code> under <code style={{ background: C.panel, padding: "0.1rem 0.3rem", borderRadius: 4 }}>program:</code> in your YAML to display system diagrams here.
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                </>
+              )}
+            </div>
+          </section>
         ) : (
           <section style={{ minHeight: 0, overflowY: "auto", background: C.panel2, padding: "1rem 1.1rem 1.2rem" }}>
             <div style={{ display: "grid", gap: "1rem" }}>
@@ -2305,7 +2352,25 @@ function TestManagerInner({ config }: ModuleProps) {
           </div>
           <article style={{ maxWidth: 980, margin: "0 auto", background: "white", border: "1px solid #e5e7eb", borderRadius: 12, padding: "1.2rem 1.4rem", boxShadow: "0 16px 50px rgba(15,23,42,0.12)" }}>
             <h1 style={{ marginTop: 0 }}>{getProgramTitle(definition, config)} Report</h1>
-            <p><strong>Run:</strong> {activeRun.label}<br /><strong>Generated:</strong> {formatDate(nowIso())}</p>
+            <p style={{ color: "#374151" }}><strong>Run:</strong> {activeRun.label}<br /><strong>Generated:</strong> {formatDate(nowIso())}</p>
+            {definition.programAssets.length > 0 ? (
+              <section style={{ marginBottom: "1.5rem", paddingBottom: "1.5rem", borderBottom: "1px solid #e5e7eb" }}>
+                <h2 style={{ color: "#0f172a", fontSize: "1.2rem" }}>Program Overview</h2>
+                {getProgramDescription(definition) ? <p style={{ color: "#374151", lineHeight: 1.65 }}>{getProgramDescription(definition)}</p> : null}
+                <div style={{ display: "grid", gap: "1rem", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", marginTop: "1rem" }}>
+                  {definition.programAssets.map((asset) => (
+                    <div key={asset.id} style={{ borderRadius: 8, overflow: "hidden", border: "1px solid #e5e7eb" }}>
+                      {asset.type === "svg_inline" || asset.type === "diagram_svg" ? (
+                        <div dangerouslySetInnerHTML={{ __html: asset.content }} />
+                      ) : (
+                        <img src={asset.content} alt={asset.label} style={{ maxWidth: "100%", display: "block" }} />
+                      )}
+                      <div style={{ padding: "0.35rem 0.5rem", background: "#f8fafc", fontSize: "0.76rem", color: "#64748b", textAlign: "center" }}>{asset.label}</div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ) : null}
             <section id="report-summary">
               <h2>Summary</h2>
               <PrintMarkdownBlock value={reportPages.summary} assets={reportPages.assets} />

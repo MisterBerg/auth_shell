@@ -85,6 +85,7 @@ function run(command: string, args: string[]): void {
   execFileSync(command, args, {
     cwd: ROOT,
     stdio: "inherit",
+    shell: process.platform === "win32" && command.endsWith(".cmd"),
   });
 }
 
