@@ -2698,6 +2698,63 @@ function sweepFingerprint(input: Pick<SweepChecklistItemInput, "title" | "catego
   ].join("|");
 }
 
+function sweepOrganizerItemKind(category: SweepChecklistCategory): OrganizerItemKind {
+  if (category === "follow-up") return "follow-up";
+  if (category === "blocked") return "waiting-on";
+  return "todo";
+}
+
+function normalizedTitleKey(title: string): string {
+  return title.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function findSweepOrganizerItem(items: OrganizerItem[], input: SweepChecklistItemInput): OrganizerItem | undefined {
+  const titleKey = normalizedTitleKey(input.title);
+  const kind = sweepOrganizerItemKind(normalizeSweepCategory(input.category));
+  const scopeId = input.scopeId?.trim();
+  return items.find((item) => {
+    if (item.status === "archived") return false;
+    if (item.kind !== kind) return false;
+    if (normalizedTitleKey(item.title) !== titleKey) return false;
+    if (!scopeId) return true;
+    return item.scopeIds.includes(scopeId) || item.objectiveIds.includes(scopeId);
+  });
+}
+
+function materializeSweepChecklistItems<T extends SweepChecklistItemInput>(args: {
+  items: OrganizerItem[];
+  checklist: T[];
+  userEmail?: string;
+}): { items: OrganizerItem[]; checklist: T[] } {
+  let items = args.items;
+  const checklist = args.checklist.map((input) => {
+    if (input.organizerItemId?.trim()) return input;
+    const existing = findSweepOrganizerItem(items, input);
+    if (existing) {
+      return { ...input, organizerItemId: existing.id };
+    }
+
+    const category = normalizeSweepCategory(input.category);
+    const scopeIds = input.scopeId ? [input.scopeId] : [];
+    const item = normalizeOrganizerItem({
+      input: {
+        kind: sweepOrganizerItemKind(category),
+        title: input.title,
+        details: input.reason,
+        status: "open",
+        tags: ["sweep", category],
+        dueAt: input.dueAt,
+        scopeIds,
+      },
+      userEmail: args.userEmail,
+    });
+    items = [...items, item];
+    return { ...input, organizerItemId: item.id };
+  });
+
+  return { items, checklist };
+}
+
 function normalizeSweepChecklistItem(input: Partial<SweepChecklistItem> & SweepChecklistItemInput, existing?: SweepChecklistItem): SweepChecklistItem {
   const at = nowIso();
   const category = normalizeSweepCategory(input.category ?? existing?.category);
@@ -5387,12 +5444,28 @@ async function executeTool(args: {
         checklist: SweepChecklistItemInput[];
       }>(toolCall.arguments);
       const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
-      const nextReview = mergeSweepReview(store.sweepReview, {
-        statusUpdates: parsed.statusUpdates ?? [],
+      const existingMaterialized = store.sweepReview
+        ? materializeSweepChecklistItems({
+            items: store.items,
+            checklist: store.sweepReview.checklist,
+            userEmail,
+          })
+        : { items: store.items, checklist: [] };
+      const materialized = materializeSweepChecklistItems({
+        items: existingMaterialized.items,
         checklist: parsed.checklist ?? [],
+        userEmail,
+      });
+      const existingReview = store.sweepReview
+        ? { ...store.sweepReview, checklist: existingMaterialized.checklist }
+        : undefined;
+      const nextReview = mergeSweepReview(existingReview, {
+        statusUpdates: parsed.statusUpdates ?? [],
+        checklist: materialized.checklist,
       });
       const nextStore: OrganizerStore = {
         ...store,
+        items: materialized.items,
         sweepReview: nextReview,
       };
       await saveOrganizerStore(getS3Client, storage, nextStore);
@@ -7953,7 +8026,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         "Use judgment to choose useful work areas and task granularity: focus on work item status, what can or should be done now, what is blocked, what is stale, and what risks falling through the cracks.",
         "Write in simple work-status language. Do not talk about graph structure, nodes, chains, data shape, context expansion, or what you can see in the execution environment.",
         "Break the work status into useful work-area updates. Each update should state what is happening, what is blocked or ready, and why it matters.",
-        "Call upsert_sweep_review before your final answer. Put short work-area status updates in statusUpdates. Put actionable one-line checklist entries in checklist with category do-now, blocked, or follow-up. Include organizerItemId and scopeId when known so the UI can make the checklist clickable.",
+        "Call upsert_sweep_review before your final answer. Put short work-area status updates in statusUpdates. Put actionable one-line checklist entries in checklist with category do-now, blocked, or follow-up. Include organizerItemId when a real organizer item already exists; otherwise the sweep tool will create one and link it automatically. Include scopeId when known so the UI can show the work context.",
         "Write the final answer with these sections: 1) Work status, 2) Do now, 3) Blocked or stale, 4) Quick follow-ups. Keep it concise and plain.",
         "Ignore done or archived organizer items unless I explicitly ask for closed history.",
         "Only update scopes or organizer items if it clearly improves continuity; otherwise propose the updates.",
