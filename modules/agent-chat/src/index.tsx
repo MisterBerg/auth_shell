@@ -579,7 +579,8 @@ const DEFAULT_PROMPT = [
   "Use the provided workspace tools whenever project structure, assets, resources, or modules are relevant.",
   "By default, treat 'the app', 'the webapp', 'app data', 'documentation here', and similar phrases as referring to the active project configuration, project assets, and registered resources inside the web app.",
   "Prefer project assets, registered resources, and root-config information before searching the local bridge workspace unless the user explicitly says workspace, local files, repo, filesystem, or disk, or recent conversation is clearly about local workspace operations.",
-  "Prefer module-native tools for task tracker, documentation, markdown, document-viewer, links, and webview data when they are available instead of editing their backing files indirectly.",
+  "Prefer module-native tools for task tracker, work manager, test manager, documentation, markdown, document-viewer, links, and webview data when they are available instead of editing their backing files indirectly.",
+  "For test manager slots: use get_test_manager_spec to read the current YAML spec before proposing changes, use get_test_manager_run_summary to understand test progress, and use set_test_manager_spec to write an updated spec after the user confirms — never edit test spec files indirectly through the bridge.",
   "Use shell commands only when no better dedicated tool is available, and pay attention to command failures.",
   "Prefer the managed Python tools for parsing, transformations, text extraction, and small file-oriented programs instead of shell-embedded Python.",
   "Only install Python packages through the dedicated dependency installer, and only when a missing dependency blocks the task.",
@@ -2216,6 +2217,49 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    type: "function",
+    name: "get_test_manager_spec",
+    description: "Read the YAML test specification for a test-manager slot. Returns the raw YAML text. Call this before proposing any changes so you understand the existing structure, linked values, and procedure definitions.",
+    parameters: {
+      type: "object",
+      properties: {
+        slot_id: { type: "string", description: "The slot ID of the test-manager instance." },
+      },
+      required: ["slot_id"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "set_test_manager_spec",
+    description: "Write a complete YAML test specification for a test-manager slot, replacing the current spec. Only call this after discussing the proposed changes with the user and receiving explicit confirmation. The test-manager module reflects changes on next reload.",
+    parameters: {
+      type: "object",
+      properties: {
+        slot_id: { type: "string", description: "The slot ID of the test-manager instance." },
+        yaml: { type: "string", description: "The full YAML content of the test specification." },
+      },
+      required: ["slot_id", "yaml"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "get_test_manager_run_summary",
+    description: "Read the current run state for a test-manager slot: active run, test status counts, and excluded test counts across all runs. Use this to understand progress before suggesting what to add or run next.",
+    parameters: {
+      type: "object",
+      properties: {
+        slot_id: { type: "string", description: "The slot ID of the test-manager instance." },
+      },
+      required: ["slot_id"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
 ];
 
 const C = {
@@ -2241,23 +2285,23 @@ function extractProjectId(configPath: string, fallback: string): string {
 }
 
 function buildStorageKey(projectId: string, moduleId: string) {
-  return `auth-shell:chat-codex:${projectId}:${moduleId}:openai-key`;
+  return `auth-shell:agent-chat:${projectId}:${moduleId}:openai-key`;
 }
 
 function buildChatSessionKey(configBucket: string, configPath: string, moduleId: string) {
-  return `auth-shell:chat-codex:${configBucket}:${configPath}:${moduleId}:session`;
+  return `auth-shell:agent-chat:${configBucket}:${configPath}:${moduleId}:session`;
 }
 
 function buildBridgeStorageKey(projectId: string, moduleId: string, field: "url" | "token") {
-  return `auth-shell:chat-codex:${projectId}:${moduleId}:bridge-${field}`;
+  return `auth-shell:agent-chat:${projectId}:${moduleId}:bridge-${field}`;
 }
 
 function buildBridgeWorkspaceRootKey(projectId: string, moduleId: string) {
-  return `auth-shell:chat-codex:${projectId}:${moduleId}:bridge-workspace-root`;
+  return `auth-shell:agent-chat:${projectId}:${moduleId}:bridge-workspace-root`;
 }
 
 function buildBridgeEnabledKey(projectId: string, moduleId: string) {
-  return `auth-shell:chat-codex:${projectId}:${moduleId}:bridge-enabled`;
+  return `auth-shell:agent-chat:${projectId}:${moduleId}:bridge-enabled`;
 }
 
 function safeReadLocalStorage(key: string): string {
@@ -2840,7 +2884,7 @@ function mergeSweepReview(
 
 function getOrganizerStorage(configBucket: string, configPath: string, projectId: string, moduleId: string) {
   const projectDir = dirnamePath(configPath);
-  const basePrefix = projectDir ? `${projectDir}/chat-codex/${moduleId}` : `chat-codex/${moduleId}`;
+  const basePrefix = projectDir ? `${projectDir}/agent-chat/${moduleId}` : `agent-chat/${moduleId}`;
   return {
     bucket: configBucket,
     projectId,
@@ -3344,6 +3388,45 @@ async function readTextObject(
   const s3 = await getS3Client(bucket);
   const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   return response.Body!.transformToString("utf-8");
+}
+
+async function readOptionalText(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  bucket: string,
+  key: string,
+): Promise<string | null> {
+  const s3 = await getS3Client(bucket);
+  try {
+    const object = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    return object.Body ? await object.Body.transformToString("utf-8") : null;
+  } catch (error: unknown) {
+    const err = error as { name?: string; $metadata?: { httpStatusCode?: number } };
+    if (err.name === "NoSuchKey" || err.name === "NotFound" || err.$metadata?.httpStatusCode === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function writeTextRaw(
+  getS3Client: ReturnType<typeof useAwsS3Client>,
+  bucket: string,
+  key: string,
+  text: string,
+  contentType: string,
+): Promise<void> {
+  const s3 = await getS3Client(bucket);
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: text, ContentType: contentType, CacheControl: "no-store" }));
+}
+
+function getTestManagerStorage(slotId: string, configBucket: string, configPath: string) {
+  const projectDir = dirnamePath(configPath);
+  const basePrefix = projectDir ? `${projectDir}/tests/${slotId}` : `tests/${slotId}`;
+  return {
+    bucket: configBucket,
+    definitionKey: `${basePrefix}/definition.yaml`,
+    resultsKey: `${basePrefix}/results.json`,
+  };
 }
 
 function getTaskTrackerStorage(slotConfig: ModuleConfig, configBucket: string, configPath: string, projectId: string) {
@@ -4639,7 +4722,7 @@ async function executeTool(args: {
           kind: "file",
           path: parsed.filename,
           moduleInstanceId: config.id,
-          moduleType: "module-chat-codex",
+          moduleType: "module-agent-chat",
           ...(parsed.meta ?? {}),
         },
       });
@@ -4681,7 +4764,7 @@ async function executeTool(args: {
           path: filename,
           sourceWorkspacePath: parsed.workspacePath,
           moduleInstanceId: config.id,
-          moduleType: "module-chat-codex",
+          moduleType: "module-agent-chat",
           ...(parsed.meta ?? {}),
         },
       });
@@ -6961,6 +7044,86 @@ async function executeTool(args: {
       };
     }
 
+    case "get_test_manager_spec": {
+      const parsed = parseToolArgs<{ slot_id: string }>(toolCall.arguments);
+      const storage = getTestManagerStorage(parsed.slot_id, configBucket, configPath);
+      const yaml = await readOptionalText(getS3Client, storage.bucket, storage.definitionKey);
+      if (!yaml) {
+        return {
+          output: JSON.stringify({ ok: false, error: "No spec found for this slot. The test-manager may not have a definition.yaml yet." }),
+          toolMessage: `No test spec found for slot "${parsed.slot_id}".`,
+        };
+      }
+      return {
+        output: yaml,
+        toolMessage: `Read test-manager spec for slot "${parsed.slot_id}" (${yaml.length} chars).`,
+      };
+    }
+
+    case "set_test_manager_spec": {
+      const parsed = parseToolArgs<{ slot_id: string; yaml: string }>(toolCall.arguments);
+      const trimmed = parsed.yaml.trim();
+      if (!trimmed) {
+        return {
+          output: JSON.stringify({ ok: false, error: "YAML content is empty." }),
+          toolMessage: `Refused to write empty spec for slot "${parsed.slot_id}".`,
+        };
+      }
+      if (!trimmed.startsWith("program:") && !trimmed.includes("\nprogram:")) {
+        return {
+          output: JSON.stringify({ ok: false, error: "Content does not appear to be a valid test-manager spec (missing top-level 'program:' key)." }),
+          toolMessage: `Refused to write spec for slot "${parsed.slot_id}": missing 'program:' key.`,
+        };
+      }
+      const storage = getTestManagerStorage(parsed.slot_id, configBucket, configPath);
+      await writeTextRaw(getS3Client, storage.bucket, storage.definitionKey, trimmed + "\n", "text/yaml");
+      return {
+        output: JSON.stringify({ ok: true, bytesWritten: trimmed.length, key: storage.definitionKey }),
+        toolMessage: `Wrote test-manager spec for slot "${parsed.slot_id}" (${trimmed.length} chars). Reload the module to pick up changes.`,
+      };
+    }
+
+    case "get_test_manager_run_summary": {
+      const parsed = parseToolArgs<{ slot_id: string }>(toolCall.arguments);
+      const storage = getTestManagerStorage(parsed.slot_id, configBucket, configPath);
+      const workspaceText = await readOptionalText(getS3Client, storage.bucket, storage.resultsKey);
+      if (!workspaceText) {
+        return {
+          output: JSON.stringify({ ok: true, hasData: false, message: "No run data yet — no tests have been executed for this slot." }),
+          toolMessage: `No run data found for test-manager slot "${parsed.slot_id}".`,
+        };
+      }
+      const workspace = JSON.parse(workspaceText) as {
+        activeRunId?: string;
+        runs?: Array<{
+          id: string;
+          label?: string;
+          resultsByTestId?: Record<string, { status: string }>;
+          excludedTestIds?: string[];
+        }>;
+      };
+      const runs = workspace.runs ?? [];
+      const runSummaries = runs.map((run) => {
+        const results = Object.values(run.resultsByTestId ?? {});
+        const statusCounts = results.reduce<Record<string, number>>((acc, r) => {
+          acc[r.status] = (acc[r.status] ?? 0) + 1;
+          return acc;
+        }, {});
+        return {
+          id: run.id,
+          label: run.label ?? run.id,
+          isActive: run.id === workspace.activeRunId,
+          totalResults: results.length,
+          excludedCount: (run.excludedTestIds ?? []).length,
+          statusCounts,
+        };
+      });
+      return {
+        output: JSON.stringify({ ok: true, totalRuns: runs.length, activeRunId: workspace.activeRunId ?? null, runs: runSummaries }, null, 2),
+        toolMessage: `Read run summary for test-manager slot "${parsed.slot_id}": ${runs.length} run${runs.length === 1 ? "" : "s"}.`,
+      };
+    }
+
     default:
       throw new Error(`Unsupported tool: ${toolCall.name}`);
   }
@@ -6978,7 +7141,7 @@ function formatToolError(toolName: string, error: unknown): ToolExecutionResult 
   };
 }
 
-export default function ChatCodexModule({ config }: ModuleProps) {
+export default function AgentChatModule({ config }: ModuleProps) {
   const { editMode } = useEditMode();
   const updateSlotMeta = useUpdateSlotMeta();
   const user = useUserProfile();
@@ -7481,7 +7644,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         await processQueuedBridgeAppspaceOperations(bridge);
       } catch (error) {
         setBridgeSyncError((error as Error).message);
-        console.debug("[chat-codex] bridge appspace sync failed", {
+        console.debug("[agent-chat] bridge appspace sync failed", {
           message: (error as Error).message,
         });
       }
@@ -7817,7 +7980,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
           typeof (item as ResponsesApiFunctionCall).call_id === "string"
       );
 
-      console.debug("[chat-codex] response loop", {
+      console.debug("[agent-chat] response loop", {
         iteration: i,
         functionCalls: functionCalls.map((call) => call.name),
       });
@@ -7834,7 +7997,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         if (args.signal.aborted) {
           throw new DOMException("The agent run was stopped.", "AbortError");
         }
-        console.debug("[chat-codex] tool call", {
+        console.debug("[agent-chat] tool call", {
           name: call.name,
           arguments: call.arguments,
         });
@@ -7869,7 +8032,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
           output: result.output,
         });
 
-        console.debug("[chat-codex] tool result", {
+        console.debug("[agent-chat] tool result", {
           name: call.name,
           toolMessage: result.toolMessage,
           outputPreview: result.output.slice(0, 300),
@@ -7953,6 +8116,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
         organizerSummary,
         "Work scopes are the durable graph layer for broad-to-narrow work context. Each scope can have an upstream parentScopeId and downstream child scopes. With little context, start with list_work_scope_index or search_work_scope_graph, then call get_work_scope_context on the best candidate.",
         "Organizer memory is available through get_organizer_overview, list_work_scope_index, search_work_scope_graph, get_work_scope_context, list_work_scopes, create_work_scopes, update_work_scope, archive_work_scope, list_organizer_items, create_organizer_items, update_organizer_item, delete_organizer_item, batch_update_organizer_items, mark_organizer_items_complete, and upsert_sweep_review. Use scopes for work context and organizer items for small notes, todos, reminders, follow-ups, and waiting-on items.",
+        "Test manager data is available through three callable tools: get_test_manager_spec (read the full YAML spec for a slot), set_test_manager_spec (write a replacement spec after user confirmation), and get_test_manager_run_summary (read run progress and status counts). Pass the slot's id string as slot_id. These are direct callable functions — not metadata — invoke them by name.",
         user?.email ? `Signed-in user: ${user.email}.` : undefined,
       ].filter((value): value is string => Boolean(value));
 
@@ -7986,7 +8150,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       }
       await refreshOrganizerStore();
     } catch (error) {
-      console.debug("[chat-codex] tool loop error", {
+      console.debug("[agent-chat] tool loop error", {
         message: (error as Error).message,
       });
       setMessages((current) => {
@@ -8079,7 +8243,7 @@ export default function ChatCodexModule({ config }: ModuleProps) {
       }
       await refreshOrganizerStore();
     } catch (error) {
-      console.debug("[chat-codex] continuation error", {
+      console.debug("[agent-chat] continuation error", {
         message: (error as Error).message,
       });
       setMessages((current) => {
@@ -9003,7 +9167,7 @@ function MessageBody({ role, text }: { role: ChatMessage["role"]; text: string }
   }
 
   return (
-    <div style={{ fontSize: "0.86rem", lineHeight: 1.6, minWidth: 0, maxWidth: "100%", overflowX: "hidden" }} className="chat-codex-markdown">
+    <div style={{ fontSize: "0.86rem", lineHeight: 1.6, minWidth: 0, maxWidth: "100%", overflowX: "hidden" }} className="agent-chat-markdown">
       <Markdown
         remarkPlugins={[remarkGfm]}
         components={{
