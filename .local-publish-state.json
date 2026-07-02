@@ -1,3 +1,22 @@
 {
-  "workspaces": {}
+  "workspaces": {
+    "apps/landing": "c32a664be66c4b6ab76fae7487cf958c4490e6ca7769e4df4400eb3f23b2ae86",
+    "layouts/top-left": "a2f34d70361fa824becd6b258c90a0ed283eeb1b0f38c2ec1dc60e793b0538a0",
+    "layouts/tabs-top": "b15149b36864189583ee0a9e6ca9717a10b9b5236410d2c7a78110301f82922c",
+    "layouts/tabs-left": "b3b8c6a2ff1e92f80ad8267955f8b7fdb6859fd2d223aaaaf01335b3bb03ac7b",
+    "layouts/left-right-columns": "61e8d6fdfd4e73fc1aa6537e770ff6b0034aab7b3bc0df440097907060df0934",
+    "modules/webview": "e6e4d41fb38c0a671ffaab79d19cdf4ad05ca214314419d12e9d16f86532acd2",
+    "modules/oauth-badge": "13d7f80f395c5d4a7f9ba80fed220097ac17fd80e61345f3de0954e172ad2720",
+    "modules/markdown-viewer": "0fa022d9e3e8970bd6c58d75dabf1f48e60efdbc32b457a456216fa2048ddaf2",
+    "modules/document-viewer": "1749d8912f4307158c35675ffa1de71596acddc046592d9d758f5c1952b79157",
+    "modules/documentation-viewer": "40b2ab295f22abf91a95dfea5e6bad0e5de8397d8ffae7884b5ebfea725a6a3d",
+    "modules/links": "86c90a66d75a1cc6029dd6a12fc6adac234c9a5fb2e2f9dac1cfc8a92312f3a8",
+    "modules/test-manager": "fc8446b404be51a07a30881ca17cbf32d5cb29a2712a1dbe5d7ad6e12759d87c",
+    "modules/task-tracker": "0f787b3a81dd09e34cf247bf8e8e977fcf3a032379ab6201c56892a96b2330e3",
+    "modules/work-manager": "20a0ee509f8c71454c17b538b201665c7d3e0ea63528392647e83bcf3ad6fe3a",
+    "modules/kicad-board-viewer": "8182c85010f795f91d193737d0d4cf2cb1233c2c79f4e8d67d79a72d1795b20e",
+    "modules/serial-display": "adac340154209797b5c4fe7c84cf6bffe8a7f81e7cf574d08873c593e1fa36c3",
+    "modules/shell-core": "671d93c5dc40471d18ccfa799f4986bbc9eb6bcd1b7fae47a976756cc56a71ae",
+    "modules/chat-codex": "4a4aa8c187050527062273a064c0218ebef87e016287b295a5c557a6d88cc5ea"
+  }
 }

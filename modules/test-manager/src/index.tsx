@@ -192,6 +192,7 @@ type TestRun = {
   updatedAt: string;
   createdBy?: string;
   resultsByTestId: Record<string, ResultRecord>;
+  excludedTestIds?: string[];
 };
 
 type WorkspaceState = {
@@ -1748,6 +1749,8 @@ function TestManagerInner({ config }: ModuleProps) {
   const activeRun = workspace ? getActiveRun(workspace) : null;
   const selectedTest = selectedTestId ? testsById.get(selectedTestId) ?? null : null;
   const selectedResult = selectedTest && activeRun ? ensureResult(activeRun, selectedTest, user?.email) : null;
+  const activeExcludedIds = useMemo(() => new Set(activeRun?.excludedTestIds ?? []), [activeRun]);
+  const includedTests = useMemo(() => resolvedTests.filter((test) => !activeExcludedIds.has(test.id)), [resolvedTests, activeExcludedIds]);
 
   const createRun = useCallback(() => {
     if (!workspace) return;
@@ -1780,6 +1783,21 @@ function TestManagerInner({ config }: ModuleProps) {
       }),
     }));
   }, [activeRun, selectedTest, updateWorkspace, user?.email, workspace]);
+
+  const toggleTestExclusion = useCallback((testId: string) => {
+    if (!workspace || !activeRun) return;
+    updateWorkspace((current) => {
+      const run = current.runs.find((r) => r.id === current.activeRunId);
+      if (!run) return current;
+      const excluded = new Set(run.excludedTestIds ?? []);
+      if (excluded.has(testId)) excluded.delete(testId);
+      else excluded.add(testId);
+      return {
+        ...current,
+        runs: current.runs.map((r) => r.id !== run.id ? r : { ...r, excludedTestIds: [...excluded], updatedAt: nowIso() }),
+      };
+    }, "Run scope updated");
+  }, [activeRun, updateWorkspace, workspace]);
 
   const uploadArtifacts = useCallback(async (files: FileList | null, testId: string, fieldId: string | null) => {
     if (!files?.length || !activeRun) return;
@@ -1845,7 +1863,7 @@ function TestManagerInner({ config }: ModuleProps) {
 
   const validationIssues = useMemo(() => {
     if (!definition || !activeRun) return [];
-    return resolvedTests.flatMap((test) => {
+    return includedTests.flatMap((test) => {
       const result = ensureResult(activeRun, test, user?.email);
       const runtimeIssues = definition.inputFields.flatMap((field) => {
         if (isArtifactField(field)) {
@@ -1861,32 +1879,32 @@ function TestManagerInner({ config }: ModuleProps) {
         ...runtimeIssues,
       ];
     });
-  }, [activeRun, definition, resolvedTests, user?.email]);
+  }, [activeRun, definition, includedTests, user?.email]);
 
   const statusCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const status of STATUS_OPTIONS) counts.set(status, 0);
     if (!activeRun) return counts;
-    for (const test of resolvedTests) {
+    for (const test of includedTests) {
       const status = ensureResult(activeRun, test, user?.email).status;
       counts.set(status, (counts.get(status) ?? 0) + 1);
     }
     return counts;
-  }, [activeRun, resolvedTests, user?.email]);
+  }, [activeRun, includedTests, user?.email]);
 
   const completion = useMemo(() => {
-    if (!activeRun || resolvedTests.length === 0) return 0;
-    const doneCount = resolvedTests.filter((test) => {
+    if (!activeRun || includedTests.length === 0) return 0;
+    const doneCount = includedTests.filter((test) => {
       const status = ensureResult(activeRun, test, user?.email).status;
       return status === "pass" || status === "fail" || status === "blocked";
     }).length;
-    return Math.round((doneCount / resolvedTests.length) * 100);
-  }, [activeRun, resolvedTests, user?.email]);
+    return Math.round((doneCount / includedTests.length) * 100);
+  }, [activeRun, includedTests, user?.email]);
 
   const reportPages = useMemo(() => {
     if (!definition || !activeRun) return null;
-    return generateReportPages(definition, activeRun, resolvedTests);
-  }, [activeRun, definition, resolvedTests]);
+    return generateReportPages(definition, activeRun, includedTests);
+  }, [activeRun, definition, includedTests]);
 
   const buildReportFiles = useCallback((): Record<string, string> | null => {
     if (!definition || !reportPages) return null;
@@ -1974,6 +1992,13 @@ function TestManagerInner({ config }: ModuleProps) {
             {workspace.runs.map((run) => <option key={run.id} value={run.id}>{run.label} · {formatDate(run.updatedAt)}</option>)}
           </select>
         </label>
+        <label style={{ ...labelStyle(), minWidth: 180 }}>
+          Run Label
+          <input value={activeRun?.label ?? ""} onChange={(event) => updateWorkspace((current) => ({
+            ...current,
+            runs: current.runs.map((run) => run.id === activeRun?.id ? { ...run, label: event.target.value, updatedAt: nowIso() } : run),
+          }), "Run renamed")} style={inputStyle()} />
+        </label>
         <div style={{ border: `1px solid ${C.border}`, borderRadius: 999, padding: "0.32rem 0.75rem", fontSize: "0.78rem", fontWeight: 700 }}>Completion: {completion}%</div>
         {STATUS_OPTIONS.map((status) => (
           <div key={status} style={{ border: `1px solid ${statusTone(status)}`, borderRadius: 999, padding: "0.32rem 0.7rem", color: statusTone(status), fontSize: "0.78rem", fontWeight: 700 }}>
@@ -1991,7 +2016,7 @@ function TestManagerInner({ config }: ModuleProps) {
         </div>
       )}
 
-      <main style={{ minHeight: 0, display: "grid", gridTemplateColumns: section === "run" ? "330px 1fr" : "1fr", gap: "1px", background: C.border, overflow: "hidden" }}>
+      <main style={{ minHeight: 0, display: "grid", gridTemplateColumns: section === "run" ? "360px 1fr" : "1fr", gap: "1px", background: C.border, overflow: "hidden" }}>
         {section === "run" ? (
           <>
             <aside style={{ minHeight: 0, overflowY: "auto", background: C.panel }}>
@@ -2012,30 +2037,50 @@ function TestManagerInner({ config }: ModuleProps) {
                       if (!resolved || !activeRun) return null;
                       const result = ensureResult(activeRun, resolved, user?.email);
                       const invalid = resolved.fieldIssues.length + resolved.linkedValueIssues.length > 0;
+                      const isExcluded = activeExcludedIds.has(test.id);
                       return (
-                        <button
+                        <div
                           key={test.id}
+                          role="button"
+                          tabIndex={0}
                           onClick={() => setSelectedTestId(test.id)}
+                          onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedTestId(test.id); }}
                           style={{
                             width: "100%",
                             textAlign: "left",
                             border: `1px solid ${selectedTestId === test.id ? C.accent : C.border}`,
                             background: selectedTestId === test.id ? C.accentSoft : "transparent",
-                            color: C.text,
+                            color: isExcluded ? C.muted : C.text,
+                            opacity: isExcluded ? 0.55 : 1,
                             padding: "0.75rem",
                             borderRadius: 10,
                             cursor: "pointer",
                             fontFamily: "inherit",
                             marginLeft: "0.4rem",
+                            boxSizing: "border-box",
                           }}
                         >
-                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem" }}>
-                            <strong style={{ fontSize: "0.88rem" }}>{test.title}</strong>
-                            <span style={{ border: `1px solid ${statusTone(result.status)}`, color: statusTone(result.status), borderRadius: 999, padding: "0.15rem 0.45rem", fontSize: "0.68rem", fontWeight: 700 }}>{result.status}</span>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.5rem" }}>
+                            <strong style={{ fontSize: "0.88rem", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{test.title}</strong>
+                            <div style={{ display: "flex", gap: "0.3rem", alignItems: "center", flexShrink: 0 }}>
+                              {isExcluded ? (
+                                <span style={{ border: `1px solid ${C.idle}`, color: C.idle, borderRadius: 999, padding: "0.15rem 0.45rem", fontSize: "0.68rem", fontWeight: 700, whiteSpace: "nowrap" }}>excluded</span>
+                              ) : (
+                                <span style={{ border: `1px solid ${statusTone(result.status)}`, color: statusTone(result.status), borderRadius: 999, padding: "0.15rem 0.45rem", fontSize: "0.68rem", fontWeight: 700, whiteSpace: "nowrap" }}>{humanize(result.status)}</span>
+                              )}
+                              <button
+                                type="button"
+                                onClick={(event) => { event.stopPropagation(); toggleTestExclusion(test.id); }}
+                                title={isExcluded ? "Include in run" : "Exclude from run"}
+                                style={{ border: `1px solid ${C.border}`, borderRadius: 6, background: "transparent", color: isExcluded ? C.accent : C.idle, cursor: "pointer", padding: "0.08rem 0.3rem", fontSize: "0.72rem", fontWeight: 700, fontFamily: "inherit", lineHeight: 1.4, flexShrink: 0 }}
+                              >
+                                {isExcluded ? "+" : "−"}
+                              </button>
+                            </div>
                           </div>
                           <div style={{ marginTop: "0.3rem", color: C.muted, fontSize: "0.76rem" }}>{test.id}</div>
-                          {invalid ? <div style={{ marginTop: "0.25rem", color: C.warning, fontSize: "0.72rem" }}>Definition needs attention</div> : null}
-                        </button>
+                          {invalid && !isExcluded ? <div style={{ marginTop: "0.25rem", color: C.warning, fontSize: "0.72rem" }}>Definition needs attention</div> : null}
+                        </div>
                       );
                     })}
                   </div>
@@ -2062,13 +2107,6 @@ function TestManagerInner({ config }: ModuleProps) {
                         <select value={selectedResult.status} onChange={(event) => updateSelectedResult((current) => ({ ...current, status: event.target.value, inputValues: { ...current.inputValues, status: event.target.value } }))} style={inputStyle()}>
                           {STATUS_OPTIONS.map((status) => <option key={status} value={status}>{humanize(status)}</option>)}
                         </select>
-                      </label>
-                      <label style={labelStyle()}>
-                        Run Label
-                        <input value={activeRun.label} onChange={(event) => updateWorkspace((current) => ({
-                          ...current,
-                          runs: current.runs.map((run) => run.id === activeRun.id ? { ...run, label: event.target.value, updatedAt: nowIso() } : run),
-                        }), "Run renamed")} style={inputStyle()} />
                       </label>
                       <label style={labelStyle()}>
                         Started
