@@ -183,6 +183,7 @@ type ResultRecord = {
   startedAt?: string;
   updatedAt: string;
   updatedBy?: string;
+  inputFingerprint?: string;
 };
 
 type TestRun = {
@@ -193,6 +194,8 @@ type TestRun = {
   createdBy?: string;
   resultsByTestId: Record<string, ResultRecord>;
   excludedTestIds?: string[];
+  excludedTestReasons?: Record<string, string>;
+  definitionSnapshot?: string;
 };
 
 type WorkspaceState = {
@@ -259,6 +262,12 @@ const C = {
 };
 
 const STRUCTURAL_REQUIRED_FIELDS = ["test_group_id", "test_id", "title", "failure_mode", "target_module"];
+const FINGERPRINT_EXCLUDED_KEYS = new Set([
+  "test_group_id", "test_group_title", "test_id", "title", "description",
+  "pre_test_guidance", "pre_test_assets", "equipment_runtime",
+  "procedure", "test_steps", "preconditions", "expected_hazard_focus",
+]);
+const TERMINAL_STATUSES = new Set(["pass", "fail", "blocked"]);
 const STATUS_OPTIONS = ["not-run", "in-progress", "pass", "fail", "blocked"];
 const SECTION_LABELS: Record<AppSection, string> = { overview: "Overview", run: "Run", report: "Report" };
 
@@ -749,13 +758,14 @@ function renderDiagramSvg(diagram: DiagramDefinition): string {
   const maxRows = Math.max(1, ...[...byLevel.values()].map((items) => items.length));
   const width = Math.max(620, 48 + (maxLevel + 1) * nodeWidth + maxLevel * xGap + 48);
   const height = Math.max(260, topPad + maxRows * nodeHeight + (maxRows - 1) * yGap + 118);
+  const nodeOrder = new Map(nodes.map((node, i) => [node.id, i]));
   const positions = new Map<string, { x: number; y: number; cx: number; cy: number }>();
 
   for (const [level, levelNodes] of byLevel.entries()) {
     const columnHeight = levelNodes.length * nodeHeight + (levelNodes.length - 1) * yGap;
     const startY = topPad + Math.max(0, ((height - topPad - 96) - columnHeight) / 2);
     levelNodes
-      .sort((a, b) => a.label.localeCompare(b.label))
+      .sort((a, b) => (nodeOrder.get(a.id) ?? 0) - (nodeOrder.get(b.id) ?? 0))
       .forEach((node, index) => {
         const x = 48 + level * (nodeWidth + xGap);
         const y = startY + index * (nodeHeight + yGap);
@@ -897,6 +907,7 @@ function normalizeResultRecord(value: unknown): ResultRecord {
     startedAt: toStringValue(record.startedAt, "") || undefined,
     updatedAt: toStringValue(record.updatedAt, nowIso()),
     updatedBy: toStringValue(record.updatedBy, "") || undefined,
+    inputFingerprint: toStringValue(record.inputFingerprint, "") || undefined,
   };
 }
 
@@ -1061,6 +1072,30 @@ function buildResolvedTests(definition: TestDefinition): ResolvedTest[] {
 function getProgramTitle(definition: TestDefinition | null, config: ModuleProps["config"]): string {
   if (!definition) return (config.meta?.["title"] as string | undefined) ?? "Test Manager";
   return toStringValue(definition.program.name ?? definition.program.title, (config.meta?.["title"] as string | undefined) ?? "Test Manager");
+}
+
+function computeTestInputFingerprint(test: ResolvedTest): string {
+  const encoder = new TextEncoder();
+  const content = JSON.stringify({
+    id: test.id,
+    title: test.title,
+    testGroupId: test.testGroupId,
+    testGroupTitle: test.testGroupTitle,
+    steps: test.procedureSteps.map((step) => ({
+      id: step.id,
+      title: step.title,
+      instruction: step.instruction,
+      expected: step.expected ?? null,
+      requiresEvidence: step.requiresEvidence,
+      safetyCritical: step.safetyCritical,
+    })),
+    definedValues: Object.fromEntries(
+      Object.entries(test.definedValues)
+        .filter(([key]) => !FINGERPRINT_EXCLUDED_KEYS.has(key))
+        .sort(([a], [b]) => a.localeCompare(b))
+    ),
+  });
+  return crc32(encoder.encode(content)).toString(16).padStart(8, "0");
 }
 
 function getProgramDescription(definition: TestDefinition | null): string {
@@ -1751,16 +1786,34 @@ function TestManagerInner({ config }: ModuleProps) {
   const selectedResult = selectedTest && activeRun ? ensureResult(activeRun, selectedTest, user?.email) : null;
   const activeExcludedIds = useMemo(() => new Set(activeRun?.excludedTestIds ?? []), [activeRun]);
   const includedTests = useMemo(() => resolvedTests.filter((test) => !activeExcludedIds.has(test.id)), [resolvedTests, activeExcludedIds]);
+  const staleTestIds = useMemo(() => {
+    const stale = new Set<string>();
+    if (!activeRun) return stale;
+    for (const test of resolvedTests) {
+      const result = activeRun.resultsByTestId[test.id];
+      if (!result?.inputFingerprint || !TERMINAL_STATUSES.has(result.status)) continue;
+      if (result.inputFingerprint !== computeTestInputFingerprint(test)) stale.add(test.id);
+    }
+    return stale;
+  }, [activeRun, resolvedTests]);
 
   const createRun = useCallback(() => {
     if (!workspace) return;
     const nextRun = createDefaultRun(user?.email, `Run ${workspace.runs.length + 1}`);
+    const snapshotYaml = definition?.sourceText;
     updateWorkspace((current) => ({
       ...current,
       activeRunId: nextRun.id,
-      runs: [nextRun, ...current.runs],
+      runs: [
+        nextRun,
+        ...current.runs.map((run) =>
+          run.id === current.activeRunId && !run.definitionSnapshot
+            ? { ...run, definitionSnapshot: snapshotYaml }
+            : run
+        ),
+      ],
     }), "New run created");
-  }, [updateWorkspace, user?.email, workspace]);
+  }, [definition, updateWorkspace, user?.email, workspace]);
 
   const updateSelectedResult = useCallback((mutate: (current: ResultRecord) => ResultRecord) => {
     if (!workspace || !activeRun || !selectedTest) return;
@@ -1790,13 +1843,32 @@ function TestManagerInner({ config }: ModuleProps) {
       const run = current.runs.find((r) => r.id === current.activeRunId);
       if (!run) return current;
       const excluded = new Set(run.excludedTestIds ?? []);
-      if (excluded.has(testId)) excluded.delete(testId);
+      const wasExcluded = excluded.has(testId);
+      if (wasExcluded) excluded.delete(testId);
       else excluded.add(testId);
+      const reasons = { ...(run.excludedTestReasons ?? {}) };
+      if (wasExcluded) delete reasons[testId];
       return {
         ...current,
-        runs: current.runs.map((r) => r.id !== run.id ? r : { ...r, excludedTestIds: [...excluded], updatedAt: nowIso() }),
+        runs: current.runs.map((r) => r.id !== run.id ? r : { ...r, excludedTestIds: [...excluded], excludedTestReasons: reasons, updatedAt: nowIso() }),
       };
     }, "Run scope updated");
+  }, [activeRun, updateWorkspace, workspace]);
+
+  const setExclusionReason = useCallback((testId: string, reason: string) => {
+    if (!workspace || !activeRun) return;
+    updateWorkspace((current) => {
+      const run = current.runs.find((r) => r.id === current.activeRunId);
+      if (!run) return current;
+      return {
+        ...current,
+        runs: current.runs.map((r) => r.id !== run.id ? r : {
+          ...r,
+          excludedTestReasons: { ...(r.excludedTestReasons ?? {}), [testId]: reason },
+          updatedAt: nowIso(),
+        }),
+      };
+    }, "Exclusion reason updated");
   }, [activeRun, updateWorkspace, workspace]);
 
   const uploadArtifacts = useCallback(async (files: FileList | null, testId: string, fieldId: string | null) => {
@@ -1912,10 +1984,10 @@ function TestManagerInner({ config }: ModuleProps) {
       "report.md": reportPages.summary,
       ...Object.fromEntries(Object.entries(reportPages.details).map(([testId, content]) => [`tests/${safeFileSegment(testId)}.md`, content])),
       ...Object.fromEntries(Object.entries(reportPages.assets).map(([path, asset]) => [path, asset.content])),
-      "definition.yaml": definition.sourceText,
+      "definition.yaml": activeRun?.definitionSnapshot ?? definition.sourceText,
       "workspace.json": JSON.stringify(workspace, null, 2),
     };
-  }, [definition, reportPages, workspace]);
+  }, [activeRun, definition, reportPages, workspace]);
 
   const downloadReportZip = useCallback(() => {
     const files = buildReportFiles();
@@ -2068,14 +2140,9 @@ function TestManagerInner({ config }: ModuleProps) {
                               ) : (
                                 <span style={{ border: `1px solid ${statusTone(result.status)}`, color: statusTone(result.status), borderRadius: 999, padding: "0.15rem 0.45rem", fontSize: "0.68rem", fontWeight: 700, whiteSpace: "nowrap" }}>{humanize(result.status)}</span>
                               )}
-                              <button
-                                type="button"
-                                onClick={(event) => { event.stopPropagation(); toggleTestExclusion(test.id); }}
-                                title={isExcluded ? "Include in run" : "Exclude from run"}
-                                style={{ border: `1px solid ${C.border}`, borderRadius: 6, background: "transparent", color: isExcluded ? C.accent : C.idle, cursor: "pointer", padding: "0.08rem 0.3rem", fontSize: "0.72rem", fontWeight: 700, fontFamily: "inherit", lineHeight: 1.4, flexShrink: 0 }}
-                              >
-                                {isExcluded ? "+" : "−"}
-                              </button>
+                              {!isExcluded && staleTestIds.has(test.id) ? (
+                                <span title="Spec changed since completion" style={{ color: C.warning, fontSize: "0.75rem", fontWeight: 800, lineHeight: 1, flexShrink: 0 }}>⚠</span>
+                              ) : null}
                             </div>
                           </div>
                           <div style={{ marginTop: "0.3rem", color: C.muted, fontSize: "0.76rem" }}>{test.id}</div>
@@ -2097,14 +2164,47 @@ function TestManagerInner({ config }: ModuleProps) {
                 <div style={{ display: "grid", gap: "1rem" }}>
                   <section style={{ ...cardStyle(), overflow: "hidden", padding: 0 }}>
                     <div style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, background: "rgba(255,255,255,0.03)" }}>
-                      <div style={{ color: C.accent, fontSize: "0.72rem", letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 700 }}>{selectedTest.testGroupTitle}</div>
-                      <h3 style={{ margin: "0.2rem 0 0", fontSize: "1.25rem" }}>{selectedTest.title}</h3>
-                      <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.82rem" }}>{selectedTest.id}</div>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "1rem" }}>
+                        <div>
+                          <div style={{ color: C.accent, fontSize: "0.72rem", letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 700 }}>{selectedTest.testGroupTitle}</div>
+                          <h3 style={{ margin: "0.2rem 0 0", fontSize: "1.25rem" }}>{selectedTest.title}</h3>
+                          <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.82rem" }}>{selectedTest.id}</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => toggleTestExclusion(selectedTest.id)}
+                          style={{ border: `1px solid ${activeExcludedIds.has(selectedTest.id) ? C.accent : C.idle}`, borderRadius: 8, background: "transparent", color: activeExcludedIds.has(selectedTest.id) ? C.accent : C.idle, cursor: "pointer", padding: "0.4rem 0.9rem", fontSize: "0.8rem", fontWeight: 700, fontFamily: "inherit", lineHeight: 1.4, whiteSpace: "nowrap", flexShrink: 0 }}
+                        >
+                          {activeExcludedIds.has(selectedTest.id) ? "Add to run" : "Remove from run"}
+                        </button>
+                      </div>
+                      {activeExcludedIds.has(selectedTest.id) && (
+                        <div style={{ display: "flex", alignItems: "center", gap: "0.65rem", marginTop: "0.75rem", paddingTop: "0.65rem", borderTop: `1px solid ${C.border}` }}>
+                          <span style={{ fontSize: "0.7rem", color: C.idle, whiteSpace: "nowrap", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase" }}>Exclusion reason</span>
+                          <input
+                            type="text"
+                            value={activeRun?.excludedTestReasons?.[selectedTest.id] ?? ""}
+                            onChange={(e) => setExclusionReason(selectedTest.id, e.target.value)}
+                            placeholder="Why is this test excluded from this run?"
+                            style={{ flex: 1, background: "rgba(255,255,255,0.04)", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: "0.82rem", padding: "0.32rem 0.6rem", fontFamily: "inherit", outline: "none" }}
+                          />
+                        </div>
+                      )}
                     </div>
                     <div style={{ padding: "1rem 1.1rem", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "0.85rem" }}>
                       <label style={labelStyle()}>
                         Execution Status
-                        <select value={selectedResult.status} onChange={(event) => updateSelectedResult((current) => ({ ...current, status: event.target.value, inputValues: { ...current.inputValues, status: event.target.value } }))} style={inputStyle()}>
+                        <select value={selectedResult.status} onChange={(event) => {
+                          const newStatus = event.target.value;
+                          updateSelectedResult((current) => ({
+                            ...current,
+                            status: newStatus,
+                            inputValues: { ...current.inputValues, status: newStatus },
+                            inputFingerprint: TERMINAL_STATUSES.has(newStatus) && selectedTest
+                              ? computeTestInputFingerprint(selectedTest)
+                              : undefined,
+                          }));
+                        }} style={inputStyle()}>
                           {STATUS_OPTIONS.map((status) => <option key={status} value={status}>{humanize(status)}</option>)}
                         </select>
                       </label>
@@ -2118,6 +2218,25 @@ function TestManagerInner({ config }: ModuleProps) {
                       </label>
                     </div>
                   </section>
+
+                  {staleTestIds.has(selectedTest.id) ? (
+                    <section style={{ border: `1px solid ${C.warning}`, borderRadius: 14, background: "rgba(251,191,36,0.06)", padding: "0.95rem 1rem" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
+                        <div>
+                          <div style={{ fontWeight: 700, color: C.warning }}>⚠ Spec Changed Since Completion</div>
+                          <div style={{ marginTop: "0.3rem", color: C.text, fontSize: "0.88rem", lineHeight: 1.55 }}>
+                            The test definition was updated after this result was recorded. Review the changes and retest, or confirm the result is still valid.
+                          </div>
+                        </div>
+                        <button
+                          style={buttonStyle()}
+                          onClick={() => selectedTest && updateSelectedResult((current) => ({ ...current, inputFingerprint: computeTestInputFingerprint(selectedTest) }))}
+                        >
+                          Mark Still Valid
+                        </button>
+                      </div>
+                    </section>
+                  ) : null}
 
                   {(selectedTest.preTestGuidance || selectedTest.preTestAssets.length > 0) ? (
                     <section style={cardStyle()}>
