@@ -421,7 +421,8 @@ export function extractMediaRelativePaths(markdown: string): string[] {
   const patterns = [
     /!?\[[^\]]*]\(([^)\s"']+)/g,
     /^\s*\[[^\]]+]:\s*([^\s"'<>\n]+)/gm,
-    /<(?:img|video|audio|source)[^>]+src=["']([^"']+)["']/gi,
+    /<(?:img|video|audio|source|embed)[^>]+src=["']([^"']+)["']/gi,
+    /<object[^>]+data=["']([^"']+)["']/gi,
   ];
 
   for (const pattern of patterns) {

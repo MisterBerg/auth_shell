@@ -1150,6 +1150,60 @@ function inputStyle(): React.CSSProperties {
   return { width: "100%", boxSizing: "border-box", background: C.input, border: `1px solid ${C.border}`, borderRadius: 8, color: C.text, padding: "0.6rem 0.7rem", font: "inherit" };
 }
 
+function DraftTextInput({
+  value,
+  onCommit,
+  multiline = false,
+  rows = 4,
+  placeholder,
+  type = "text",
+  style,
+}: {
+  value: string;
+  onCommit: (nextValue: string) => void;
+  multiline?: boolean;
+  rows?: number;
+  placeholder?: string;
+  type?: "text" | "number";
+  style?: React.CSSProperties;
+}) {
+  const [draft, setDraft] = useState(value);
+
+  useEffect(() => {
+    setDraft(value);
+  }, [value]);
+
+  const commit = useCallback(() => {
+    if (draft !== value) {
+      onCommit(draft);
+    }
+  }, [draft, onCommit, value]);
+
+  if (multiline) {
+    return (
+      <textarea
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        rows={rows}
+        placeholder={placeholder}
+        style={{ ...inputStyle(), resize: "vertical", lineHeight: 1.5, ...style }}
+      />
+    );
+  }
+
+  return (
+    <input
+      type={type}
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={commit}
+      placeholder={placeholder}
+      style={{ ...inputStyle(), ...style }}
+    />
+  );
+}
+
 function labelStyle(): React.CSSProperties {
   return { display: "flex", flexDirection: "column", gap: "0.38rem", color: C.muted, fontSize: "0.78rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em" };
 }
@@ -1433,7 +1487,12 @@ function FieldInput({
     return (
       <label style={labelStyle()}>
         {field.label}{field.required ? " *" : ""}
-        <textarea value={value == null ? "" : String(value)} onChange={(event) => onChange(event.target.value)} rows={4} style={{ ...inputStyle(), resize: "vertical", lineHeight: 1.5 }} />
+        <DraftTextInput
+          value={value == null ? "" : String(value)}
+          onCommit={(nextValue) => onChange(nextValue)}
+          multiline
+          rows={4}
+        />
       </label>
     );
   }
@@ -1462,11 +1521,10 @@ function FieldInput({
   return (
     <label style={labelStyle()}>
       {field.label}{field.required ? " *" : ""}
-      <input
+      <DraftTextInput
         type={type.includes("number") ? "number" : "text"}
         value={value == null ? "" : String(value)}
-        onChange={(event) => onChange(type.includes("number") ? (event.target.value === "" ? null : Number(event.target.value)) : event.target.value)}
-        style={inputStyle()}
+        onCommit={(nextValue) => onChange(type.includes("number") ? (nextValue === "" ? null : Number(nextValue)) : nextValue)}
       />
     </label>
   );
@@ -2019,16 +2077,15 @@ function TestManagerInner({ config }: ModuleProps) {
           .test-manager-print-root pre { white-space: pre-wrap !important; }
         }
       `}</style>
-      <header style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, background: C.header, display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
-        <div>
+      <header style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, background: C.header, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "1rem", flexWrap: "wrap" }}>
+        <div style={{ minWidth: 0, flex: "1 1 420px" }}>
           <div style={{ fontSize: "0.72rem", color: C.accent, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 700 }}>Test Manager</div>
           <h2 style={{ margin: "0.2rem 0 0", fontSize: "1.35rem" }}>{getProgramTitle(definition, config)}</h2>
           <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.82rem" }}>
             {definition ? `${resolvedTests.length} tests across ${definition.testGroups.length} groups` : "No test definition uploaded yet"} · {storage.projectId}
           </div>
-          {getProgramDescription(definition) ? <p style={{ margin: "0.55rem 0 0", color: C.text, maxWidth: 780, lineHeight: 1.55 }}>{getProgramDescription(definition)}</p> : null}
         </div>
-        <div style={{ display: "flex", gap: "0.55rem", alignItems: "center", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: "0.55rem", alignItems: "center", justifyContent: "flex-end", flexWrap: "wrap", flex: "0 1 auto", paddingTop: "0.1rem" }}>
           <button onClick={() => importRef.current?.click()} style={buttonStyle("primary")}>Upload YAML</button>
           <button onClick={() => definition && downloadText(`test-definition-${storage.projectId}.yaml`, definition.sourceText, "text/yaml;charset=utf-8")} style={buttonStyle()} disabled={!definition}>Download YAML</button>
           <button onClick={() => setReportDialogOpen(true)} style={buttonStyle()} disabled={!reportPages}>Generate Report</button>
@@ -2066,10 +2123,13 @@ function TestManagerInner({ config }: ModuleProps) {
         </label>
         <label style={{ ...labelStyle(), minWidth: 180 }}>
           Run Label
-          <input value={activeRun?.label ?? ""} onChange={(event) => updateWorkspace((current) => ({
-            ...current,
-            runs: current.runs.map((run) => run.id === activeRun?.id ? { ...run, label: event.target.value, updatedAt: nowIso() } : run),
-          }), "Run renamed")} style={inputStyle()} />
+          <DraftTextInput
+            value={activeRun?.label ?? ""}
+            onCommit={(nextValue) => updateWorkspace((current) => ({
+              ...current,
+              runs: current.runs.map((run) => run.id === activeRun?.id ? { ...run, label: nextValue, updatedAt: nowIso() } : run),
+            }), "Run renamed")}
+          />
         </label>
         <div style={{ border: `1px solid ${C.border}`, borderRadius: 999, padding: "0.32rem 0.75rem", fontSize: "0.78rem", fontWeight: 700 }}>Completion: {completion}%</div>
         {STATUS_OPTIONS.map((status) => (
@@ -2181,12 +2241,11 @@ function TestManagerInner({ config }: ModuleProps) {
                       {activeExcludedIds.has(selectedTest.id) && (
                         <div style={{ display: "flex", alignItems: "center", gap: "0.65rem", marginTop: "0.75rem", paddingTop: "0.65rem", borderTop: `1px solid ${C.border}` }}>
                           <span style={{ fontSize: "0.7rem", color: C.idle, whiteSpace: "nowrap", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase" }}>Exclusion reason</span>
-                          <input
-                            type="text"
+                          <DraftTextInput
                             value={activeRun?.excludedTestReasons?.[selectedTest.id] ?? ""}
-                            onChange={(e) => setExclusionReason(selectedTest.id, e.target.value)}
+                            onCommit={(nextValue) => setExclusionReason(selectedTest.id, nextValue)}
                             placeholder="Why is this test excluded from this run?"
-                            style={{ flex: 1, background: "rgba(255,255,255,0.04)", border: `1px solid ${C.border}`, borderRadius: 6, color: C.text, fontSize: "0.82rem", padding: "0.32rem 0.6rem", fontFamily: "inherit", outline: "none" }}
+                            style={{ flex: 1, background: "rgba(255,255,255,0.04)", fontSize: "0.82rem", padding: "0.32rem 0.6rem", outline: "none" }}
                           />
                         </div>
                       )}
@@ -2339,20 +2398,19 @@ function TestManagerInner({ config }: ModuleProps) {
                                       <option value="failed">Failed</option>
                                       <option value="blocked">Blocked</option>
                                     </select>
-                                    <input
+                                    <DraftTextInput
                                       value={stepResult.notes}
-                                      onChange={(event) => updateSelectedResult((current) => ({
+                                      onCommit={(nextValue) => updateSelectedResult((current) => ({
                                         ...current,
                                         stepResultsById: {
                                           ...current.stepResultsById,
                                           [step.id]: {
                                             ...stepResult,
-                                            notes: event.target.value,
+                                            notes: nextValue,
                                           },
                                         },
                                       }))}
                                       placeholder="Step notes"
-                                      style={inputStyle()}
                                     />
                                   </div>
                                 </div>
@@ -2401,7 +2459,13 @@ function TestManagerInner({ config }: ModuleProps) {
                     <div style={{ marginTop: "1rem" }}>
                       <label style={labelStyle()}>
                         {operatorNotesField?.label ?? "Operator Notes"}
-                        <textarea value={selectedResult.notes} onChange={(event) => updateSelectedResult((current) => ({ ...current, notes: event.target.value }))} rows={6} style={{ ...inputStyle(), resize: "vertical", lineHeight: 1.55 }} />
+                        <DraftTextInput
+                          value={selectedResult.notes}
+                          onCommit={(nextValue) => updateSelectedResult((current) => ({ ...current, notes: nextValue }))}
+                          multiline
+                          rows={6}
+                          style={{ lineHeight: 1.55 }}
+                        />
                       </label>
                     </div>
                     <div style={{ marginTop: "1rem" }}>

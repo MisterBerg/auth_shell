@@ -178,6 +178,10 @@ function mediaKind(path: string, contentType = contentTypeForPath(path)): "image
   return "file";
 }
 
+function isSvgPath(path: string): boolean {
+  return contentTypeForPath(path) === "image/svg+xml";
+}
+
 function basename(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   const parts = normalized.split("/");
@@ -256,9 +260,9 @@ function extractLocalRefs(content: string): string[] {
     const u = m[1];
     if (u && !/^(https?:|mailto:|#|data:)/i.test(u)) refs.push(u.split(/[?#]/)[0]);
   }
-  const htmlImg = /<(?:img|video|audio|source)[^>]+src=["']([^"']+)["']/gi;
-  while ((m = htmlImg.exec(content)) !== null) {
-    const u = m[1];
+  const htmlMedia = /<(?:img|video|audio|source|embed)[^>]+src=["']([^"']+)["']|<object[^>]+data=["']([^"']+)["']/gi;
+  while ((m = htmlMedia.exec(content)) !== null) {
+    const u = m[1] || m[2];
     if (u && !/^(https?:|data:)/i.test(u)) refs.push(u.split(/[?#]/)[0]);
   }
   return refs;
@@ -398,7 +402,8 @@ function rewriteImportedMarkdownContent(args: {
   return args.content
     .replace(/(!?\[[^\]]*\]\()([^) \t\n"']+)(\))/g, (_match, prefix, href, suffix) => `${prefix}${replacer(href)}${suffix}`)
     .replace(/^(\s*\[[^\]]+\]:\s*)([^\s"'<>\n]+)(.*)$/gm, (_match, prefix, href, suffix) => `${prefix}${replacer(href)}${suffix}`)
-    .replace(/(<(?:img|video|audio|source)[^>]+src=["'])([^"']+)(["'][^>]*>)/gi, (_match, prefix, href, suffix) => `${prefix}${replacer(href)}${suffix}`);
+    .replace(/(<(?:img|video|audio|source|embed)[^>]+src=["'])([^"']+)(["'][^>]*>)/gi, (_match, prefix, href, suffix) => `${prefix}${replacer(href)}${suffix}`)
+    .replace(/(<object[^>]+data=["'])([^"']+)(["'][^>]*>)/gi, (_match, prefix, href, suffix) => `${prefix}${replacer(href)}${suffix}`);
 }
 
 async function buildImportedDocumentationData(args: {
@@ -904,11 +909,13 @@ function DocumentationMedia({
 }) {
   const getS3Client = useAwsS3Client();
   const [url, setUrl] = useState<string | "loading" | "error">("loading");
+  const [inlineSvg, setInlineSvg] = useState<string | null>(null);
   const mediaRelativePath = resolveMediaRelativePath(manifest, currentDocId, href);
 
   useEffect(() => {
     if (!mediaRelativePath) {
       setUrl("error");
+      setInlineSvg(null);
       return;
     }
 
@@ -923,18 +930,40 @@ function DocumentationMedia({
     let cancelled = false;
     getS3Client(storage.bucket)
       .then((s3) => s3.send(new GetObjectCommand({ Bucket: storage.bucket, Key: key })))
-      .then((response) => response.Body!.transformToByteArray())
-      .then((bytes) => {
+      .then(async (response) => {
+        if (isSvgPath(mediaRelativePath)) {
+          return {
+            kind: "svg" as const,
+            text: await response.Body!.transformToString("utf-8"),
+          };
+        }
+        return {
+          kind: "binary" as const,
+          bytes: await response.Body!.transformToByteArray(),
+        };
+      })
+      .then((payload) => {
         if (cancelled) return;
-        const blob = new Blob([bytes.buffer as ArrayBuffer], {
+        if (payload.kind === "svg") {
+          setInlineSvg(payload.text);
+          setUrl("");
+          return;
+        }
+        const exactBytes = new Uint8Array(payload.bytes.byteLength);
+        exactBytes.set(payload.bytes);
+        const blob = new Blob([exactBytes], {
           type: contentTypeForPath(mediaRelativePath),
         });
         const blobUrl = URL.createObjectURL(blob);
         mediaBlobCache.set(cacheKey, blobUrl);
+        setInlineSvg(null);
         setUrl(blobUrl);
       })
       .catch(() => {
-        if (!cancelled) setUrl("error");
+        if (!cancelled) {
+          setInlineSvg(null);
+          setUrl("error");
+        }
       });
 
     return () => {
@@ -943,6 +972,21 @@ function DocumentationMedia({
   }, [getS3Client, mediaRelativePath, storage]);
 
   if (!mediaRelativePath) return null;
+  if (inlineSvg) {
+    return (
+      <div
+        style={{
+          maxWidth: "100%",
+          borderRadius: 8,
+          overflowX: "auto",
+          background: "#ffffff",
+          padding: "0.75rem",
+          border: `1px solid ${COLORS.border}`,
+        }}
+        dangerouslySetInnerHTML={{ __html: inlineSvg }}
+      />
+    );
+  }
   if (url === "loading") {
     return <em style={{ color: COLORS.muted, fontSize: "0.85em" }}>[{alt ?? mediaRelativePath} loading...]</em>;
   }
@@ -952,7 +996,20 @@ function DocumentationMedia({
 
   const kind = mediaKind(mediaRelativePath);
   if (kind === "image") {
-    return <img src={url} alt={alt ?? ""} style={{ maxWidth: "100%", borderRadius: 8 }} />;
+    return (
+      <div
+        style={{
+          display: "inline-block",
+          maxWidth: "100%",
+          borderRadius: 8,
+          background: "#ffffff",
+          padding: "0.75rem",
+          border: `1px solid ${COLORS.border}`,
+        }}
+      >
+        <img src={url} alt={alt ?? ""} style={{ display: "block", maxWidth: "100%", borderRadius: 8 }} />
+      </div>
+    );
   }
   if (kind === "video") {
     return <video src={url} controls style={{ maxWidth: "100%", borderRadius: 8 }} />;
@@ -965,6 +1022,71 @@ function DocumentationMedia({
     <a href={url} target="_blank" rel="noopener noreferrer" style={{ color: COLORS.accent }}>
       {alt || mediaRelativePath.split("/").pop() || "Open media"}
     </a>
+  );
+}
+
+function MermaidBlock({ code }: { code: string }) {
+  const [svg, setSvg] = useState<string>("");
+  const [error, setError] = useState<string>("");
+  const renderId = useMemo(() => {
+    const cryptoId = globalThis.crypto?.randomUUID?.();
+    return `mermaid-${cryptoId ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`}`;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setError("");
+    setSvg("");
+
+    void import("mermaid")
+      .then(async (module) => {
+        const mermaid = module.default;
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "loose",
+          theme: "neutral",
+        });
+        const result = await mermaid.render(renderId, code);
+        if (!cancelled) {
+          setSvg(result.svg);
+        }
+      })
+      .catch((cause) => {
+        if (!cancelled) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [code, renderId]);
+
+  if (error) {
+    return (
+      <div style={{ border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: "0.9rem", background: COLORS.bgInput }}>
+        <div style={{ color: COLORS.muted, fontSize: "0.9rem", marginBottom: "0.5rem" }}>Mermaid diagram could not be rendered.</div>
+        <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{code}</pre>
+        <div style={{ color: COLORS.muted, fontSize: "0.8rem", marginTop: "0.5rem" }}>{error}</div>
+      </div>
+    );
+  }
+
+  if (!svg) {
+    return <div style={{ color: COLORS.muted, fontSize: "0.9rem" }}>Rendering Mermaid diagram...</div>;
+  }
+
+  return (
+    <div
+      style={{
+        overflowX: "auto",
+        background: "#ffffff",
+        padding: "0.75rem",
+        borderRadius: 8,
+        border: `1px solid ${COLORS.border}`,
+      }}
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
   );
 }
 
@@ -1073,8 +1195,30 @@ function DocumentationBody({
               storage={storage}
             />
           ),
+          object: (props) => (
+            <DocumentationMedia
+              href={typeof props.data === "string" ? props.data : undefined}
+              alt={typeof props["aria-label"] === "string" ? props["aria-label"] : undefined}
+              manifest={manifest}
+              currentDocId={currentDocId}
+              storage={storage}
+            />
+          ),
+          embed: (props) => (
+            <DocumentationMedia
+              href={typeof props.src === "string" ? props.src : undefined}
+              alt={typeof props.title === "string" ? props.title : undefined}
+              manifest={manifest}
+              currentDocId={currentDocId}
+              storage={storage}
+            />
+          ),
           code: ({ className, children, ...props }) => {
             const inline = !className;
+            const codeText = String(children).replace(/\n$/, "");
+            if (!inline && /\blanguage-mermaid\b/.test(className ?? "")) {
+              return <MermaidBlock code={codeText} />;
+            }
             return inline ? (
               <code style={{ background: COLORS.bgInput, padding: "0.1rem 0.35rem", borderRadius: 4 }} {...props}>
                 {children}
