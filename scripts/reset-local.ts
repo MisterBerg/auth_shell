@@ -53,6 +53,16 @@ function heading(step: number, total: number, label: string) {
 }
 
 function run(command: string, args: string[], cwd?: string) {
+  if (process.platform === "win32" && /\.cmd$/i.test(command)) {
+    const shell = process.env["ComSpec"] || "cmd.exe";
+    const commandLine = [command, ...args.map(quoteWindowsArg)].join(" ");
+    execFileSync(shell, ["/d", "/s", "/c", commandLine], {
+      cwd: cwd ?? ROOT,
+      stdio: "inherit",
+    });
+    return;
+  }
+
   execFileSync(command, args, {
     cwd: cwd ?? ROOT,
     stdio: "inherit",
@@ -68,6 +78,13 @@ function runShell(command: string) {
 
 function runTsx(scriptPath: string, scriptArgs: string[] = []) {
   run(process.execPath, [TSX_CLI, scriptPath, ...scriptArgs]);
+}
+
+function quoteWindowsArg(value: string): string {
+  if (!/[\s"]/u.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/"/g, '\\"')}"`;
 }
 
 function podmanBin(): string {

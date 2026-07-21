@@ -1662,23 +1662,23 @@ function PrintMarkdownBlock({ value, assets }: { value: string; assets: ReportPa
   }, [assets]);
 
   return (
-    <div style={{ color: "#111827", lineHeight: 1.62, fontSize: "0.95rem" }}>
+    <div style={{ color: "#111827", lineHeight: 1.68, fontSize: "1.06rem" }}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          h1: ({ children }) => <h1 style={{ margin: "0 0 0.75rem", fontSize: "1.55rem", color: "#0f172a" }}>{children}</h1>,
-          h2: ({ children }) => <h2 style={{ margin: "1.15rem 0 0.6rem", fontSize: "1.25rem", color: "#0f172a" }}>{children}</h2>,
-          h3: ({ children }) => <h3 style={{ margin: "0.9rem 0 0.45rem", fontSize: "1.05rem", color: "#0f172a" }}>{children}</h3>,
+          h1: ({ children }) => <h1 style={{ margin: "0 0 0.75rem", fontSize: "1.9rem", color: "#0f172a" }}>{children}</h1>,
+          h2: ({ children }) => <h2 style={{ margin: "1.15rem 0 0.6rem", fontSize: "1.45rem", color: "#0f172a" }}>{children}</h2>,
+          h3: ({ children }) => <h3 style={{ margin: "0.9rem 0 0.45rem", fontSize: "1.18rem", color: "#0f172a" }}>{children}</h3>,
           p: ({ children }) => <p style={{ margin: "0.45rem 0", color: "#111827" }}>{children}</p>,
           ul: ({ children }) => <ul style={{ margin: "0.45rem 0", paddingLeft: "1.2rem", color: "#111827" }}>{children}</ul>,
           ol: ({ children }) => <ol style={{ margin: "0.45rem 0", paddingLeft: "1.2rem", color: "#111827" }}>{children}</ol>,
           li: ({ children }) => <li style={{ margin: "0.2rem 0", color: "#111827" }}>{children}</li>,
-          code: ({ children }) => <code style={{ background: "#f1f5f9", color: "#0f172a", padding: "0.1rem 0.25rem", borderRadius: 4 }}>{children}</code>,
-          pre: ({ children }) => <pre style={{ background: "#f8fafc", color: "#0f172a", border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.85rem", overflowX: "auto" }}>{children}</pre>,
+          code: ({ children }) => <code style={{ background: "#f1f5f9", color: "#0f172a", padding: "0.1rem 0.25rem", borderRadius: 4, fontSize: "0.98em" }}>{children}</code>,
+          pre: ({ children }) => <pre style={{ background: "#f8fafc", color: "#0f172a", border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.95rem 1rem", overflowX: "auto", fontSize: "0.98rem", lineHeight: 1.6 }}>{children}</pre>,
           img: ({ src, alt }) => <img src={assetUrls.get(src ?? "") ?? src ?? ""} alt={alt ?? ""} style={{ maxWidth: "100%", borderRadius: 8, border: "1px solid #cbd5e1", background: "#f8fafc", padding: "0.35rem" }} />,
           table: ({ children }) => <table style={{ width: "100%", borderCollapse: "collapse", margin: "0.7rem 0", color: "#111827" }}>{children}</table>,
-          th: ({ children }) => <th style={{ textAlign: "left", borderBottom: "1px solid #94a3b8", padding: "0.45rem", color: "#0f172a" }}>{children}</th>,
-          td: ({ children }) => <td style={{ borderBottom: "1px solid #cbd5e1", padding: "0.45rem", verticalAlign: "top", color: "#111827" }}>{children}</td>,
+          th: ({ children }) => <th style={{ textAlign: "left", borderBottom: "1px solid #94a3b8", padding: "0.55rem 0.6rem", color: "#0f172a", fontSize: "0.98rem" }}>{children}</th>,
+          td: ({ children }) => <td style={{ borderBottom: "1px solid #cbd5e1", padding: "0.55rem 0.6rem", verticalAlign: "top", color: "#111827", fontSize: "0.98rem" }}>{children}</td>,
           a: ({ href, children }) => <a href={reportAnchorForLink(href)} style={{ color: "#0f766e" }}>{children}</a>,
         }}
       >
@@ -2068,13 +2068,27 @@ function TestManagerInner({ config }: ModuleProps) {
     <div style={{ height: "100%", minHeight: 0, display: "grid", gridTemplateRows: "auto auto auto 1fr", background: C.bg, color: C.text, fontFamily: "\"Segoe UI\", \"Aptos\", sans-serif" }}>
       <style>{`
         @media print {
+          @page {
+            size: auto;
+            margin: 0.45in;
+          }
           body * { visibility: hidden !important; }
           .test-manager-print-root, .test-manager-print-root * { visibility: visible !important; }
-          .test-manager-print-root { position: absolute !important; inset: 0 !important; width: auto !important; height: auto !important; overflow: visible !important; background: white !important; color: #111827 !important; }
+          .test-manager-print-root { position: absolute !important; inset: 0 !important; width: auto !important; height: auto !important; overflow: visible !important; background: white !important; color: #111827 !important; padding: 0 !important; margin: 0 !important; }
           .test-manager-print-root * { color-adjust: exact !important; print-color-adjust: exact !important; -webkit-print-color-adjust: exact !important; }
           .test-manager-print-actions { display: none !important; }
           .test-manager-print-page { break-before: page; }
           .test-manager-print-root pre { white-space: pre-wrap !important; }
+          .test-manager-print-article {
+            max-width: none !important;
+            width: 100% !important;
+            margin: 0 !important;
+            border: none !important;
+            border-radius: 0 !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            background: white !important;
+          }
         }
       `}</style>
       <header style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, background: C.header, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "1rem", flexWrap: "wrap" }}>
@@ -2563,21 +2577,21 @@ function TestManagerInner({ config }: ModuleProps) {
         </div>
       ) : null}
       {printReportOpen && definition && reportPages && activeRun ? (
-        <div className="test-manager-print-root" style={{ position: "fixed", inset: 0, zIndex: 60, overflow: "auto", background: "#f8fafc", color: "#111827", padding: "1.25rem" }}>
-          <div className="test-manager-print-actions" style={{ position: "sticky", top: 0, zIndex: 2, display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", padding: "0.75rem 0", background: "#f8fafc" }}>
+        <div className="test-manager-print-root" style={{ position: "fixed", inset: 0, zIndex: 60, overflow: "auto", background: "#eef2f7", color: "#111827", padding: "0.2rem" }}>
+          <div className="test-manager-print-actions" style={{ position: "sticky", top: 0, zIndex: 2, display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", padding: "0.6rem 0.6rem 0.8rem", background: "#eef2f7" }}>
             <div style={{ fontWeight: 800 }}>Print Report</div>
             <div style={{ display: "flex", gap: "0.5rem" }}>
               <button onClick={() => window.print()} style={{ ...buttonStyle("primary"), borderColor: "#0f766e", background: "#0f766e", color: "white" }}>Print / Save PDF</button>
               <button onClick={() => setPrintReportOpen(false)} style={{ ...buttonStyle(), color: "#111827", borderColor: "#cbd5e1" }}>Close</button>
             </div>
           </div>
-          <article style={{ maxWidth: 980, margin: "0 auto", background: "white", border: "1px solid #e5e7eb", borderRadius: 12, padding: "1.2rem 1.4rem", boxShadow: "0 16px 50px rgba(15,23,42,0.12)" }}>
-            <h1 style={{ marginTop: 0 }}>{getProgramTitle(definition, config)} Report</h1>
-            <p style={{ color: "#374151" }}><strong>Run:</strong> {activeRun.label}<br /><strong>Generated:</strong> {formatDate(nowIso())}</p>
+          <article className="test-manager-print-article" style={{ width: "calc(100vw - 0.4rem)", maxWidth: "none", margin: "0 auto 0.5rem", background: "white", border: "1px solid #dbe4ee", borderRadius: 8, padding: "1rem 1.1rem", boxShadow: "0 8px 24px rgba(15,23,42,0.06)", boxSizing: "border-box", fontSize: "1.05rem", lineHeight: 1.65 }}>
+            <h1 style={{ marginTop: 0, marginBottom: "0.6rem", fontSize: "2rem", lineHeight: 1.2 }}>{getProgramTitle(definition, config)} Report</h1>
+            <p style={{ color: "#374151", fontSize: "1rem", lineHeight: 1.6 }}><strong>Run:</strong> {activeRun.label}<br /><strong>Generated:</strong> {formatDate(nowIso())}</p>
             {definition.programAssets.length > 0 ? (
               <section style={{ marginBottom: "1.5rem", paddingBottom: "1.5rem", borderBottom: "1px solid #e5e7eb" }}>
-                <h2 style={{ color: "#0f172a", fontSize: "1.2rem" }}>Program Overview</h2>
-                {getProgramDescription(definition) ? <p style={{ color: "#374151", lineHeight: 1.65 }}>{getProgramDescription(definition)}</p> : null}
+                <h2 style={{ color: "#0f172a", fontSize: "1.45rem", lineHeight: 1.25 }}>Program Overview</h2>
+                {getProgramDescription(definition) ? <p style={{ color: "#374151", lineHeight: 1.7, fontSize: "1.02rem" }}>{getProgramDescription(definition)}</p> : null}
                 <div style={{ display: "grid", gap: "1rem", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", marginTop: "1rem" }}>
                   {definition.programAssets.map((asset) => (
                     <div key={asset.id} style={{ borderRadius: 8, overflow: "hidden", border: "1px solid #e5e7eb" }}>
@@ -2586,7 +2600,7 @@ function TestManagerInner({ config }: ModuleProps) {
                       ) : (
                         <img src={asset.content} alt={asset.label} style={{ maxWidth: "100%", display: "block" }} />
                       )}
-                      <div style={{ padding: "0.35rem 0.5rem", background: "#f8fafc", fontSize: "0.76rem", color: "#64748b", textAlign: "center" }}>{asset.label}</div>
+                      <div style={{ padding: "0.45rem 0.6rem", background: "#f8fafc", fontSize: "0.9rem", color: "#64748b", textAlign: "center" }}>{asset.label}</div>
                     </div>
                   ))}
                 </div>

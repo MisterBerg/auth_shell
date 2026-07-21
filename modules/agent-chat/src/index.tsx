@@ -3,6 +3,7 @@ import type { CSSProperties, KeyboardEvent, MouseEvent as ReactMouseEvent } from
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { parse as parseYaml } from "yaml";
 import type {
   AssetRecord,
   ChildSlot,
@@ -531,8 +532,8 @@ const MODEL_OPTIONS: Array<{ group: string; options: ModelOption[] }> = [
         price: "Input $2.50 / Cached $0.25 / Output $15.00 per 1M",
       },
       {
-        id: "gpt-5-codex",
-        label: "GPT-5-Codex - coding agent",
+        id: "gpt-5-Agent",
+        label: "GPT-5-Agent - coding agent",
         price: "Input $1.25 / Cached $0.125 / Output $10.00 per 1M",
       },
     ],
@@ -569,7 +570,7 @@ const MODEL_OPTIONS: Array<{ group: string; options: ModelOption[] }> = [
   },
 ] as const;
 const FLAT_MODEL_OPTIONS = MODEL_OPTIONS.flatMap((group) => group.options);
-const DEFAULT_TITLE = "Codex Chat";
+const DEFAULT_TITLE = "Agent Chat";
 const TOOL_ITERATION_LIMIT = 20;
 const BROWSER_CONTEXT_ITEM_LIMIT = 18;
 const BROWSER_CONTEXT_CHAR_BUDGET = 24000;
@@ -580,7 +581,7 @@ const DEFAULT_PROMPT = [
   "By default, treat 'the app', 'the webapp', 'app data', 'documentation here', and similar phrases as referring to the active project configuration, project assets, and registered resources inside the web app.",
   "Prefer project assets, registered resources, and root-config information before searching the local bridge workspace unless the user explicitly says workspace, local files, repo, filesystem, or disk, or recent conversation is clearly about local workspace operations.",
   "Prefer module-native tools for task tracker, work manager, test manager, documentation, markdown, document-viewer, links, and webview data when they are available instead of editing their backing files indirectly.",
-  "For test manager slots: use get_test_manager_spec to read the current YAML spec before proposing changes, use get_test_manager_run_summary to understand test progress, and use set_test_manager_spec to write an updated spec after the user confirms — never edit test spec files indirectly through the bridge.",
+  "For test manager slots: start with summarize_test_manager_spec or get_test_manager_spec to understand the current YAML, use get_test_manager_run_summary to understand test progress, use validate_test_manager_spec on any proposed rewrite before writing, and only then use set_test_manager_spec after the user confirms. Never edit test spec files indirectly through the bridge.",
   "Use shell commands only when no better dedicated tool is available, and pay attention to command failures.",
   "Prefer the managed Python tools for parsing, transformations, text extraction, and small file-oriented programs instead of shell-embedded Python.",
   "Only install Python packages through the dedicated dependency installer, and only when a missing dependency blocks the task.",
@@ -2220,13 +2221,53 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     name: "get_test_manager_spec",
-    description: "Read the YAML test specification for a test-manager slot. Returns the raw YAML text. Call this before proposing any changes so you understand the existing structure, linked values, and procedure definitions.",
+    description: "Read the YAML test specification for a test-manager slot. Returns the raw YAML text. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Call this before proposing changes so you understand the existing structure, linked values, and procedure definitions.",
     parameters: {
       type: "object",
       properties: {
-        slot_id: { type: "string", description: "The slot ID of the test-manager instance." },
+        slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+        slotPath: {
+          type: ["array", "null"],
+          items: { type: "string" },
+          minItems: 1,
+          description: "Full slot path to the test-manager instance, or null when using slot_id.",
+        },
       },
-      required: ["slot_id"],
+      required: ["slot_id", "slotPath"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "summarize_test_manager_spec",
+    description: "Inspect the current YAML spec for a test-manager slot and return a structured summary with counts, key IDs, and structural issues. Use this before editing when you need to understand the shape of the spec rather than reading the raw YAML directly.",
+    parameters: {
+      type: "object",
+      properties: {
+        slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+        slotPath: {
+          type: ["array", "null"],
+          items: { type: "string" },
+          minItems: 1,
+          description: "Full slot path to the test-manager instance, or null when using slot_id.",
+        },
+      },
+      required: ["slot_id", "slotPath"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "validate_test_manager_spec",
+    description: "Validate and summarize a candidate YAML test-manager spec before writing it. Returns parse/structure issues and a compact summary so you can catch problems before calling set_test_manager_spec.",
+    parameters: {
+      type: "object",
+      properties: {
+        yaml: { type: "string", description: "The candidate full YAML content of the test specification." },
+      },
+      required: ["yaml"],
       additionalProperties: false,
     },
     strict: true,
@@ -2234,14 +2275,20 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     name: "set_test_manager_spec",
-    description: "Write a complete YAML test specification for a test-manager slot, replacing the current spec. Only call this after discussing the proposed changes with the user and receiving explicit confirmation. The test-manager module reflects changes on next reload.",
+    description: "Write a complete YAML test specification for a test-manager slot, replacing the current spec. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Only call this after discussing the proposed changes with the user and receiving explicit confirmation. The test-manager module reflects changes on next reload.",
     parameters: {
       type: "object",
       properties: {
-        slot_id: { type: "string", description: "The slot ID of the test-manager instance." },
+        slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+        slotPath: {
+          type: ["array", "null"],
+          items: { type: "string" },
+          minItems: 1,
+          description: "Full slot path to the test-manager instance, or null when using slot_id.",
+        },
         yaml: { type: "string", description: "The full YAML content of the test specification." },
       },
-      required: ["slot_id", "yaml"],
+      required: ["slot_id", "slotPath", "yaml"],
       additionalProperties: false,
     },
     strict: true,
@@ -2249,13 +2296,19 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     name: "get_test_manager_run_summary",
-    description: "Read the current run state for a test-manager slot: active run, test status counts, and excluded test counts across all runs. Use this to understand progress before suggesting what to add or run next.",
+    description: "Read the current run state for a test-manager slot: active run, test status counts, and excluded test counts across all runs. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Use this to understand progress before suggesting what to add or run next.",
     parameters: {
       type: "object",
       properties: {
-        slot_id: { type: "string", description: "The slot ID of the test-manager instance." },
+        slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+        slotPath: {
+          type: ["array", "null"],
+          items: { type: "string" },
+          minItems: 1,
+          description: "Full slot path to the test-manager instance, or null when using slot_id.",
+        },
       },
-      required: ["slot_id"],
+      required: ["slot_id", "slotPath"],
       additionalProperties: false,
     },
     strict: true,
@@ -3426,6 +3479,166 @@ function getTestManagerStorage(slotId: string, configBucket: string, configPath:
     bucket: configBucket,
     definitionKey: `${basePrefix}/definition.yaml`,
     resultsKey: `${basePrefix}/results.json`,
+  };
+}
+
+function resolveTestManagerSlotRef(
+  rootConfig: ModuleConfig,
+  ref: { slot_id?: string | null; slotPath?: string[] | null },
+): { slotId: string; slotPath: string[] } {
+  if (Array.isArray(ref.slotPath) && ref.slotPath.length > 0) {
+    const slot = requireModuleAtPath(rootConfig, ref.slotPath, "module-test-manager");
+    return { slotId: slot.slotId, slotPath: ref.slotPath };
+  }
+  const slotId = typeof ref.slot_id === "string" ? ref.slot_id.trim() : "";
+  if (!slotId) {
+    throw new Error("Either slot_id or slotPath is required.");
+  }
+  return { slotId, slotPath: [slotId] };
+}
+
+function inspectTestManagerYaml(text: string) {
+  const issues: string[] = [];
+  const warnings: string[] = [];
+
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(text);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      issues: [`YAML parse failed: ${message}`],
+      warnings,
+      summary: null,
+    };
+  }
+
+  const root = (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed as Record<string, unknown> : null;
+  if (!root) {
+    return {
+      ok: false,
+      issues: ["Top-level YAML document must be an object/map."],
+      warnings,
+      summary: null,
+    };
+  }
+
+  const program = (root["program"] && typeof root["program"] === "object" && !Array.isArray(root["program"]))
+    ? root["program"] as Record<string, unknown>
+    : null;
+  if (!program) {
+    issues.push("Missing top-level 'program' object.");
+  }
+
+  const linkedValues = (root["linked_values"] && typeof root["linked_values"] === "object" && !Array.isArray(root["linked_values"]))
+    ? root["linked_values"] as Record<string, unknown>
+    : {};
+  const inputFields = Array.isArray(root["input_fields"]) ? root["input_fields"] as unknown[] : [];
+  const testDefinedFields = Array.isArray(root["test_defined_fields"]) ? root["test_defined_fields"] as unknown[] : [];
+  const steps = (root["steps"] && typeof root["steps"] === "object" && !Array.isArray(root["steps"]))
+    ? root["steps"] as Record<string, unknown>
+    : {};
+  const procedures = (root["procedures"] && typeof root["procedures"] === "object" && !Array.isArray(root["procedures"]))
+    ? root["procedures"] as Record<string, unknown>
+    : {};
+  const diagrams = (root["diagrams"] && typeof root["diagrams"] === "object" && !Array.isArray(root["diagrams"]))
+    ? root["diagrams"] as Record<string, unknown>
+    : {};
+  const testGroups = Array.isArray(root["test_groups"]) ? root["test_groups"] as unknown[] : [];
+
+  if (!Array.isArray(root["test_groups"])) {
+    issues.push("Missing top-level 'test_groups' array.");
+  }
+
+  const groupIds = new Set<string>();
+  const testIds = new Set<string>();
+  let totalTests = 0;
+
+  for (const [groupIndex, groupValue] of testGroups.entries()) {
+    const group = (groupValue && typeof groupValue === "object" && !Array.isArray(groupValue))
+      ? groupValue as Record<string, unknown>
+      : null;
+    if (!group) {
+      issues.push(`test_groups[${groupIndex}] must be an object.`);
+      continue;
+    }
+    const groupId = typeof group["id"] === "string" ? group["id"].trim() : "";
+    const groupTitle = typeof group["title"] === "string" ? group["title"].trim() : "";
+    if (!groupId) issues.push(`test_groups[${groupIndex}] is missing id.`);
+    if (!groupTitle) warnings.push(`test_groups[${groupIndex}] is missing title.`);
+    if (groupId) {
+      if (groupIds.has(groupId)) issues.push(`Duplicate test group id "${groupId}".`);
+      groupIds.add(groupId);
+    }
+
+    const tests = Array.isArray(group["tests"]) ? group["tests"] as unknown[] : [];
+    if (!Array.isArray(group["tests"])) {
+      issues.push(`test group "${groupId || groupIndex}" is missing tests array.`);
+      continue;
+    }
+
+    for (const [testIndex, testValue] of tests.entries()) {
+      totalTests += 1;
+      const test = (testValue && typeof testValue === "object" && !Array.isArray(testValue))
+        ? testValue as Record<string, unknown>
+        : null;
+      if (!test) {
+        issues.push(`test_groups[${groupIndex}].tests[${testIndex}] must be an object.`);
+        continue;
+      }
+      const testId = typeof test["id"] === "string" ? test["id"].trim() : "";
+      const testTitle = typeof test["title"] === "string" ? test["title"].trim() : "";
+      if (!testId) issues.push(`test_groups[${groupIndex}].tests[${testIndex}] is missing id.`);
+      if (!testTitle) warnings.push(`test "${testId || `${groupIndex}.${testIndex}`}" is missing title.`);
+      if (testId) {
+        if (testIds.has(testId)) issues.push(`Duplicate test id "${testId}".`);
+        testIds.add(testId);
+      }
+    }
+  }
+
+  for (const [fieldBucket, fields] of [["input_fields", inputFields], ["test_defined_fields", testDefinedFields]] as const) {
+    const ids = new Set<string>();
+    for (const [index, value] of fields.entries()) {
+      const field = (value && typeof value === "object" && !Array.isArray(value)) ? value as Record<string, unknown> : null;
+      if (!field) {
+        issues.push(`${fieldBucket}[${index}] must be an object.`);
+        continue;
+      }
+      const id = typeof field["id"] === "string" ? field["id"].trim() : "";
+      if (!id) {
+        issues.push(`${fieldBucket}[${index}] is missing id.`);
+        continue;
+      }
+      if (ids.has(id)) issues.push(`Duplicate field id "${id}" in ${fieldBucket}.`);
+      ids.add(id);
+    }
+  }
+
+  const programAssets = Array.isArray(program?.["pre_test_assets"]) ? program?.["pre_test_assets"] as unknown[] : [];
+
+  return {
+    ok: issues.length === 0,
+    issues,
+    warnings,
+    summary: {
+      programName: typeof program?.["name"] === "string" ? program["name"] : typeof program?.["title"] === "string" ? program["title"] : null,
+      counts: {
+        linkedValueSets: Object.keys(linkedValues).length,
+        inputFields: inputFields.length,
+        testDefinedFields: testDefinedFields.length,
+        steps: Object.keys(steps).length,
+        procedures: Object.keys(procedures).length,
+        diagrams: Object.keys(diagrams).length,
+        programAssets: programAssets.length,
+        testGroups: testGroups.length,
+        tests: totalTests,
+      },
+      groupIds: [...groupIds],
+      testIdsSample: [...testIds].slice(0, 20),
+      topLevelKeys: Object.keys(root),
+    },
   };
 }
 
@@ -7045,52 +7258,95 @@ async function executeTool(args: {
     }
 
     case "get_test_manager_spec": {
-      const parsed = parseToolArgs<{ slot_id: string }>(toolCall.arguments);
-      const storage = getTestManagerStorage(parsed.slot_id, configBucket, configPath);
+      const parsed = parseToolArgs<{ slot_id?: string; slotPath?: string[] }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const resolved = resolveTestManagerSlotRef(context.rootConfig, parsed);
+      const storage = getTestManagerStorage(resolved.slotId, configBucket, configPath);
       const yaml = await readOptionalText(getS3Client, storage.bucket, storage.definitionKey);
       if (!yaml) {
         return {
           output: JSON.stringify({ ok: false, error: "No spec found for this slot. The test-manager may not have a definition.yaml yet." }),
-          toolMessage: `No test spec found for slot "${parsed.slot_id}".`,
+          toolMessage: `No test spec found for slot "${resolved.slotPath.join(" / ")}".`,
         };
       }
       return {
         output: yaml,
-        toolMessage: `Read test-manager spec for slot "${parsed.slot_id}" (${yaml.length} chars).`,
+        toolMessage: `Read test-manager spec for slot "${resolved.slotPath.join(" / ")}" (${yaml.length} chars).`,
+      };
+    }
+
+    case "summarize_test_manager_spec": {
+      const parsed = parseToolArgs<{ slot_id?: string; slotPath?: string[] }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const resolved = resolveTestManagerSlotRef(context.rootConfig, parsed);
+      const storage = getTestManagerStorage(resolved.slotId, configBucket, configPath);
+      const yaml = await readOptionalText(getS3Client, storage.bucket, storage.definitionKey);
+      if (!yaml) {
+        return {
+          output: JSON.stringify({ ok: false, error: "No spec found for this slot. The test-manager may not have a definition.yaml yet." }),
+          toolMessage: `No test spec found for slot "${resolved.slotPath.join(" / ")}".`,
+        };
+      }
+      const inspection = inspectTestManagerYaml(yaml);
+      return {
+        output: JSON.stringify(inspection, null, 2),
+        toolMessage: `Summarized test-manager spec for slot "${resolved.slotPath.join(" / ")}".`,
+      };
+    }
+
+    case "validate_test_manager_spec": {
+      const parsed = parseToolArgs<{ yaml: string }>(toolCall.arguments);
+      const inspection = inspectTestManagerYaml(parsed.yaml);
+      return {
+        output: JSON.stringify(inspection, null, 2),
+        toolMessage: inspection.ok
+          ? "Validated candidate test-manager spec."
+          : `Candidate test-manager spec has ${inspection.issues.length} issue${inspection.issues.length === 1 ? "" : "s"}.`,
       };
     }
 
     case "set_test_manager_spec": {
-      const parsed = parseToolArgs<{ slot_id: string; yaml: string }>(toolCall.arguments);
+      const parsed = parseToolArgs<{ slot_id?: string; slotPath?: string[]; yaml: string }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const resolved = resolveTestManagerSlotRef(context.rootConfig, parsed);
       const trimmed = parsed.yaml.trim();
       if (!trimmed) {
         return {
           output: JSON.stringify({ ok: false, error: "YAML content is empty." }),
-          toolMessage: `Refused to write empty spec for slot "${parsed.slot_id}".`,
+          toolMessage: `Refused to write empty spec for slot "${resolved.slotPath.join(" / ")}".`,
         };
       }
       if (!trimmed.startsWith("program:") && !trimmed.includes("\nprogram:")) {
         return {
           output: JSON.stringify({ ok: false, error: "Content does not appear to be a valid test-manager spec (missing top-level 'program:' key)." }),
-          toolMessage: `Refused to write spec for slot "${parsed.slot_id}": missing 'program:' key.`,
+          toolMessage: `Refused to write spec for slot "${resolved.slotPath.join(" / ")}": missing 'program:' key.`,
         };
       }
-      const storage = getTestManagerStorage(parsed.slot_id, configBucket, configPath);
+      const inspection = inspectTestManagerYaml(trimmed);
+      if (!inspection.ok) {
+        return {
+          output: JSON.stringify({ ok: false, error: "Candidate YAML did not pass test-manager validation.", inspection }, null, 2),
+          toolMessage: `Refused to write spec for slot "${resolved.slotPath.join(" / ")}": validation found ${inspection.issues.length} issue${inspection.issues.length === 1 ? "" : "s"}.`,
+        };
+      }
+      const storage = getTestManagerStorage(resolved.slotId, configBucket, configPath);
       await writeTextRaw(getS3Client, storage.bucket, storage.definitionKey, trimmed + "\n", "text/yaml");
       return {
         output: JSON.stringify({ ok: true, bytesWritten: trimmed.length, key: storage.definitionKey }),
-        toolMessage: `Wrote test-manager spec for slot "${parsed.slot_id}" (${trimmed.length} chars). Reload the module to pick up changes.`,
+        toolMessage: `Wrote test-manager spec for slot "${resolved.slotPath.join(" / ")}" (${trimmed.length} chars). Reload the module to pick up changes.`,
       };
     }
 
     case "get_test_manager_run_summary": {
-      const parsed = parseToolArgs<{ slot_id: string }>(toolCall.arguments);
-      const storage = getTestManagerStorage(parsed.slot_id, configBucket, configPath);
+      const parsed = parseToolArgs<{ slot_id?: string; slotPath?: string[] }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const resolved = resolveTestManagerSlotRef(context.rootConfig, parsed);
+      const storage = getTestManagerStorage(resolved.slotId, configBucket, configPath);
       const workspaceText = await readOptionalText(getS3Client, storage.bucket, storage.resultsKey);
       if (!workspaceText) {
         return {
           output: JSON.stringify({ ok: true, hasData: false, message: "No run data yet — no tests have been executed for this slot." }),
-          toolMessage: `No run data found for test-manager slot "${parsed.slot_id}".`,
+          toolMessage: `No run data found for test-manager slot "${resolved.slotPath.join(" / ")}".`,
         };
       }
       const workspace = JSON.parse(workspaceText) as {
@@ -7120,7 +7376,7 @@ async function executeTool(args: {
       });
       return {
         output: JSON.stringify({ ok: true, totalRuns: runs.length, activeRunId: workspace.activeRunId ?? null, runs: runSummaries }, null, 2),
-        toolMessage: `Read run summary for test-manager slot "${parsed.slot_id}": ${runs.length} run${runs.length === 1 ? "" : "s"}.`,
+        toolMessage: `Read run summary for test-manager slot "${resolved.slotPath.join(" / ")}": ${runs.length} run${runs.length === 1 ? "" : "s"}.`,
       };
     }
 
@@ -8116,7 +8372,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
         organizerSummary,
         "Work scopes are the durable graph layer for broad-to-narrow work context. Each scope can have an upstream parentScopeId and downstream child scopes. With little context, start with list_work_scope_index or search_work_scope_graph, then call get_work_scope_context on the best candidate.",
         "Organizer memory is available through get_organizer_overview, list_work_scope_index, search_work_scope_graph, get_work_scope_context, list_work_scopes, create_work_scopes, update_work_scope, archive_work_scope, list_organizer_items, create_organizer_items, update_organizer_item, delete_organizer_item, batch_update_organizer_items, mark_organizer_items_complete, and upsert_sweep_review. Use scopes for work context and organizer items for small notes, todos, reminders, follow-ups, and waiting-on items.",
-        "Test manager data is available through three callable tools: get_test_manager_spec (read the full YAML spec for a slot), set_test_manager_spec (write a replacement spec after user confirmation), and get_test_manager_run_summary (read run progress and status counts). Pass the slot's id string as slot_id. These are direct callable functions — not metadata — invoke them by name.",
+        "Test manager data is available through five callable tools: summarize_test_manager_spec (inspect the current spec shape), get_test_manager_spec (read the raw YAML), validate_test_manager_spec (check a proposed YAML rewrite before writing), set_test_manager_spec (write a replacement spec after user confirmation), and get_test_manager_run_summary (read run progress and status counts). Prefer summarize plus validate before any rewrite. Prefer the full slotPath array like other module APIs; slot_id is still accepted as a shortcut. These are direct callable functions — not metadata — invoke them by name.",
         user?.email ? `Signed-in user: ${user.email}.` : undefined,
       ].filter((value): value is string => Boolean(value));
 
@@ -8493,7 +8749,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
 
             <div style={{ minHeight: 0, overflow: "auto", border: `1px solid ${C.border}`, borderRadius: 10, background: "#071321" }}>
               {scopeColumns.length === 0 ? (
-                <div style={{ padding: "1rem", fontSize: "0.84rem", color: C.muted }}>No work scopes yet. Ask Codex to create scope nodes or queue organizer graph operations through the local bridge.</div>
+                <div style={{ padding: "1rem", fontSize: "0.84rem", color: C.muted }}>No work scopes yet. Ask Agent to create scope nodes or queue organizer graph operations through the local bridge.</div>
               ) : (
                 <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start", minWidth: Math.max(900, scopeColumns.length * 270), padding: "1rem" }}>
                   {scopeColumns.map((column) => (
@@ -8876,7 +9132,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
       <div ref={scrollRef} style={{ minHeight: 0, overflowY: "auto", overflowX: "hidden", padding: "1rem", display: "grid", gap: "0.8rem", alignContent: messages.length ? "start" : "center" }}>
         {messages.length === 0 ? (
           <div style={{ maxWidth: 720, margin: "0 auto", padding: "1.2rem 1.25rem", background: C.panel, border: `1px solid ${C.border}`, borderRadius: 16 }}>
-            <div style={{ fontSize: "0.95rem", fontWeight: 700, marginBottom: "0.45rem" }}>Workspace-side Codex test module</div>
+            <div style={{ fontSize: "0.95rem", fontWeight: 700, marginBottom: "0.45rem" }}>Workspace-side Agent test module</div>
             <div style={{ fontSize: "0.82rem", lineHeight: 1.6, color: C.muted }}>
               This version can inspect the workspace, browse assets and resources, manage organizer memory, list published modules, add or update slots, and use a local bridge for files, commands, and PDF analysis.
             </div>
@@ -8886,7 +9142,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
             <div key={message.id} style={{ display: "flex", justifyContent: message.role === "user" ? "flex-end" : "flex-start", minWidth: 0, width: "100%" }}>
               <div style={bubbleStyle(message.role)}>
                 <div style={{ fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.08em", color: C.muted, marginBottom: "0.3rem" }}>
-                  {message.role === "user" ? "You" : message.role === "assistant" ? "Codex" : message.role === "tool" ? "Tool" : "Error"}
+                  {message.role === "user" ? "You" : message.role === "assistant" ? "Agent" : message.role === "tool" ? "Tool" : "Error"}
                 </div>
                 <MessageBody role={message.role} text={message.text} />
               </div>
@@ -8897,7 +9153,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
           <div style={{ display: "flex", justifyContent: "flex-start" }}>
             <div style={bubbleStyle("assistant")}>
               <div style={{ fontSize: "0.7rem", textTransform: "uppercase", letterSpacing: "0.08em", color: C.muted, marginBottom: "0.3rem" }}>
-                Codex
+                Agent
               </div>
               <div style={{ fontSize: "0.86rem", lineHeight: 1.6, color: C.muted }}>Thinking and possibly using tools...</div>
             </div>
@@ -8926,7 +9182,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
             value={composer}
             onChange={(event) => setComposer(event.currentTarget.value)}
             onKeyDown={handleComposerKeyDown}
-            placeholder="Ask Codex to inspect the workspace, remember a follow-up, sweep your open items, or make a concrete module/config change..."
+            placeholder="Ask Agent to inspect the workspace, remember a follow-up, sweep your open items, or make a concrete module/config change..."
             rows={3}
             style={{ ...inputStyle, resize: "none", minHeight: 84 }}
           />
