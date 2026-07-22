@@ -11,7 +11,7 @@
     "modules/document-viewer": "1749d8912f4307158c35675ffa1de71596acddc046592d9d758f5c1952b79157",
     "modules/documentation-viewer": "e694bbbd627643420200ff89541417defd53395321568908aa4ee712ed148c55",
     "modules/links": "86c90a66d75a1cc6029dd6a12fc6adac234c9a5fb2e2f9dac1cfc8a92312f3a8",
-    "modules/test-manager": "1f83b8e90f66648f3b3d29b628f593aa8d1c2a93036b77ed209683f2fd455477",
+    "modules/test-manager": "04684b3718c432f7d612aab805217f092369c806a9d58a82f3ecd10f57248617",
     "modules/task-tracker": "0f787b3a81dd09e34cf247bf8e8e977fcf3a032379ab6201c56892a96b2330e3",
     "modules/work-manager": "20a0ee509f8c71454c17b538b201665c7d3e0ea63528392647e83bcf3ad6fe3a",
     "modules/kicad-board-viewer": "8182c85010f795f91d193737d0d4cf2cb1233c2c79f4e8d67d79a72d1795b20e",

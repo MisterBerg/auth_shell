@@ -1,1 +1,1 @@
-{"root":["./src/index.tsx"],"version":"5.9.3"}
+{"root":["./src/aws-s3-request-presigner.d.ts","./src/index.tsx"],"version":"5.9.3"}

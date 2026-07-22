@@ -1,5 +1,6 @@
 import React, { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
 import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { parse as parseYaml } from "yaml";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -219,6 +220,21 @@ type ReportPages = {
   assets: Record<string, { content: string; contentType: string }>;
 };
 
+type ReportArtifactContext = {
+  test: ResolvedTest;
+  fieldId: string | null;
+  artifact: ArtifactRef;
+};
+
+type ReportGenerationOptions = {
+  detailHref?: (test: ResolvedTest) => string;
+  backToSummaryHref?: string;
+  artifactHref?: (context: ReportArtifactContext) => string;
+  notes?: string[];
+};
+
+type ZipFileContent = string | Uint8Array;
+
 class TestManagerBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   state: { error: Error | null } = { error: null };
 
@@ -312,7 +328,30 @@ async function readOptionalText(s3: S3Client, bucket: string, key: string): Prom
   }
 }
 
+async function readOptionalBytes(s3: S3Client, bucket: string, key: string): Promise<Uint8Array | null> {
+  try {
+    const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    return response.Body ? await response.Body.transformToByteArray() : null;
+  } catch (error: unknown) {
+    const err = error as { name?: string; $metadata?: { httpStatusCode?: number } };
+    if (err.name === "NoSuchKey" || err.name === "NotFound" || err.$metadata?.httpStatusCode === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 async function writeText(s3: S3Client, bucket: string, key: string, body: string, contentType: string): Promise<void> {
+  await s3.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: body,
+    ContentType: contentType,
+    CacheControl: "no-store",
+  }));
+}
+
+async function writeBytes(s3: S3Client, bucket: string, key: string, body: Uint8Array, contentType: string): Promise<void> {
   await s3.send(new PutObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -1245,8 +1284,13 @@ function downloadBlob(filename: string, blob: Blob): void {
   URL.revokeObjectURL(url);
 }
 
-function markdownArtifactLink(artifact: ArtifactRef): string {
-  return `[${artifact.name}](s3://${artifact.bucket}/${artifact.key})`;
+function artifactArchivePath(testId: string, artifact: ArtifactRef, fieldId?: string | null): string {
+  const area = fieldId ? `typed/${safeFileSegment(fieldId)}` : "supporting";
+  return `evidence/${safeFileSegment(testId)}/${area}/${safeFileSegment(artifact.id)}-${safeFileSegment(artifact.name)}`;
+}
+
+function markdownArtifactLink(label: string, href: string): string {
+  return `[${label}](${href})`;
 }
 
 function stepStatusLabel(result: StepResult | undefined): string {
@@ -1305,7 +1349,7 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
   return output;
 }
 
-function createZipBlob(files: Record<string, string>): Blob {
+function createZipBlob(files: Record<string, ZipFileContent>): Blob {
   const encoder = new TextEncoder();
   const localParts: Uint8Array[] = [];
   const centralParts: Uint8Array[] = [];
@@ -1314,7 +1358,7 @@ function createZipBlob(files: Record<string, string>): Blob {
 
   for (const [path, content] of Object.entries(files)) {
     const nameBytes = encoder.encode(path.replace(/^\/+/, ""));
-    const data = encoder.encode(content);
+    const data = typeof content === "string" ? encoder.encode(content) : content;
     const crc = crc32(data);
     const localHeader = concatBytes([
       u32(0x04034b50), u16(20), u16(0), u16(0), u16(stamp.time), u16(stamp.date),
@@ -1342,11 +1386,19 @@ function createZipBlob(files: Record<string, string>): Blob {
   return new Blob([buffer], { type: "application/zip" });
 }
 
-function generateReportPages(definition: TestDefinition, run: TestRun, tests: ResolvedTest[]): ReportPages {
+function generateReportPages(
+  definition: TestDefinition,
+  run: TestRun,
+  tests: ResolvedTest[],
+  options: ReportGenerationOptions = {},
+): ReportPages {
   const title = getProgramTitle(definition, { id: "", app: { bucket: "" } } as ModuleProps["config"]);
   const summary: string[] = [];
   const details: Record<string, string> = {};
   const assets: Record<string, { content: string; contentType: string }> = {};
+  const detailHref = options.detailHref ?? ((test: ResolvedTest) => `tests/${safeFileSegment(test.id)}.md`);
+  const artifactHref = options.artifactHref ?? ((context: ReportArtifactContext) => `s3://${context.artifact.bucket}/${context.artifact.key}`);
+  const backToSummaryHref = options.backToSummaryHref ?? "../report.md";
 
   summary.push(`# ${title} Report`);
   summary.push("");
@@ -1356,6 +1408,11 @@ function generateReportPages(definition: TestDefinition, run: TestRun, tests: Re
   summary.push(`- Run: ${escapeMarkdownCell(run.label)}`);
   summary.push(`- Generated On: ${escapeMarkdownCell(formatDate(nowIso()))}`);
   summary.push(`- Tests in Scope: ${tests.length}`);
+  if (options.notes?.length) {
+    for (const note of options.notes) {
+      summary.push(`- Note: ${escapeMarkdownCell(note)}`);
+    }
+  }
   summary.push("");
   if (definition.programAssets.length > 0) {
     summary.push("## Program Overview");
@@ -1378,7 +1435,7 @@ function generateReportPages(definition: TestDefinition, run: TestRun, tests: Re
 
   for (const test of tests) {
     const result = ensureResult(run, test);
-    summary.push(`| ${escapeMarkdownCell(test.id)} | ${escapeMarkdownCell(test.testGroupId)} | ${escapeMarkdownCell(result.status)} | ${escapeMarkdownCell(valueDisplay(test.definedValues.failure_mode))} | ${escapeMarkdownCell(valueDisplay(test.definedValues.target_module))} | [View](tests/${safeFileSegment(test.id)}.md) |`);
+    summary.push(`| ${escapeMarkdownCell(test.id)} | ${escapeMarkdownCell(test.testGroupId)} | ${escapeMarkdownCell(result.status)} | ${escapeMarkdownCell(valueDisplay(test.definedValues.failure_mode))} | ${escapeMarkdownCell(valueDisplay(test.definedValues.target_module))} | [View](${detailHref(test)}) |`);
 
     const detail: string[] = [];
     detail.push(`# Test Result: ${test.id}`);
@@ -1446,19 +1503,23 @@ function generateReportPages(definition: TestDefinition, run: TestRun, tests: Re
       detail.push("");
       for (const [fieldId, artifacts] of Object.entries(result.typedArtifacts)) {
         detail.push(`### ${humanize(fieldId)}`);
-        for (const artifact of artifacts) detail.push(`- ${markdownArtifactLink(artifact)}`);
+        for (const artifact of artifacts) {
+          detail.push(`- ${markdownArtifactLink(artifact.name, artifactHref({ test, fieldId, artifact }))}`);
+        }
         detail.push("");
       }
     }
     if (result.supportingArtifacts.length > 0) {
       detail.push("## Supporting Files");
       detail.push("");
-      for (const artifact of result.supportingArtifacts) detail.push(`- ${markdownArtifactLink(artifact)}`);
+      for (const artifact of result.supportingArtifacts) {
+        detail.push(`- ${markdownArtifactLink(artifact.name, artifactHref({ test, fieldId: null, artifact }))}`);
+      }
       detail.push("");
     }
     detail.push("## Navigation");
     detail.push("");
-    detail.push("- [Back to Report Summary](../report.md)");
+    detail.push(`- [Back to Report Summary](${backToSummaryHref})`);
     detail.push("");
     details[test.id] = detail.join("\n");
   }
@@ -1769,6 +1830,7 @@ function TestManagerInner({ config }: ModuleProps) {
   const [error, setError] = useState("");
   const [reportDialogOpen, setReportDialogOpen] = useState(false);
   const [printReportOpen, setPrintReportOpen] = useState(false);
+  const [reportArtifactLinks, setReportArtifactLinks] = useState<Record<string, string>>({});
 
   const resolvedTests = useMemo(() => definition ? buildResolvedTests(definition) : [], [definition]);
   const testsById = useMemo(() => new Map(resolvedTests.map((test) => [test.id, test])), [resolvedTests]);
@@ -2031,27 +2093,122 @@ function TestManagerInner({ config }: ModuleProps) {
     return Math.round((doneCount / includedTests.length) * 100);
   }, [activeRun, includedTests, user?.email]);
 
+  const reportArtifacts = useMemo(() => {
+    if (!activeRun) return [] as ArtifactRef[];
+    const deduped = new Map<string, ArtifactRef>();
+    for (const test of includedTests) {
+      const result = ensureResult(activeRun, test, user?.email);
+      for (const artifacts of Object.values(result.typedArtifacts)) {
+        for (const artifact of artifacts) deduped.set(artifact.id, artifact);
+      }
+      for (const artifact of result.supportingArtifacts) deduped.set(artifact.id, artifact);
+    }
+    return [...deduped.values()];
+  }, [activeRun, includedTests, user?.email]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (reportArtifacts.length === 0) {
+      setReportArtifactLinks({});
+      return;
+    }
+
+    void (async () => {
+      try {
+        const s3 = await getS3Client(storage.bucket);
+        const entries = await Promise.all(reportArtifacts.map(async (artifact) => {
+          const href = await getSignedUrl(
+            s3,
+            new GetObjectCommand({ Bucket: artifact.bucket, Key: artifact.key }),
+            { expiresIn: 60 * 60 * 24 * 7 },
+          );
+          return [artifact.id, href] as const;
+        }));
+        if (!cancelled) setReportArtifactLinks(Object.fromEntries(entries));
+      } catch {
+        if (!cancelled) setReportArtifactLinks({});
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [getS3Client, reportArtifacts, storage.bucket]);
+
   const reportPages = useMemo(() => {
     if (!definition || !activeRun) return null;
-    return generateReportPages(definition, activeRun, includedTests);
-  }, [activeRun, definition, includedTests]);
+    return generateReportPages(definition, activeRun, includedTests, {
+      artifactHref: ({ artifact }) => reportArtifactLinks[artifact.id] ?? `s3://${artifact.bucket}/${artifact.key}`,
+      notes: reportArtifacts.length > 0
+        ? ["Evidence links in the live report and PDF are time-limited access URLs and may expire after about 7 days."]
+        : undefined,
+    });
+  }, [activeRun, definition, includedTests, reportArtifactLinks, reportArtifacts.length]);
 
-  const buildReportFiles = useCallback((): Record<string, string> | null => {
-    if (!definition || !reportPages) return null;
-    return {
-      "report.md": reportPages.summary,
-      ...Object.fromEntries(Object.entries(reportPages.details).map(([testId, content]) => [`tests/${safeFileSegment(testId)}.md`, content])),
-      ...Object.fromEntries(Object.entries(reportPages.assets).map(([path, asset]) => [path, asset.content])),
-      "definition.yaml": activeRun?.definitionSnapshot ?? definition.sourceText,
+  const buildReportFiles = useCallback(async (): Promise<Record<string, ZipFileContent> | null> => {
+    if (!definition || !activeRun) return null;
+    const zipPages = generateReportPages(definition, activeRun, includedTests, {
+      artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
+    });
+    const files: Record<string, ZipFileContent> = {
+      "report.md": zipPages.summary,
+      ...Object.fromEntries(Object.entries(zipPages.details).map(([testId, content]) => [`tests/${safeFileSegment(testId)}.md`, content])),
+      ...Object.fromEntries(Object.entries(zipPages.assets).map(([path, asset]) => [path, asset.content])),
+      "definition.yaml": activeRun.definitionSnapshot ?? definition.sourceText,
       "workspace.json": JSON.stringify(workspace, null, 2),
     };
-  }, [activeRun, definition, reportPages, workspace]);
+
+    const manifest: Array<Record<string, string | number | null>> = [];
+    const s3 = await getS3Client(storage.bucket);
+    for (const test of includedTests) {
+      const result = ensureResult(activeRun, test, user?.email);
+      for (const [fieldId, artifacts] of Object.entries(result.typedArtifacts)) {
+        for (const artifact of artifacts) {
+          const archivePath = artifactArchivePath(test.id, artifact, fieldId);
+          const bytes = await readOptionalBytes(s3, artifact.bucket, artifact.key);
+          if (bytes) files[archivePath] = bytes;
+          manifest.push({
+            testId: test.id,
+            fieldId,
+            kind: artifact.kind,
+            name: artifact.name,
+            archivePath,
+            bucket: artifact.bucket,
+            key: artifact.key,
+            contentType: artifact.contentType ?? null,
+            sizeBytes: artifact.sizeBytes,
+          });
+        }
+      }
+      for (const artifact of result.supportingArtifacts) {
+        const archivePath = artifactArchivePath(test.id, artifact, null);
+        const bytes = await readOptionalBytes(s3, artifact.bucket, artifact.key);
+        if (bytes) files[archivePath] = bytes;
+        manifest.push({
+          testId: test.id,
+          fieldId: null,
+          kind: artifact.kind,
+          name: artifact.name,
+          archivePath,
+          bucket: artifact.bucket,
+          key: artifact.key,
+          contentType: artifact.contentType ?? null,
+          sizeBytes: artifact.sizeBytes,
+        });
+      }
+    }
+
+    files["evidence/manifest.json"] = JSON.stringify(manifest, null, 2);
+    return files;
+  }, [activeRun, definition, getS3Client, includedTests, storage.bucket, user?.email, workspace]);
 
   const downloadReportZip = useCallback(() => {
-    const files = buildReportFiles();
-    if (!files) return;
-    downloadBlob(`test-report-${safeFileSegment(storage.projectId)}.zip`, createZipBlob(files));
-    setReportDialogOpen(false);
+    void (async () => {
+      const files = await buildReportFiles();
+      if (!files) return;
+      downloadBlob(`test-report-${safeFileSegment(storage.projectId)}.zip`, createZipBlob(files));
+      setReportDialogOpen(false);
+    })();
   }, [buildReportFiles, storage.projectId]);
 
   const openReportPdf = useCallback(() => {
@@ -2567,7 +2724,7 @@ function TestManagerInner({ config }: ModuleProps) {
               </button>
               <button onClick={downloadReportZip} style={{ ...buttonStyle(), textAlign: "left", padding: "0.85rem 1rem" }} disabled={!reportPages}>
                 ZIP
-                <span style={{ display: "block", marginTop: "0.25rem", color: C.muted, fontWeight: 500 }}>Downloads report.md, tests/*.md, generated SVG assets, definition.yaml, and workspace.json.</span>
+                <span style={{ display: "block", marginTop: "0.25rem", color: C.muted, fontWeight: 500 }}>Downloads report.md, tests/*.md, generated SVG assets, evidence files, evidence/manifest.json, definition.yaml, and workspace.json.</span>
               </button>
             </div>
             <footer style={{ padding: "0.85rem 1.1rem", borderTop: `1px solid ${C.border}`, display: "flex", justifyContent: "flex-end" }}>
@@ -2642,10 +2799,59 @@ export async function onExport(ctx: ExportContext): Promise<void> {
     const workspace = normalizeWorkspaceState(JSON.parse(workspaceText), storage.projectId);
     const activeRun = getActiveRun(workspace);
     const tests = buildResolvedTests(definition);
-    const pages = generateReportPages(definition, activeRun, tests);
+    const pages = generateReportPages(definition, activeRun, tests, {
+      artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
+    });
     await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/report.md`, pages.summary, "text/markdown;charset=utf-8");
     for (const [testId, detail] of Object.entries(pages.details)) {
       await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/tests/${testId}.md`, detail, "text/markdown;charset=utf-8");
     }
+    for (const [path, asset] of Object.entries(pages.assets)) {
+      await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/${path}`, asset.content, asset.contentType);
+    }
+
+    const manifest: Array<Record<string, string | number | null>> = [];
+    for (const test of tests) {
+      const result = ensureResult(activeRun, test);
+      for (const [fieldId, artifacts] of Object.entries(result.typedArtifacts)) {
+        for (const artifact of artifacts) {
+          const exportPath = `${ctx.projectPrefix}${ctx.config.id}/export/${artifactArchivePath(test.id, artifact, fieldId)}`;
+          const bytes = await readOptionalBytes(ctx.s3Client as S3Client, artifact.bucket, artifact.key);
+          if (bytes) {
+            await writeBytes(ctx.s3Client as S3Client, storage.bucket, exportPath, bytes, artifact.contentType || "application/octet-stream");
+          }
+          manifest.push({
+            testId: test.id,
+            fieldId,
+            kind: artifact.kind,
+            name: artifact.name,
+            archivePath: artifactArchivePath(test.id, artifact, fieldId),
+            bucket: artifact.bucket,
+            key: artifact.key,
+            contentType: artifact.contentType ?? null,
+            sizeBytes: artifact.sizeBytes,
+          });
+        }
+      }
+      for (const artifact of result.supportingArtifacts) {
+        const exportPath = `${ctx.projectPrefix}${ctx.config.id}/export/${artifactArchivePath(test.id, artifact, null)}`;
+        const bytes = await readOptionalBytes(ctx.s3Client as S3Client, artifact.bucket, artifact.key);
+        if (bytes) {
+          await writeBytes(ctx.s3Client as S3Client, storage.bucket, exportPath, bytes, artifact.contentType || "application/octet-stream");
+        }
+        manifest.push({
+          testId: test.id,
+          fieldId: null,
+          kind: artifact.kind,
+          name: artifact.name,
+          archivePath: artifactArchivePath(test.id, artifact, null),
+          bucket: artifact.bucket,
+          key: artifact.key,
+          contentType: artifact.contentType ?? null,
+          sizeBytes: artifact.sizeBytes,
+        });
+      }
+    }
+    await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/evidence/manifest.json`, JSON.stringify(manifest, null, 2), "application/json");
   }
 }
