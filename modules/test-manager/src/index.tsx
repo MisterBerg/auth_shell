@@ -1,5 +1,5 @@
 import React, { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
-import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { parse as parseYaml } from "yaml";
 import ReactMarkdown from "react-markdown";
@@ -398,6 +398,59 @@ function escapeXml(value: string): string {
     .replace(/"/g, "&quot;");
 }
 
+function truncateSvgText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  if (maxChars <= 3) return value.slice(0, maxChars);
+  return `${value.slice(0, maxChars - 3).trimEnd()}...`;
+}
+
+function wrapSvgText(value: string, maxChars: number, maxLines: number): string[] {
+  const words = value.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  const lines: string[] = [];
+  let current = "";
+
+  for (const word of words) {
+    const remainingLines = maxLines - lines.length;
+    if (remainingLines <= 0) break;
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length <= maxChars) {
+      current = candidate;
+      continue;
+    }
+    if (current) {
+      lines.push(current);
+      current = word;
+    } else {
+      lines.push(truncateSvgText(word, maxChars));
+      current = "";
+    }
+  }
+
+  if (current && lines.length < maxLines) lines.push(current);
+  if (lines.length === maxLines && words.join(" ").length > lines.join(" ").length) {
+    lines[lines.length - 1] = truncateSvgText(lines[lines.length - 1], Math.max(1, maxChars - 3));
+  }
+  return lines.length ? lines : [""];
+}
+
+function renderWrappedSvgText(args: {
+  value: string;
+  x: number;
+  y: number;
+  maxChars: number;
+  maxLines: number;
+  lineHeight: number;
+  fill: string;
+  fontSize: number;
+  fontWeight?: number;
+}): string {
+  const lines = wrapSvgText(args.value, args.maxChars, args.maxLines);
+  const tspans = lines.map((line, index) =>
+    `<tspan x="${args.x}" dy="${index === 0 ? 0 : args.lineHeight}">${escapeXml(line)}</tspan>`
+  ).join("");
+  return `<text x="${args.x}" y="${args.y}" text-anchor="middle" fill="${args.fill}" font-size="${args.fontSize}"${args.fontWeight ? ` font-weight="${args.fontWeight}"` : ""}>${tspans}</text>`;
+}
+
 function guessLinkedValueSet(fieldId: string): string | undefined {
   if (!fieldId) return undefined;
   if (fieldId.endsWith("_id")) return `${fieldId.slice(0, -3)}s`;
@@ -789,7 +842,7 @@ function renderDiagramSvg(diagram: DiagramDefinition): string {
   }
 
   const nodeWidth = 155;
-  const nodeHeight = 82;
+  const nodeHeight = 104;
   const xGap = 72;
   const yGap = 32;
   const topPad = diagram.title ? 92 : 42;
@@ -832,10 +885,40 @@ function renderDiagramSvg(diagram: DiagramDefinition): string {
     const pos = positions.get(node.id);
     if (!pos) return "";
     const tone = diagramToneColor(node.tone);
-    const note = node.note ? `<text x="${pos.cx}" y="${pos.y + 55}" text-anchor="middle" fill="#94a3b8" font-size="13">${escapeXml(node.note)}</text>` : "";
-    const badge = node.badge ? `<rect x="${pos.x + 12}" y="${pos.y + nodeHeight - 21}" width="${nodeWidth - 24}" height="18" rx="9" fill="${tone.stroke}" opacity="0.22"/><text x="${pos.cx}" y="${pos.y + nodeHeight - 8}" text-anchor="middle" fill="${tone.text}" font-size="12" font-weight="700">${escapeXml(node.badge)}</text>` : "";
+    const label = renderWrappedSvgText({
+      value: node.label,
+      x: pos.cx,
+      y: pos.y + 28,
+      maxChars: 17,
+      maxLines: 2,
+      lineHeight: 18,
+      fill: tone.text,
+      fontSize: 15,
+      fontWeight: 700,
+    });
+    const note = node.note ? renderWrappedSvgText({
+      value: node.note,
+      x: pos.cx,
+      y: pos.y + 65,
+      maxChars: 22,
+      maxLines: node.badge ? 1 : 2,
+      lineHeight: 15,
+      fill: "#94a3b8",
+      fontSize: 12,
+    }) : "";
+    const badge = node.badge ? `<rect x="${pos.x + 12}" y="${pos.y + nodeHeight - 23}" width="${nodeWidth - 24}" height="19" rx="9.5" fill="${tone.stroke}" opacity="0.22"/>${renderWrappedSvgText({
+      value: node.badge,
+      x: pos.cx,
+      y: pos.y + nodeHeight - 10,
+      maxChars: 17,
+      maxLines: 1,
+      lineHeight: 12,
+      fill: tone.text,
+      fontSize: 11,
+      fontWeight: 700,
+    })}` : "";
     return `<rect x="${pos.x}" y="${pos.y}" width="${nodeWidth}" height="${nodeHeight}" rx="12" fill="${tone.fill}" stroke="${tone.stroke}" stroke-width="2"/>
-      <text x="${pos.cx}" y="${pos.y + 30}" text-anchor="middle" fill="${tone.text}" font-size="16" font-weight="700">${escapeXml(node.label)}</text>
+      ${label}
       ${note}
       ${badge}`;
   }).join("\n");
@@ -1145,6 +1228,18 @@ function formatDate(value?: string): string {
   if (!value) return "";
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size >= 10 || unitIndex === 0 ? Math.round(size) : size.toFixed(1)} ${units[unitIndex]}`;
 }
 
 function getActiveRun(store: WorkspaceState): TestRun {
@@ -1596,15 +1691,22 @@ function ArtifactField({
   artifacts,
   supporting = false,
   onUpload,
+  onDelete,
 }: {
   field: FieldDefinition;
   artifacts: ArtifactRef[];
   supporting?: boolean;
-  onUpload: (files: FileList | null) => void;
+  onUpload: (files: File[]) => boolean | Promise<boolean>;
+  onDelete: (artifact: ArtifactRef) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const accept = artifactAccept(field);
+  const queueFiles = useCallback((files: FileList | null) => {
+    if (!files?.length) return;
+    setPendingFiles((current) => [...current, ...Array.from(files)]);
+  }, []);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "0.55rem" }}>
@@ -1617,7 +1719,7 @@ function ArtifactField({
         onDrop={(event) => {
           event.preventDefault();
           setDragActive(false);
-          onUpload(event.dataTransfer.files);
+          queueFiles(event.dataTransfer.files);
         }}
         style={{
           border: `1px dashed ${dragActive ? C.accent : C.border}`,
@@ -1633,7 +1735,7 @@ function ArtifactField({
           </button>
         </div>
         <div style={{ marginTop: "0.4rem", color: C.muted, fontSize: "0.8rem" }}>
-          {supporting ? "Ad hoc files are stored predictably for this test and linked from the detail page." : "Known file inputs can be rendered or linked consistently in the report."}
+          {supporting ? "Review files before uploading; accepted files are stored for this test and linked from the detail page." : "Review files before uploading; accepted files are stored as a list for this input."}
         </div>
         <input
           ref={inputRef}
@@ -1642,19 +1744,56 @@ function ArtifactField({
           multiple
           accept={accept}
           onChange={(event) => {
-            onUpload(event.target.files);
+            queueFiles(event.target.files);
             event.target.value = "";
           }}
         />
       </div>
+      {pendingFiles.length > 0 ? (
+        <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, background: C.panel2, padding: "0.75rem", display: "grid", gap: "0.55rem" }}>
+          <div style={{ color: C.text, fontSize: "0.86rem", fontWeight: 700 }}>Review {pendingFiles.length} file{pendingFiles.length === 1 ? "" : "s"} before upload</div>
+          <div style={{ display: "grid", gap: "0.35rem" }}>
+            {pendingFiles.map((file, index) => (
+              <div key={`${file.name}-${file.size}-${file.lastModified}-${index}`} style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", color: C.muted, fontSize: "0.8rem" }}>
+                <span style={{ color: C.text, overflowWrap: "anywhere" }}>{file.name}</span>
+                <span style={{ flexShrink: 0 }}>{formatBytes(file.size)}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
+            <button
+              type="button"
+              onClick={() => {
+                void (async () => {
+                  const uploaded = await onUpload(pendingFiles);
+                  if (uploaded !== false) setPendingFiles([]);
+                })();
+              }}
+              style={buttonStyle("primary")}
+            >
+              Upload
+            </button>
+            <button type="button" onClick={() => setPendingFiles([])} style={buttonStyle("ghost")}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : null}
       {artifacts.length === 0 ? (
         <div style={{ color: C.muted, fontSize: "0.82rem" }}>No files uploaded yet.</div>
       ) : (
         <div style={{ display: "grid", gap: "0.45rem" }}>
           {artifacts.map((artifact) => (
             <div key={artifact.id} style={{ border: `1px solid ${C.border}`, borderRadius: 10, background: C.panel2, padding: "0.65rem 0.75rem" }}>
-              <div style={{ color: C.text, fontSize: "0.86rem", fontWeight: 600 }}>{artifact.name}</div>
-              <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.78rem" }}>{artifact.contentType || "file"} · {Math.max(1, Math.round(artifact.sizeBytes / 1024))} KB · {formatDate(artifact.uploadedAt)}</div>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "flex-start" }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ color: C.text, fontSize: "0.86rem", fontWeight: 600, overflowWrap: "anywhere" }}>{artifact.name}</div>
+                  <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.78rem" }}>{artifact.contentType || "file"} · {formatBytes(artifact.sizeBytes)} · {formatDate(artifact.uploadedAt)}</div>
+                </div>
+                <button type="button" onClick={() => onDelete(artifact)} style={{ ...buttonStyle("danger"), padding: "0.35rem 0.55rem", flexShrink: 0 }}>
+                  Delete
+                </button>
+              </div>
               <div style={{ marginTop: "0.25rem", color: C.accent, fontSize: "0.76rem", wordBreak: "break-all" }}>s3://{artifact.bucket}/{artifact.key}</div>
             </div>
           ))}
@@ -1991,16 +2130,16 @@ function TestManagerInner({ config }: ModuleProps) {
     }, "Exclusion reason updated");
   }, [activeRun, updateWorkspace, workspace]);
 
-  const uploadArtifacts = useCallback(async (files: FileList | null, testId: string, fieldId: string | null) => {
-    if (!files?.length || !activeRun) return;
+  const uploadArtifacts = useCallback(async (files: File[], testId: string, fieldId: string | null): Promise<boolean> => {
+    if (!files.length || !activeRun) return false;
     const test = testsById.get(testId);
-    if (!test) return;
+    if (!test) return false;
     setSaving(true);
     setError("");
     try {
       const s3 = await getS3Client(storage.bucket);
       const uploaded: ArtifactRef[] = [];
-      for (const file of Array.from(files)) {
+      for (const file of files) {
         const key = artifactStoragePath(storage, activeRun.id, testId, fieldId, file.name);
         await s3.send(new PutObjectCommand({
           Bucket: storage.bucket,
@@ -2047,11 +2186,67 @@ function TestManagerInner({ config }: ModuleProps) {
           };
         }),
       }), "Artifacts uploaded");
+      return true;
     } catch (uploadError: unknown) {
       setError((uploadError as Error).message);
       setSaving(false);
+      return false;
     }
   }, [activeRun, getS3Client, storage, testsById, updateWorkspace, user?.email]);
+
+  const deleteArtifact = useCallback(async (testId: string, fieldId: string | null, artifact: ArtifactRef) => {
+    if (!activeRun) return;
+    const test = testsById.get(testId);
+    if (!test) return;
+    const confirmed = window.confirm(
+      `Delete "${artifact.name}" from this test and permanently remove it from S3?\n\nThis cannot be undone.`
+    );
+    if (!confirmed) return;
+
+    setSaving(true);
+    setError("");
+    try {
+      const s3 = await getS3Client(artifact.bucket);
+      await s3.send(new DeleteObjectCommand({
+        Bucket: artifact.bucket,
+        Key: artifact.key,
+      }));
+
+      updateWorkspace((currentWorkspace) => ({
+        ...currentWorkspace,
+        runs: currentWorkspace.runs.map((run) => {
+          if (run.id !== activeRun.id) return run;
+          const currentResult = ensureResult(run, test, user?.email);
+          const typedArtifacts = { ...currentResult.typedArtifacts };
+          let supportingArtifacts = currentResult.supportingArtifacts;
+          if (fieldId) {
+            typedArtifacts[fieldId] = (typedArtifacts[fieldId] ?? []).filter((candidate) => candidate.id !== artifact.id);
+            if (typedArtifacts[fieldId].length === 0) delete typedArtifacts[fieldId];
+          } else {
+            supportingArtifacts = supportingArtifacts.filter((candidate) => candidate.id !== artifact.id);
+          }
+          return {
+            ...run,
+            updatedAt: nowIso(),
+            resultsByTestId: {
+              ...run.resultsByTestId,
+              [testId]: {
+                ...currentResult,
+                typedArtifacts,
+                supportingArtifacts,
+                updatedAt: nowIso(),
+                updatedBy: user?.email,
+                startedAt: currentResult.startedAt ?? nowIso(),
+              },
+            },
+          };
+        }),
+      }), "Artifact deleted from test and S3");
+    } catch (deleteError: unknown) {
+      setError((deleteError as Error).message);
+      setSaving(false);
+    }
+  }, [activeRun, getS3Client, testsById, updateWorkspace, user?.email]);
 
   const validationIssues = useMemo(() => {
     if (!definition || !activeRun) return [];
@@ -2623,7 +2818,13 @@ function TestManagerInner({ config }: ModuleProps) {
                     <div style={{ marginTop: "1rem" }}>
                       <div style={{ display: "grid", gap: "1rem" }}>
                         {artifactInputFields.map((field) => (
-                          <ArtifactField key={field.id} field={field} artifacts={selectedResult.typedArtifacts[field.id] ?? []} onUpload={(files) => void uploadArtifacts(files, selectedTest.id, field.id)} />
+                          <ArtifactField
+                            key={field.id}
+                            field={field}
+                            artifacts={selectedResult.typedArtifacts[field.id] ?? []}
+                            onUpload={(files) => uploadArtifacts(files, selectedTest.id, field.id)}
+                            onDelete={(artifact) => void deleteArtifact(selectedTest.id, field.id, artifact)}
+                          />
                         ))}
                       </div>
                     </div>
@@ -2644,7 +2845,8 @@ function TestManagerInner({ config }: ModuleProps) {
                         field={{ id: "supporting_files", label: "Supporting Files", type: "file_list", required: false }}
                         artifacts={selectedResult.supportingArtifacts}
                         supporting
-                        onUpload={(files) => void uploadArtifacts(files, selectedTest.id, null)}
+                        onUpload={(files) => uploadArtifacts(files, selectedTest.id, null)}
+                        onDelete={(artifact) => void deleteArtifact(selectedTest.id, null, artifact)}
                       />
                     </div>
                   </section>
