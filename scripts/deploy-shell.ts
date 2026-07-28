@@ -28,14 +28,10 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "..");
 
-const REGION      = "us-east-2";
+const REGION = "us-east-2";
 const SHELL_BUCKET = "jeffspace-shell";
-const SHELL_DIR   = join(ROOT, "apps", "shell");
-const DIST_DIR    = join(SHELL_DIR, "dist");
-
-// ---------------------------------------------------------------------------
-// Credentials
-// ---------------------------------------------------------------------------
+const SHELL_DIR = join(ROOT, "apps", "shell");
+const DIST_DIR = join(SHELL_DIR, "dist");
 
 function loadCredentials(): { accessKeyId: string; secretAccessKey: string } | undefined {
   const credFile = join(ROOT, ".aws", "credentials", "access_key");
@@ -48,30 +44,22 @@ function loadCredentials(): { accessKeyId: string; secretAccessKey: string } | u
   return { accessKeyId: lines[0]!.trim(), secretAccessKey: lines[1]!.trim() };
 }
 
-// ---------------------------------------------------------------------------
-// Content-type map
-// ---------------------------------------------------------------------------
-
 const CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
-  ".js":   "application/javascript; charset=utf-8",
-  ".css":  "text/css; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
   ".json": "application/json",
-  ".svg":  "image/svg+xml",
-  ".png":  "image/png",
-  ".ico":  "image/x-icon",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
   ".woff2": "font/woff2",
-  ".woff":  "font/woff",
-  ".ttf":   "font/ttf",
+  ".woff": "font/woff",
+  ".ttf": "font/ttf",
 };
 
 function contentType(file: string): string {
   return CONTENT_TYPES[extname(file).toLowerCase()] ?? "application/octet-stream";
 }
-
-// ---------------------------------------------------------------------------
-// File walk
-// ---------------------------------------------------------------------------
 
 function walk(dir: string, base = dir): string[] {
   const entries = readdirSync(dir);
@@ -87,22 +75,16 @@ function walk(dir: string, base = dir): string[] {
   return files;
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
 async function main(): Promise<void> {
   const credentials = loadCredentials();
   const s3 = new S3Client(credentials ? { region: REGION, credentials } : { region: REGION });
   const cf = new CloudFrontClient(credentials ? { region: "us-east-1", credentials } : { region: "us-east-1" });
 
-  // Build
   console.log("\n[1/4] Building shell app...");
   execSync("npm run build", { cwd: SHELL_DIR, stdio: "inherit" });
-  console.log("  ✓ Build complete");
+  console.log("  Build complete");
   buildAgentRuntimeInstallers();
 
-  // Clear existing objects in bucket
   console.log(`\n[2/4] Clearing "${SHELL_BUCKET}"...`);
   const listed = await s3.send(new ListObjectsV2Command({ Bucket: SHELL_BUCKET }));
   const existing = listed.Contents?.map((o) => ({ Key: o.Key! })) ?? [];
@@ -111,20 +93,17 @@ async function main(): Promise<void> {
       Bucket: SHELL_BUCKET,
       Delete: { Objects: existing },
     }));
-    console.log(`  ✓ Removed ${existing.length} existing objects`);
+    console.log(`  Removed ${existing.length} existing objects`);
   } else {
-    console.log("  · bucket already empty");
+    console.log("  Bucket already empty");
   }
 
-  // Upload dist/
   console.log(`\n[3/4] Uploading to "${SHELL_BUCKET}"...`);
   const files = walk(DIST_DIR);
   let count = 0;
   for (const file of files) {
     const body = readFileSync(join(DIST_DIR, file));
-    const ct   = contentType(file);
-    // index.html: no-cache so CloudFront always serves the latest entry point
-    // Everything else: long cache (Vite hashes asset filenames)
+    const ct = contentType(file);
     const cacheControl = file === "index.html"
       ? "no-cache, no-store, must-revalidate"
       : "public, max-age=31536000, immutable";
@@ -139,7 +118,7 @@ async function main(): Promise<void> {
     count++;
     process.stdout.write(`\r  Uploaded ${count}/${files.length}: ${file.padEnd(60)}`);
   }
-  console.log(`\n  ✓ ${count} files uploaded`);
+  console.log(`\n  Uploaded ${count} files`);
 
   console.log("\n[4/4] Invalidating CloudFront...");
   const listedDistributions = await cf.send(new ListDistributionsCommand({}));
@@ -162,12 +141,12 @@ async function main(): Promise<void> {
       },
     },
   }));
-  console.log(`  ✓ CloudFront invalidation started (${distribution.Id} / ${invalidation.Invalidation?.Id})`);
+  console.log(`  CloudFront invalidation started (${distribution.Id} / ${invalidation.Invalidation?.Id})`);
 
   console.log(`
-╔══════════════════════════════════════════════════════════════╗
-║  Shell deployed to jeffspace-shell                          ║
-╚══════════════════════════════════════════════════════════════╝
++--------------------------------------------------------------+
+|  Shell deployed to jeffspace-shell                           |
++--------------------------------------------------------------+
 
   CloudFront invalidation has been started automatically.
   Distribution: ${distribution.Id}
@@ -177,17 +156,23 @@ async function main(): Promise<void> {
 
 function buildAgentRuntimeInstallers(): void {
   if (process.env["SKIP_AGENT_RUNTIME_INSTALLERS"] === "1") {
-    console.log("  · skipped agent runtime installers (SKIP_AGENT_RUNTIME_INSTALLERS=1)");
+    console.log("  Skipped agent runtime installers (SKIP_AGENT_RUNTIME_INSTALLERS=1)");
     return;
   }
 
-  if (process.platform !== "darwin") {
-    console.log("  · skipped macOS agent runtime installer build; run on macOS or provide the artifact before deploy");
+  if (process.platform === "darwin") {
+    console.log("  Building macOS agent runtime installer");
+    execSync("npm run build:agent-runtime:macos", { cwd: ROOT, stdio: "inherit" });
     return;
   }
 
-  console.log("  · building macOS agent runtime installer");
-  execSync("npm run build:agent-runtime:macos", { cwd: ROOT, stdio: "inherit" });
+  if (process.platform === "win32") {
+    console.log("  Building Windows agent runtime installer");
+    execSync("npm run build:agent-runtime:windows", { cwd: ROOT, stdio: "inherit" });
+    return;
+  }
+
+  console.log("  Skipped platform-specific agent runtime installer build; provide prebuilt artifacts before deploy");
 }
 
 main().catch((err) => {

@@ -38,7 +38,11 @@
     "publish": "tsx scripts/publish-module.ts",
     "publish:all": "tsx scripts/publish-all.ts",
     "publish:all:local": "tsx scripts/publish-all.ts --local",
+    "build:agent-runtime": "tsx scripts/manage-agent-runtime.ts build",
     "build:agent-runtime:macos": "tsx scripts/build-agent-runtime-macos.ts",
+    "build:agent-runtime:windows": "tsx scripts/build-agent-runtime-windows.ts",
+    "install:agent-runtime": "tsx scripts/manage-agent-runtime.ts install",
+    "uninstall:agent-runtime": "tsx scripts/manage-agent-runtime.ts uninstall",
     "provision": "tsx scripts/provision-aws.ts",
     "deploy:shell": "tsx scripts/deploy-shell.ts",
     "kicad:export-board": "tsx scripts/kicad/export-board-viewer.ts"
