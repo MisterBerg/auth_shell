@@ -241,6 +241,23 @@ function escapeCsv(value: string): string {
   return `"${value.replace(/"/g, "\"\"")}"`;
 }
 
+function resolveSvgColor(value: string, fallback: string): string {
+  if (typeof document === "undefined") return fallback;
+  try {
+    const probe = document.createElement("span");
+    probe.style.color = value;
+    probe.style.position = "absolute";
+    probe.style.visibility = "hidden";
+    probe.style.pointerEvents = "none";
+    document.body.appendChild(probe);
+    const resolved = getComputedStyle(probe).color;
+    probe.remove();
+    return resolved || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function sanitizePlantName(value: string): string {
   return value.replace(/\r?\n/g, " ").replace(/\[/g, "(").replace(/\]/g, ")").trim();
 }
@@ -600,7 +617,7 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
     const barX = labelWidth + startOffset * dayWidth + 4;
     const barY = y + Math.round((spec.rowHeight - 20) / 2);
     const barWidth = row.isMilestone ? 16 : Math.max(18, duration * dayWidth - 8);
-    const barColor = kindColor(row.item.kind);
+    const barColor = resolveSvgColor(kindColor(row.item.kind), "#3b82f6");
     lines.push(`<rect x="${labelWidth}" y="${y}" width="${chartWidth}" height="${spec.rowHeight}" fill="${index % 2 === 0 ? "#0b1525" : "#0a1322"}"/>`);
     if (includeLabels) {
       lines.push(`<rect x="0" y="${y}" width="${labelWidth}" height="${spec.rowHeight}" fill="${selected ? "rgba(59,130,246,0.12)" : index % 2 === 0 ? "#0b1525" : "#0a1322"}"/>`);
