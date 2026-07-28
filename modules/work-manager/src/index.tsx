@@ -1116,26 +1116,26 @@ function TaskPanel({
 }) {
   const itemIdsKey = useMemo(() => items.map((item) => item.id).sort().join("|"), [items]);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
-  const tree = useMemo(() => buildMilestoneTaskGroups(items), [items]);
+  const groups = useMemo(() => buildTaskLaneGroups(items), [items]);
 
   useEffect(() => {
     setExpandedIds((current) => {
       const next = new Set(current);
-      for (const itemId of tree.expandableIds) next.add(itemId);
+      for (const group of groups) next.add(group.id);
       return next;
     });
-  }, [itemIdsKey, tree.expandableIds]);
+  }, [groups, itemIdsKey]);
 
-  const toggleExpanded = useCallback((itemId: string) => {
+  const toggleExpanded = useCallback((groupId: string) => {
     setExpandedIds((current) => {
       const next = new Set(current);
-      if (next.has(itemId)) next.delete(itemId);
-      else next.add(itemId);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
       return next;
     });
   }, []);
 
-  const renderItem = useCallback((item: WorkItem, repeated: boolean): React.ReactNode => {
+  const renderItem = useCallback((item: WorkItem): React.ReactNode => {
     return (
       <button key={item.id} onClick={() => onSelect(item.id)} style={itemRowStyle(item, item.id === selectedItemId)}>
         <span style={{ width: 8, height: 62, borderRadius: 99, background: priorityColor(item.priority), flexShrink: 0 }} />
@@ -1145,7 +1145,6 @@ function TaskPanel({
             <Badge color={kindColor(item.kind)}>{item.kind}</Badge>
             <Badge color={statusColor(item.status)}>{item.status}</Badge>
             {item.kind !== "milestone" && Math.max(0, item.durationDays ?? 0) === 0 && <Badge color="#93c5fd">task list</Badge>}
-            {repeated && <Badge color="#93c5fd">linked</Badge>}
           </span>
           <span style={{ display: "block", marginTop: "0.25rem", color: C.muted, fontSize: "0.78rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {item.description || item.notes || "No description yet"}
@@ -1158,56 +1157,15 @@ function TaskPanel({
     );
   }, [onSelect, selectedItemId]);
 
-  const renderNode = useCallback((node: TaskDependencyNode, depth: number, path: string[]): React.ReactNode => {
-    const item = node.item;
-    const repeated = (tree.referenceCountById.get(item.id) ?? 0) > 1;
-    const cyclic = path.includes(item.id);
-    const canCollapse = item.kind === "milestone" && node.children.length > 0 && !cyclic;
-    const expanded = !canCollapse || expandedIds.has(item.id);
-    const nextPath = [...path, item.id];
-
+  const renderGroup = useCallback((group: TaskLaneGroup): React.ReactNode => {
+    const expanded = expandedIds.has(group.id);
     return (
-      <React.Fragment key={`${path.join("/")}:${item.id}`}>
-        <div style={{ marginLeft: Math.min(depth, 8) * 30, display: "flex", alignItems: "stretch", gap: "0.35rem" }}>
-          <button
-            type="button"
-            aria-label={expanded ? "Collapse milestone dependencies" : "Expand milestone dependencies"}
-            onClick={() => canCollapse && toggleExpanded(item.id)}
-            disabled={!canCollapse}
-            style={{
-              width: 24,
-              alignSelf: "stretch",
-              border: `1px solid ${C.border}`,
-              borderRadius: 8,
-              background: canCollapse ? C.panel2 : "transparent",
-              color: canCollapse ? C.text : C.muted,
-              cursor: canCollapse ? "pointer" : "default",
-              flexShrink: 0,
-            }}
-          >
-            {canCollapse ? (expanded ? "-" : "+") : ""}
-          </button>
-          {renderItem(item, repeated)}
-        </div>
-        {cyclic && (
-          <div style={{ marginLeft: (Math.min(depth + 1, 8) * 30) + 30, color: C.danger, fontSize: "0.76rem" }}>
-            Cycle detected; dependency branch stopped.
-          </div>
-        )}
-        {expanded && !cyclic && node.children.map((child) => renderNode(child, depth + 1, nextPath))}
-      </React.Fragment>
-    );
-  }, [expandedIds, renderItem, toggleExpanded, tree.referenceCountById]);
-
-  const renderGroup = useCallback((group: MilestoneTaskGroup): React.ReactNode => {
-    const expanded = expandedIds.has(group.milestone.id);
-    return (
-      <React.Fragment key={group.milestone.id}>
+      <React.Fragment key={group.id}>
         <div style={{ display: "flex", alignItems: "stretch", gap: "0.35rem" }}>
           <button
             type="button"
-            aria-label={expanded ? "Collapse milestone dependencies" : "Expand milestone dependencies"}
-            onClick={() => toggleExpanded(group.milestone.id)}
+            aria-label={expanded ? "Collapse task group" : "Expand task group"}
+            onClick={() => toggleExpanded(group.id)}
             style={{
               width: 24,
               alignSelf: "stretch",
@@ -1221,188 +1179,154 @@ function TaskPanel({
           >
             {expanded ? "-" : "+"}
           </button>
-          {renderItem(group.milestone, (tree.referenceCountById.get(group.milestone.id) ?? 0) > 1)}
+          <div style={{
+            flex: 1,
+            minWidth: 0,
+            border: `1px solid ${C.border}`,
+            borderRadius: 12,
+            background: C.panel2,
+            color: C.text,
+            padding: "0.8rem 0.95rem",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem", flexWrap: "wrap" }}>
+              <strong style={{ fontSize: "0.95rem" }}>{group.title}</strong>
+              <span style={{ color: C.muted, fontSize: "0.76rem" }}>{group.items.length} item{group.items.length === 1 ? "" : "s"}</span>
+            </div>
+          </div>
         </div>
         {expanded && (
           <div style={{ display: "flex", flexDirection: "column", gap: "0.45rem" }}>
-            {group.dependencies.length ? group.dependencies.map((node) => (
-              renderNode(node, 1, [group.milestone.id])
+            {group.items.length ? group.items.map((item) => (
+              <div key={item.id} style={{ marginLeft: 30 }}>
+                {renderItem(item)}
+              </div>
             )) : (
-              <div style={{ color: C.muted, fontSize: "0.78rem", padding: "0.25rem 0.3rem" }}>No dependencies under this milestone.</div>
+              <div style={{ color: C.muted, fontSize: "0.78rem", padding: "0.25rem 0.3rem" }}>No tasks in this group.</div>
             )}
           </div>
         )}
       </React.Fragment>
     );
-  }, [expandedIds, renderItem, renderNode, toggleExpanded, tree.referenceCountById]);
+  }, [expandedIds, renderItem, toggleExpanded]);
 
   return (
     <section style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column", border: `1px solid ${C.border}`, borderRadius: 14, background: C.panel, overflow: "hidden" }}>
       <header style={{ padding: "0.9rem 1rem", borderBottom: `1px solid ${C.border}`, background: C.panel2, display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem", flexWrap: "wrap" }}>
         <div>
           <div style={{ fontWeight: 700 }}>Tasks</div>
-          <div style={{ marginTop: "0.15rem", color: C.muted, fontSize: "0.78rem" }}>Milestones with flat prerequisite lists.</div>
+          <div style={{ marginTop: "0.15rem", color: C.muted, fontSize: "0.78rem" }}>Lane-based task groups ordered by dependency flow.</div>
         </div>
         <div style={{ display: "flex", gap: "0.4rem" }}>
-          <button onClick={() => setExpandedIds(new Set(tree.expandableIds))} style={miniButton()}>Expand</button>
+          <button onClick={() => setExpandedIds(new Set(groups.map((group) => group.id)))} style={miniButton()}>Expand</button>
           <button onClick={() => setExpandedIds(new Set())} style={miniButton()}>Collapse</button>
         </div>
       </header>
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "0.7rem", display: "flex", flexDirection: "column", gap: "0.55rem" }}>
-        {tree.groups.length ? tree.groups.map((group) => renderGroup(group)) : (
-          <div style={{ color: C.muted, fontSize: "0.82rem", padding: "0.3rem" }}>Add a milestone to create a collapsible dependency group.</div>
+        {groups.length ? groups.map((group) => renderGroup(group)) : (
+          <div style={{ color: C.muted, fontSize: "0.82rem", padding: "0.3rem" }}>Add work items to create grouped task lanes.</div>
         )}
       </div>
     </section>
   );
 }
 
-type MilestoneTaskGroup = {
-  milestone: WorkItem;
-  dependencies: TaskDependencyNode[];
+type TaskLaneGroup = {
+  id: string;
+  title: string;
+  items: WorkItem[];
 };
-
-type TaskDependencyNode = {
-  item: WorkItem;
-  children: TaskDependencyNode[];
-};
-
-function buildMilestoneTaskGroups(items: WorkItem[]): {
-  groups: MilestoneTaskGroup[];
-  referenceCountById: Map<string, number>;
-  expandableIds: string[];
-} {
-  const itemsById = new Map(items.map((item) => [item.id, item]));
-  const referenceCountById = new Map<string, number>();
-  const expandableIds = new Set<string>();
-  const nestedMilestoneIds = new Set<string>();
-  const markNestedMilestones = (item: WorkItem, path: Set<string>) => {
-    if (path.has(item.id)) return;
-    if (item.kind === "milestone") nestedMilestoneIds.add(item.id);
-    const nextPath = new Set(path);
-    nextPath.add(item.id);
-    for (const dependencyId of item.dependencies) {
-      const dependency = itemsById.get(dependencyId);
-      if (!dependency) continue;
-      if (dependency.kind === "milestone") nestedMilestoneIds.add(dependency.id);
-      markNestedMilestones(dependency, nextPath);
-    }
-  };
-  for (const milestone of items.filter((item) => item.kind === "milestone")) {
-    for (const dependencyId of milestone.dependencies) {
-      const dependency = itemsById.get(dependencyId);
-      if (dependency) markNestedMilestones(dependency, new Set([milestone.id]));
-    }
-  }
-
-  const rootMilestones = items.filter((item) => {
-    return item.kind === "milestone" && !nestedMilestoneIds.has(item.id);
-  });
-  const milestones = rootMilestones.length ? rootMilestones : items.filter((item) => item.kind === "milestone");
-
-  const countReference = (itemId: string) => {
-    referenceCountById.set(itemId, (referenceCountById.get(itemId) ?? 0) + 1);
-  };
-
-  const makeGroupedNode = (item: WorkItem, path: Set<string>): TaskDependencyNode => {
-    countReference(item.id);
-    if (path.has(item.id)) return { item, children: [] };
-
-    const children = collectDependencyNodes(item, path);
-    if (item.kind === "milestone" && children.length) expandableIds.add(item.id);
-    return {
-      item,
-      children,
-    };
-  };
-
-  const makeScheduledNode = (item: WorkItem, path: Set<string>): TaskDependencyNode => {
-    countReference(item.id);
-    if (path.has(item.id)) return { item, children: [] };
-
-    const nextPath = new Set(path);
-    nextPath.add(item.id);
-    return {
-      item,
-      children: item.dependencies
-        .map((depId) => itemsById.get(depId))
-        .filter((dependency): dependency is WorkItem => Boolean(dependency))
-        .filter(isTaskListOnly)
-        .sort(compareTaskGroupItems)
-        .map((dependency) => makeGroupedNode(dependency, nextPath)),
-    };
-  };
-
-  function collectDependencyNodes(item: WorkItem, path: Set<string>): TaskDependencyNode[] {
-    if (path.has(item.id)) return [];
-
-    const nextPath = new Set(path);
-    nextPath.add(item.id);
-    const nodesById = new Map<string, TaskDependencyNode>();
-    const addDependency = (dependency: WorkItem, localPath: Set<string>) => {
-      if (nodesById.has(dependency.id)) return;
-      if (dependency.kind === "milestone" || isTaskListOnly(dependency)) {
-        nodesById.set(dependency.id, makeGroupedNode(dependency, localPath));
-        return;
-      }
-
-      nodesById.set(dependency.id, makeScheduledNode(dependency, localPath));
-      if (localPath.has(dependency.id)) return;
-
-      const promotedPath = new Set(localPath);
-      promotedPath.add(dependency.id);
-      const promotedDependencies = dependency.dependencies
-        .map((depId) => itemsById.get(depId))
-        .filter((candidate): candidate is WorkItem => Boolean(candidate))
-        .filter((candidate) => !isTaskListOnly(candidate));
-      for (const promotedDependency of promotedDependencies) {
-        addDependency(promotedDependency, promotedPath);
-      }
-    };
-
-    const directDependencies = item.dependencies
-      .map((depId) => itemsById.get(depId))
-      .filter((dependency): dependency is WorkItem => Boolean(dependency))
-      .sort(compareTaskGroupItems);
-
-    for (const dependency of directDependencies) addDependency(dependency, nextPath);
-    return [...nodesById.values()].sort(compareTaskGroupItemsByNode);
-  }
-
-  const groups = milestones
-    .filter((item) => item.kind === "milestone")
-    .sort((a, b) => {
-      const laneCompare = laneRank(a.lane).localeCompare(laneRank(b.lane));
-      if (laneCompare) return laneCompare;
-      const aTime = a.startAt ?? a.createdAt;
-      const bTime = b.startAt ?? b.createdAt;
-      return aTime.localeCompare(bTime) || a.title.localeCompare(b.title);
-    })
-    .map((milestone) => {
-      countReference(milestone.id);
-      const dependencies = collectDependencyNodes(milestone, new Set());
-      if (dependencies.length) expandableIds.add(milestone.id);
-      return { milestone, dependencies };
-    });
-
-  return { groups, referenceCountById, expandableIds: [...expandableIds] };
-}
 
 function isTaskListOnly(item: WorkItem): boolean {
   return item.kind !== "milestone" && Math.max(0, item.durationDays ?? 0) === 0;
 }
 
-function compareTaskGroupItems(a: WorkItem, b: WorkItem): number {
-  const aGroup = a.kind === "milestone" || isTaskListOnly(a) ? 0 : 1;
-  const bGroup = b.kind === "milestone" || isTaskListOnly(b) ? 0 : 1;
-  if (aGroup !== bGroup) return aGroup - bGroup;
-  const laneCompare = laneRank(a.lane).localeCompare(laneRank(b.lane));
-  if (laneCompare) return laneCompare;
-  return a.title.localeCompare(b.title);
+function compareTaskPanelItems(a: WorkItem, b: WorkItem): number {
+  const aTaskListOnly = isTaskListOnly(a) ? 1 : 0;
+  const bTaskListOnly = isTaskListOnly(b) ? 1 : 0;
+  if (aTaskListOnly !== bTaskListOnly) return aTaskListOnly - bTaskListOnly;
+  const kindCompare = kindRank(a.kind) - kindRank(b.kind);
+  if (kindCompare) return kindCompare;
+  const aTime = a.startAt ?? a.createdAt;
+  const bTime = b.startAt ?? b.createdAt;
+  return aTime.localeCompare(bTime) || a.title.localeCompare(b.title);
 }
 
-function compareTaskGroupItemsByNode(a: TaskDependencyNode, b: TaskDependencyNode): number {
-  return compareTaskGroupItems(a.item, b.item);
+function sortLaneItems(items: WorkItem[]): WorkItem[] {
+  const itemsById = new Map(items.map((item) => [item.id, item]));
+  const predecessorsById = new Map<string, Set<string>>();
+  const dependentsById = new Map<string, Set<string>>();
+
+  for (const item of items) {
+    const predecessors = new Set(
+      item.dependencies.filter((depId) => {
+        const dep = itemsById.get(depId);
+        return Boolean(dep && (dep.lane?.trim() || "") === (item.lane?.trim() || ""));
+      })
+    );
+    predecessorsById.set(item.id, predecessors);
+    for (const depId of predecessors) {
+      if (!dependentsById.has(depId)) dependentsById.set(depId, new Set());
+      dependentsById.get(depId)!.add(item.id);
+    }
+  }
+
+  const emitted = new Set<string>();
+  const ready = items.filter((item) => (predecessorsById.get(item.id)?.size ?? 0) === 0).sort(compareTaskPanelItems);
+  const result: WorkItem[] = [];
+  let previousId: string | null = null;
+
+  const takeNextReady = (): WorkItem | undefined => {
+    if (previousId) {
+      const dependencyId = previousId;
+      const continuation = ready
+        .filter((item) => predecessorsById.get(item.id)?.has(dependencyId))
+        .sort(compareTaskPanelItems)[0];
+      if (continuation) {
+        ready.splice(ready.findIndex((item) => item.id === continuation.id), 1);
+        return continuation;
+      }
+    }
+
+    ready.sort(compareTaskPanelItems);
+    return ready.shift();
+  };
+
+  while (ready.length) {
+    const next = takeNextReady();
+    if (!next) break;
+    result.push(next);
+    emitted.add(next.id);
+    previousId = next.id;
+
+    for (const dependentId of dependentsById.get(next.id) ?? []) {
+      if (emitted.has(dependentId) || ready.some((item) => item.id === dependentId)) continue;
+      const predecessors = predecessorsById.get(dependentId) ?? new Set<string>();
+      if ([...predecessors].every((predecessorId) => emitted.has(predecessorId))) {
+        const dependent = itemsById.get(dependentId);
+        if (dependent) ready.push(dependent);
+      }
+    }
+  }
+
+  const unresolved = items.filter((item) => !emitted.has(item.id)).sort(compareTaskPanelItems);
+  return [...result, ...unresolved];
+}
+
+function buildTaskLaneGroups(items: WorkItem[]): TaskLaneGroup[] {
+  const lanes = new Map<string, WorkItem[]>();
+  for (const item of items) {
+    const lane = item.lane?.trim() || "Ungrouped";
+    if (!lanes.has(lane)) lanes.set(lane, []);
+    lanes.get(lane)!.push(item);
+  }
+
+  return [...lanes.entries()]
+    .sort(([a], [b]) => laneRank(a).localeCompare(laneRank(b)))
+    .map(([lane, laneItems]) => ({
+      id: `lane:${lane}`,
+      title: lane,
+      items: sortLaneItems(laneItems),
+    }));
 }
 
 function PlannerSplitter({
@@ -1598,8 +1522,8 @@ function GanttPanel({
                 ))}
               </div>
             </div>
-            <div style={{ flex: 1, minWidth: 0, minHeight: 0, overflow: "auto", padding: "0.75rem" }} onScroll={onTimelineScroll}>
-              <div dangerouslySetInnerHTML={{ __html: svgMarkup }} />
+            <div style={{ flex: 1, minWidth: 0, minHeight: 0, overflow: "auto" }} onScroll={onTimelineScroll}>
+              <div style={{ minWidth: "fit-content" }} dangerouslySetInnerHTML={{ __html: svgMarkup }} />
             </div>
           </>
         )}

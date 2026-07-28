@@ -251,7 +251,7 @@ async function main() {
   await ddb.send(new PutCommand({
     TableName: registryTable,
     Item: {
-      moduleName,
+      moduleName: canonicalName,
       version: "latest",
       latestVersion: version,
       ownerId: owner,
