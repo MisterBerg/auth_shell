@@ -186,6 +186,48 @@ function toIsoDate(value: string): string | undefined {
   return value ? new Date(`${value}T00:00:00`).toISOString() : undefined;
 }
 
+type WorkNoteEntry = {
+  author?: string;
+  timestamp?: string;
+  body: string;
+};
+
+const WORK_NOTE_DELIMITER = "\n\n---\n\n";
+
+function formatWorkNoteEntry(author: string | undefined, timestamp: string, body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return "";
+  const headerParts = [author?.trim() || "User", timestamp].filter(Boolean);
+  return `[[note]] ${headerParts.join(" @ ")}\n${trimmed}`;
+}
+
+function parseWorkNoteEntries(value: string): WorkNoteEntry[] {
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  return trimmed
+    .split(WORK_NOTE_DELIMITER)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const lines = part.split(/\r?\n/);
+      const header = lines[0] ?? "";
+      const body = lines.slice(1).join("\n").trim();
+      const match = header.match(/^\[\[note\]\]\s+(.*?)\s+@\s+(.+)$/);
+      if (match) {
+        return {
+          author: match[1]?.trim() || undefined,
+          timestamp: match[2]?.trim() || undefined,
+          body: body || "",
+        };
+      }
+      return {
+        author: undefined,
+        timestamp: undefined,
+        body: part,
+      };
+    });
+}
+
 function escapeXml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -1053,6 +1095,7 @@ export default function WorkManager({ config }: ModuleProps) {
           isNew={editorState.isNew}
           allItems={items}
           members={members}
+          currentUserLabel={user?.name?.trim() || user?.email?.trim() || "User"}
           onClose={() => setEditorState(null)}
           onSave={async (draft) => {
             const saved = await saveDraft(draft, editorState.isNew);
@@ -1696,6 +1739,7 @@ function WorkDetail({
   isNew,
   allItems,
   members,
+  currentUserLabel,
   onClose,
   onSave,
   onSaveAndCreateDependency,
@@ -1710,6 +1754,7 @@ function WorkDetail({
   isNew: boolean;
   allItems: WorkItem[];
   members: ProjectMember[];
+  currentUserLabel: string;
   onClose: () => void;
   onSave: (draft: WorkItem) => Promise<void>;
   onSaveAndCreateDependency: (draft: WorkItem) => Promise<void>;
@@ -1723,19 +1768,33 @@ function WorkDetail({
   const [draft, setDraft] = useState<WorkItem>({ ...item, tags: [...item.tags], dependencies: [...item.dependencies], attachments: [...item.attachments] });
   const [tagDraft, setTagDraft] = useState(item.tags.join(", "));
   const [dependencyQuery, setDependencyQuery] = useState("");
+  const [noteDraft, setNoteDraft] = useState("");
 
   useEffect(() => {
     setDraft({ ...item, tags: [...item.tags], dependencies: [...item.dependencies], attachments: [...item.attachments] });
     setTagDraft(item.tags.join(", "));
     setDependencyQuery("");
+    setNoteDraft("");
   }, [item]);
 
   const dependencyCandidates = useMemo(() => buildDependencyCandidates(draft, allItems, dependencyQuery), [allItems, dependencyQuery, draft]);
   const selectedDependencies = useMemo(() => draft.dependencies.map((id) => allItems.find((candidate) => candidate.id === id)).filter(Boolean) as WorkItem[], [allItems, draft.dependencies]);
+  const noteEntries = useMemo(() => parseWorkNoteEntries(draft.notes), [draft.notes]);
 
   const setField = useCallback(<K extends keyof WorkItem>(key: K, value: WorkItem[K]) => {
     setDraft((current) => ({ ...current, [key]: value, updatedAt: nowIso() }));
   }, []);
+
+  const addNoteEntry = useCallback(() => {
+    const entry = formatWorkNoteEntry(currentUserLabel, new Date().toLocaleString(), noteDraft);
+    if (!entry) return;
+    setDraft((current) => ({
+      ...current,
+      notes: current.notes.trim() ? `${current.notes.trim()}${WORK_NOTE_DELIMITER}${entry}` : entry,
+      updatedAt: nowIso(),
+    }));
+    setNoteDraft("");
+  }, [currentUserLabel, noteDraft]);
 
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 950, background: "rgba(3,8,15,0.62)", display: "flex", alignItems: "center", justifyContent: "center", padding: "2rem" }} onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -1752,9 +1811,6 @@ function WorkDetail({
           <div style={{ display: "flex", flexDirection: "column", gap: "0.85rem" }}>
             <label style={labelStyle()}>Description
               <textarea value={draft.description} onChange={(e) => setField("description", e.target.value)} rows={5} style={textAreaStyle()} />
-            </label>
-            <label style={labelStyle()}>Notes
-              <textarea value={draft.notes} onChange={(e) => setField("notes", e.target.value)} rows={7} style={textAreaStyle()} />
             </label>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem" }}>
               <label style={labelStyle()}>Start date
@@ -1816,6 +1872,30 @@ function WorkDetail({
                   ))}
                 </div>
               )}
+            </div>
+            <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, padding: "0.85rem", background: C.panel2, display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+              <div style={{ color: C.text, fontWeight: 700 }}>Task Updates</div>
+              {noteEntries.length === 0 ? (
+                <div style={{ color: C.muted, fontSize: "0.82rem" }}>No notes yet.</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
+                  {noteEntries.map((entry, index) => (
+                    <div key={`${entry.timestamp ?? "note"}-${index}`} style={{ border: `1px solid ${C.border}`, borderRadius: 10, background: C.panel, padding: "0.7rem 0.8rem", display: "flex", flexDirection: "column", gap: "0.35rem" }}>
+                      <div style={{ color: C.muted, fontSize: "0.75rem", fontWeight: 700 }}>
+                        {entry.author || "Note"}{entry.timestamp ? ` · ${entry.timestamp}` : ""}
+                      </div>
+                      <div style={{ color: C.text, fontSize: "0.84rem", lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{entry.body}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: "0.75rem", display: "flex", flexDirection: "column", gap: "0.55rem" }}>
+                <div style={{ color: C.muted, fontSize: "0.78rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em" }}>Add Note</div>
+                <textarea value={noteDraft} onChange={(e) => setNoteDraft(e.target.value)} rows={4} placeholder="Add a timestamped update for this task..." style={textAreaStyle()} />
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <button onClick={addNoteEntry} disabled={!noteDraft.trim()} style={noteDraft.trim() ? ghostButton() : { ...ghostButton(), opacity: 0.55, cursor: "not-allowed" }}>Add Note Entry</button>
+                </div>
+              </div>
             </div>
           </div>
 
