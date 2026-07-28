@@ -482,7 +482,7 @@ function buildChartSpec(items: WorkItem[]): ChartSpec | null {
     startDate,
     dayCount: Math.max(1, calendarDaysBetween(startDate, endDate)),
     labelWidth: 250,
-    rowHeight: 42,
+    rowHeight: 48,
     headerHeight: 44,
   };
 }
@@ -499,7 +499,7 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
   const chartWidth = spec.dayCount * dayWidth + 20;
   const labelWidth = includeLabels ? Math.max(320, spec.labelWidth) : 0;
   const svgWidth = labelWidth + chartWidth;
-  const svgHeight = spec.headerHeight + spec.rows.length * spec.rowHeight + 20;
+  const svgHeight = spec.headerHeight + spec.rows.length * spec.rowHeight;
   const lines: string[] = [];
 
   lines.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}" role="img" aria-label="Work manager gantt chart">`);
@@ -556,7 +556,7 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
     const startOffset = calendarDaysBetween(spec.startDate, row.start);
     const duration = row.isMilestone ? 0 : Math.max(1, calendarDaysBetween(startOfDay(row.start), startOfDay(row.end)) + 1);
     const barX = labelWidth + startOffset * dayWidth + 4;
-    const barY = y + 10;
+    const barY = y + Math.round((spec.rowHeight - 20) / 2);
     const barWidth = row.isMilestone ? 16 : Math.max(18, duration * dayWidth - 8);
     const barColor = kindColor(row.item.kind);
     lines.push(`<rect x="${labelWidth}" y="${y}" width="${chartWidth}" height="${spec.rowHeight}" fill="${index % 2 === 0 ? "#0b1525" : "#0a1322"}"/>`);
@@ -572,7 +572,7 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
 
     if (row.isMilestone) {
       const cx = barX + 8;
-      const cy = barY + 10;
+      const cy = y + Math.round(spec.rowHeight / 2);
       lines.push(`<polygon points="${cx},${cy - 8} ${cx + 8},${cy} ${cx},${cy + 8} ${cx - 8},${cy}" fill="${barColor}" stroke="#08111d" stroke-width="1.5"/>`);
     } else {
       lines.push(`<rect x="${barX}" y="${barY}" width="${barWidth}" height="20" rx="7" ry="7" fill="${barColor}" opacity="0.96"/>`);
@@ -585,13 +585,13 @@ function buildChartSvg(spec: ChartSpec, selectedItemId: string | undefined, zoom
   const byId = new Map(spec.rows.map((row, index) => [row.item.id, { row, index }]));
   spec.rows.forEach((row, index) => {
     const dependentStartX = labelWidth + calendarDaysBetween(spec.startDate, row.start) * dayWidth + 4;
-    const dependentY = spec.headerHeight + index * spec.rowHeight + 20;
+    const dependentY = spec.headerHeight + index * spec.rowHeight + Math.round(spec.rowHeight / 2);
     row.item.dependencies.forEach((depId) => {
       const dependency = byId.get(depId);
       if (!dependency) return;
       const dependencyWidth = dependency.row.isMilestone ? 16 : Math.max(18, (calendarDaysBetween(startOfDay(dependency.row.start), startOfDay(dependency.row.end)) + 1) * dayWidth - 8);
       const sourceX = labelWidth + calendarDaysBetween(spec.startDate, dependency.row.start) * dayWidth + 4 + dependencyWidth;
-      const sourceY = spec.headerHeight + dependency.index * spec.rowHeight + 20;
+      const sourceY = spec.headerHeight + dependency.index * spec.rowHeight + Math.round(spec.rowHeight / 2);
       const bendX = sourceX + 10;
       lines.push(`<path d="M ${sourceX} ${sourceY} L ${bendX} ${sourceY} L ${bendX} ${dependentY} L ${dependentStartX} ${dependentY}" fill="none" stroke="#93c5fd" stroke-width="1.5"/>`);
       lines.push(`<polygon points="${dependentStartX},${dependentY} ${dependentStartX - 6},${dependentY - 4} ${dependentStartX - 6},${dependentY + 4}" fill="#93c5fd"/>`);
@@ -1433,11 +1433,41 @@ function GanttPanel({
   zoom: number;
   onZoom: React.Dispatch<React.SetStateAction<number>>;
 }) {
+  const headerScrollRef = useRef<HTMLDivElement>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const scrollSyncRef = useRef<"header" | "body" | null>(null);
+  const [timelineBottomInset, setTimelineBottomInset] = useState(0);
   const labelsRef = useRef<HTMLDivElement>(null);
+  const onTimelineScroll = useCallback(() => {}, []);
 
-  const onTimelineScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
-    if (!labelsRef.current) return;
-    labelsRef.current.scrollTop = event.currentTarget.scrollTop;
+  useEffect(() => {
+    const element = timelineRef.current;
+    if (!element) return;
+
+    const measure = () => {
+      const inset = Math.max(0, element.offsetHeight - element.clientHeight);
+      setTimelineBottomInset(inset);
+    };
+
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [spec, svgMarkup]);
+
+  const syncHorizontalScroll = useCallback((source: "header" | "body", scrollLeft: number) => {
+    const header = headerScrollRef.current;
+    const body = timelineRef.current;
+    if (!header || !body) return;
+    if (scrollSyncRef.current && scrollSyncRef.current !== source) return;
+    scrollSyncRef.current = source;
+    if (source === "header") {
+      if (body.scrollLeft !== scrollLeft) body.scrollLeft = scrollLeft;
+    } else if (header.scrollLeft !== scrollLeft) {
+      header.scrollLeft = scrollLeft;
+    }
+    requestAnimationFrame(() => {
+      if (scrollSyncRef.current === source) scrollSyncRef.current = null;
+    });
   }, []);
 
   const groupMeta = useMemo(() => {
@@ -1452,6 +1482,111 @@ function GanttPanel({
       };
     });
   }, [spec]);
+
+  if (spec && svgMarkup) {
+    return (
+      <section style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column", border: `1px solid ${C.border}`, borderRadius: 14, background: C.panel, overflow: "hidden" }}>
+        <header style={{ padding: "0.9rem 1rem", borderBottom: `1px solid ${C.border}`, background: C.panel2, display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontWeight: 700 }}>Gantt Schedule</div>
+            <div style={{ marginTop: "0.15rem", color: C.muted, fontSize: "0.78rem" }}>Use the shared vertical schedule scroller for up/down movement and the timeline scrollbar for left/right movement.</div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", color: C.muted, fontSize: "0.78rem" }}>
+            <button onClick={() => onZoom((current) => Math.max(0.1, Number((current - 0.12).toFixed(2))))} style={miniButton()}>-</button>
+            <input
+              aria-label="Gantt zoom"
+              type="range"
+              min={0.1}
+              max={4}
+              step={0.05}
+              value={zoom}
+              onChange={(event) => onZoom(Number(event.target.value))}
+              style={{ width: 150 }}
+            />
+            <button onClick={() => onZoom((current) => Math.min(4, Number((current + 0.12).toFixed(2))))} style={miniButton()}>+</button>
+            <span style={{ minWidth: 48, textAlign: "right" }}>{Math.round(zoom * 100)}%</span>
+          </div>
+        </header>
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            display: "grid",
+            gridTemplateColumns: "320px minmax(0, 1fr)",
+            gridTemplateRows: `${spec.headerHeight}px minmax(0, 1fr)`,
+            overflow: "hidden",
+          }}
+        >
+          <div style={{ borderRight: `1px solid ${C.border}`, boxSizing: "border-box", display: "grid", gridTemplateColumns: "110px 1fr", alignItems: "center", borderBottom: `1px solid ${C.border}`, fontSize: "0.76rem", fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em", background: C.panel2 }}>
+            <div style={{ padding: "0 0.75rem" }}>Group</div>
+            <div style={{ padding: "0 0.75rem" }}>Task</div>
+          </div>
+          <div style={{ minWidth: 0, borderBottom: `1px solid ${C.border}`, background: C.panel2, overflow: "hidden" }}>
+            <div
+              ref={headerScrollRef}
+              onScroll={(event) => syncHorizontalScroll("header", event.currentTarget.scrollLeft)}
+              style={{ width: "100%", height: "100%", overflowX: "auto", overflowY: "hidden" }}
+            >
+              <div style={{ minWidth: "fit-content", height: spec.headerHeight, overflow: "hidden" }}>
+                <div dangerouslySetInnerHTML={{ __html: svgMarkup }} />
+              </div>
+            </div>
+          </div>
+          <div style={{ gridColumn: "1 / span 2", minHeight: 0, overflowY: "auto", overflowX: "hidden" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "320px minmax(0, 1fr)", minHeight: spec.rows.length * spec.rowHeight + timelineBottomInset }}>
+              <div style={{ borderRight: `1px solid ${C.border}`, background: C.panel2, paddingBottom: timelineBottomInset }}>
+                {groupMeta.map(({ row, firstInGroup }, index) => (
+                  <div
+                    key={row.item.id}
+                    onClick={() => onSelect(row.item.id)}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        onSelect(row.item.id);
+                      }
+                    }}
+                    style={{
+                      height: spec.rowHeight,
+                      boxSizing: "border-box",
+                      display: "grid",
+                      gridTemplateColumns: "110px 1fr",
+                      alignItems: "stretch",
+                      borderBottom: `1px solid ${C.border}`,
+                      borderTop: firstInGroup ? `2px solid ${row.item.id === selectedItemId ? C.accent : "#28415f"}` : undefined,
+                      background: row.item.id === selectedItemId ? "rgba(59,130,246,0.12)" : index % 2 === 0 ? C.panel : "#0a1322",
+                      color: C.text,
+                      cursor: "pointer",
+                    }}
+                  >
+                    <div style={{ padding: "0.55rem 0.6rem", borderRight: `1px solid ${C.border}`, display: "flex", alignItems: "center", color: firstInGroup ? "#cbd5e1" : "transparent", fontSize: "0.78rem", fontWeight: firstInGroup ? 700 : 500, background: firstInGroup ? "rgba(148,163,184,0.06)" : "transparent", overflow: "hidden" }}>
+                      <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{firstInGroup ? row.lane : ""}</span>
+                    </div>
+                    <div style={{ padding: "0.45rem 0.7rem", display: "flex", flexDirection: "column", justifyContent: "center", textAlign: "left", overflow: "hidden", minWidth: 0 }}>
+                      <strong style={{ fontSize: "0.86rem", lineHeight: 1.2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{row.item.title}</strong>
+                      <span style={{ color: C.muted, fontSize: "0.72rem", lineHeight: 1.2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{row.item.kind} | {row.item.status}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ minWidth: 0, overflow: "hidden", background: C.panel }}>
+                <div
+                  ref={timelineRef}
+                  onScroll={(event) => syncHorizontalScroll("body", event.currentTarget.scrollLeft)}
+                  style={{ width: "100%", height: spec.rows.length * spec.rowHeight + timelineBottomInset, overflowX: "auto", overflowY: "hidden" }}
+                >
+                  <div style={{ minWidth: "fit-content", height: spec.rows.length * spec.rowHeight, overflow: "hidden" }}>
+                    <div style={{ transform: `translateY(-${spec.headerHeight}px)` }} dangerouslySetInnerHTML={{ __html: svgMarkup }} />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column", border: `1px solid ${C.border}`, borderRadius: 14, background: C.panel, overflow: "hidden" }}>
@@ -1482,11 +1617,11 @@ function GanttPanel({
         ) : (
           <>
             <div style={{ width: 320, flexShrink: 0, borderRight: `1px solid ${C.border}`, display: "flex", flexDirection: "column", background: C.panel2 }}>
-              <div style={{ height: spec.headerHeight, display: "grid", gridTemplateColumns: "110px 1fr", alignItems: "center", borderBottom: `1px solid ${C.border}`, fontSize: "0.76rem", fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+              <div style={{ height: spec.headerHeight, boxSizing: "border-box", display: "grid", gridTemplateColumns: "110px 1fr", alignItems: "center", borderBottom: `1px solid ${C.border}`, fontSize: "0.76rem", fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
                 <div style={{ padding: "0 0.75rem" }}>Group</div>
                 <div style={{ padding: "0 0.75rem" }}>Task</div>
               </div>
-              <div ref={labelsRef} style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+              <div ref={labelsRef} style={{ flex: 1, minHeight: 0, overflow: "hidden", paddingBottom: timelineBottomInset }}>
                 {groupMeta.map(({ row, firstInGroup, lastInGroup }, index) => (
                   <div
                     key={row.item.id}
@@ -1501,6 +1636,7 @@ function GanttPanel({
                     }}
                     style={{
                       height: spec.rowHeight,
+                      boxSizing: "border-box",
                       display: "grid",
                       gridTemplateColumns: "110px 1fr",
                       alignItems: "stretch",
@@ -1514,15 +1650,15 @@ function GanttPanel({
                     <div style={{ padding: "0.55rem 0.6rem", borderRight: `1px solid ${C.border}`, display: "flex", alignItems: "center", color: firstInGroup ? "#cbd5e1" : "transparent", fontSize: "0.78rem", fontWeight: firstInGroup ? 700 : 500, background: firstInGroup ? "rgba(148,163,184,0.06)" : "transparent" }}>
                       {firstInGroup ? row.lane : ""}
                     </div>
-                    <div style={{ padding: "0.45rem 0.7rem", display: "flex", flexDirection: "column", justifyContent: "center", textAlign: "left" }}>
-                      <strong style={{ fontSize: "0.86rem" }}>{row.item.title}</strong>
+                    <div style={{ padding: "0.45rem 0.7rem", display: "flex", flexDirection: "column", justifyContent: "center", textAlign: "left", overflow: "hidden", minWidth: 0 }}>
+                      <strong style={{ fontSize: "0.86rem", lineHeight: 1.2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{row.item.title}</strong>
                       <span style={{ color: C.muted, fontSize: "0.72rem" }}>{row.item.kind} · {row.item.status}</span>
                     </div>
                   </div>
                 ))}
               </div>
             </div>
-            <div style={{ flex: 1, minWidth: 0, minHeight: 0, overflow: "auto" }} onScroll={onTimelineScroll}>
+            <div ref={timelineRef} style={{ flex: 1, minWidth: 0, minHeight: 0, overflow: "auto" }} onScroll={onTimelineScroll}>
               <div style={{ minWidth: "fit-content" }} dangerouslySetInnerHTML={{ __html: svgMarkup }} />
             </div>
           </>
