@@ -44,6 +44,12 @@ import {
 } from "./model.ts";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
+type ImportSelectionState = {
+  rootDir: string;
+  fileMap: Map<string, File>;
+  markdownFiles: string[];
+  selectedEntryPath: string;
+};
 const COLORS = {
   bg: "#080f1c",
   bgPanel: "#0b1525",
@@ -887,6 +893,10 @@ function resolveMediaRelativePath(
   href: string | undefined
 ): string | null {
   if (!href || isExternalHref(href)) return null;
+  const normalizedHref = href.split(/[?#]/)[0];
+  if (normalizedHref.startsWith("media/")) {
+    return normalizedHref.slice("media/".length);
+  }
   const currentDoc = manifest.docs[currentDocId];
   if (!currentDoc) return null;
   const resolvedPath = resolveRelativeHref(currentDoc.relativePath, href);
@@ -909,13 +919,11 @@ function DocumentationMedia({
 }) {
   const getS3Client = useAwsS3Client();
   const [url, setUrl] = useState<string | "loading" | "error">("loading");
-  const [inlineSvg, setInlineSvg] = useState<string | null>(null);
   const mediaRelativePath = resolveMediaRelativePath(manifest, currentDocId, href);
 
   useEffect(() => {
     if (!mediaRelativePath) {
       setUrl("error");
-      setInlineSvg(null);
       return;
     }
 
@@ -931,37 +939,19 @@ function DocumentationMedia({
     getS3Client(storage.bucket)
       .then((s3) => s3.send(new GetObjectCommand({ Bucket: storage.bucket, Key: key })))
       .then(async (response) => {
-        if (isSvgPath(mediaRelativePath)) {
-          return {
-            kind: "svg" as const,
-            text: await response.Body!.transformToString("utf-8"),
-          };
-        }
-        return {
-          kind: "binary" as const,
-          bytes: await response.Body!.transformToByteArray(),
-        };
-      })
-      .then((payload) => {
+        const bytes = await response.Body!.transformToByteArray();
         if (cancelled) return;
-        if (payload.kind === "svg") {
-          setInlineSvg(payload.text);
-          setUrl("");
-          return;
-        }
-        const exactBytes = new Uint8Array(payload.bytes.byteLength);
-        exactBytes.set(payload.bytes);
+        const exactBytes = new Uint8Array(bytes.byteLength);
+        exactBytes.set(bytes);
         const blob = new Blob([exactBytes], {
           type: contentTypeForPath(mediaRelativePath),
         });
         const blobUrl = URL.createObjectURL(blob);
         mediaBlobCache.set(cacheKey, blobUrl);
-        setInlineSvg(null);
         setUrl(blobUrl);
       })
       .catch(() => {
         if (!cancelled) {
-          setInlineSvg(null);
           setUrl("error");
         }
       });
@@ -972,21 +962,6 @@ function DocumentationMedia({
   }, [getS3Client, mediaRelativePath, storage]);
 
   if (!mediaRelativePath) return null;
-  if (inlineSvg) {
-    return (
-      <div
-        style={{
-          maxWidth: "100%",
-          borderRadius: 8,
-          overflowX: "auto",
-          background: "#ffffff",
-          padding: "0.75rem",
-          border: `1px solid ${COLORS.border}`,
-        }}
-        dangerouslySetInnerHTML={{ __html: inlineSvg }}
-      />
-    );
-  }
   if (url === "loading") {
     return <em style={{ color: COLORS.muted, fontSize: "0.85em" }}>[{alt ?? mediaRelativePath} loading...]</em>;
   }
@@ -1366,6 +1341,7 @@ export default function DocumentationViewer({ config }: ModuleProps) {
   const [editingLabel, setEditingLabel] = useState(false);
   const [labelDraft, setLabelDraft] = useState(rootTitle);
   const [importingDocs, setImportingDocs] = useState(false);
+  const [importSelection, setImportSelection] = useState<ImportSelectionState | null>(null);
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1695,50 +1671,18 @@ export default function DocumentationViewer({ config }: ModuleProps) {
     [currentContent, currentDoc, getS3Client, storage, updateCurrentContent]
   );
 
-  const importMarkdownDirectory = useCallback(
-    async (files: File[]) => {
-      if (!manifest || !currentDocId || files.length === 0) return;
+  const executeMarkdownDirectoryImport = useCallback(
+    async (rootDir: string, fileMap: Map<string, File>, entryPath: string) => {
+      if (!manifest || !currentDocId) return;
       const targetDoc = manifest.docs[currentDocId];
       if (!targetDoc) return;
-
-      const firstPath = files[0]?.webkitRelativePath || files[0]?.name || "folder";
-      const rootDir = firstPath.split("/")[0] || "folder";
-      const fileMap = new Map<string, File>();
-
-      for (const file of files) {
-        const rawPath = file.webkitRelativePath || file.name;
-        const parts = rawPath.split("/");
-        const relativePath = parts.length > 1 ? parts.slice(1).join("/") : rawPath;
-        if (relativePath) fileMap.set(relativePath, file);
-      }
-
-      const markdownFiles = [...fileMap.keys()]
-        .filter((path) => /\.mdx?$/i.test(path))
-        .sort((a, b) => {
-          const aDepth = a.split("/").length;
-          const bDepth = b.split("/").length;
-          if (aDepth !== bDepth) return aDepth - bDepth;
-          return a.localeCompare(b);
-        });
-
-      if (markdownFiles.length === 0) {
-        setSaveState("error");
-        setStatusMessage("No .md files found in the selected folder.");
-        return;
-      }
-
-      const entryPath = chooseImportEntryPath(markdownFiles, rootDir);
-      if (!entryPath) {
-        setSaveState("error");
-        setStatusMessage("Unable to determine the markdown entry point for that folder.");
-        return;
-      }
       if (!fileMap.has(entryPath)) {
         setSaveState("error");
         setStatusMessage(`Markdown entry not found: ${entryPath}`);
         return;
       }
 
+      setImportSelection(null);
       setImportingDocs(true);
       setSaveState("saving");
       setStatusMessage(`Importing markdown from ${rootDir}...`);
@@ -1789,6 +1733,48 @@ export default function DocumentationViewer({ config }: ModuleProps) {
       }
     },
     [contents, currentDocId, getS3Client, manifest, rootTitle, storage, syncStructure],
+  );
+
+  const importMarkdownDirectory = useCallback(
+    async (files: File[]) => {
+      if (!manifest || !currentDocId || files.length === 0) return;
+
+      const firstPath = files[0]?.webkitRelativePath || files[0]?.name || "folder";
+      const rootDir = firstPath.split("/")[0] || "folder";
+      const fileMap = new Map<string, File>();
+
+      for (const file of files) {
+        const rawPath = file.webkitRelativePath || file.name;
+        const parts = rawPath.split("/");
+        const relativePath = parts.length > 1 ? parts.slice(1).join("/") : rawPath;
+        if (relativePath) fileMap.set(relativePath, file);
+      }
+
+      const markdownFiles = [...fileMap.keys()]
+        .filter((path) => /\.mdx?$/i.test(path))
+        .sort((a, b) => {
+          const aDepth = a.split("/").length;
+          const bDepth = b.split("/").length;
+          if (aDepth !== bDepth) return aDepth - bDepth;
+          return a.localeCompare(b);
+        });
+
+      if (markdownFiles.length === 0) {
+        setSaveState("error");
+        setStatusMessage("No .md files found in the selected folder.");
+        return;
+      }
+
+      const suggestedEntryPath = chooseImportEntryPath(markdownFiles, rootDir) ?? markdownFiles[0]!;
+      setImportSelection({
+        rootDir,
+        fileMap,
+        markdownFiles,
+        selectedEntryPath: suggestedEntryPath,
+      });
+      setStatusMessage(`Choose the starting markdown file for ${rootDir}.`);
+    },
+    [currentDocId, manifest],
   );
 
   const createLinkedDocument = useCallback(
@@ -2118,6 +2104,59 @@ export default function DocumentationViewer({ config }: ModuleProps) {
               <span style={{ fontSize: "0.75rem", color: saveState === "error" ? COLORS.error : saveState === "saved" ? COLORS.success : COLORS.muted }}>
                 {statusMessage ?? (saveState === "saving" ? "Saving..." : saveState === "saved" ? "Saved" : "Ready")}
               </span>
+            </div>
+          </div>
+        )}
+
+        {importSelection && (
+          <div style={{ padding: "0.85rem 0.9rem", borderBottom: `1px solid ${COLORS.border}`, background: COLORS.bgToolbar, display: "flex", flexDirection: "column", gap: "0.7rem" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem", flexWrap: "wrap" }}>
+              <div>
+                <div style={{ color: COLORS.text, fontSize: "0.92rem", fontWeight: 600 }}>Choose Import Entry</div>
+                <div style={{ marginTop: "0.2rem", color: COLORS.muted, fontSize: "0.78rem" }}>
+                  Select the starting markdown file for <span style={{ fontFamily: "monospace", color: COLORS.text }}>{importSelection.rootDir}</span>. The importer will crawl links from this page.
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                <button
+                  onClick={() => {
+                    void executeMarkdownDirectoryImport(importSelection.rootDir, importSelection.fileMap, importSelection.selectedEntryPath);
+                  }}
+                  style={{ background: COLORS.accent, color: "#fff", border: `1px solid ${COLORS.accent}`, borderRadius: 6, padding: "0.45rem 0.75rem", cursor: "pointer", fontSize: "0.8rem", fontWeight: 600 }}
+                >
+                  Import Selected Entry
+                </button>
+                <button
+                  onClick={() => setImportSelection(null)}
+                  style={{ background: "transparent", color: COLORS.muted, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: "0.45rem 0.75rem", cursor: "pointer", fontSize: "0.8rem" }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem", maxHeight: 240, overflowY: "auto" }}>
+              {importSelection.markdownFiles.map((path) => {
+                const selected = path === importSelection.selectedEntryPath;
+                return (
+                  <button
+                    key={path}
+                    onClick={() => setImportSelection((current) => current ? { ...current, selectedEntryPath: path } : current)}
+                    style={{
+                      textAlign: "left",
+                      padding: "0.5rem 0.7rem",
+                      borderRadius: 8,
+                      border: `1px solid ${selected ? COLORS.accent : COLORS.border}`,
+                      background: selected ? "rgba(59,130,246,0.12)" : "transparent",
+                      color: COLORS.text,
+                      cursor: "pointer",
+                      fontSize: "0.8rem",
+                      fontFamily: "monospace",
+                    }}
+                  >
+                    {path}
+                  </button>
+                );
+              })}
             </div>
           </div>
         )}
