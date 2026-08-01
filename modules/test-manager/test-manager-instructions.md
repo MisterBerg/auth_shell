@@ -341,22 +341,15 @@ Use group-level values for shared defaults such as:
 
 ## Required Structural Fields
 
-The software hard-checks these fields after inheritance:
+The software hard-checks only these structural fields after inheritance:
 
 - `test_group_id`
 - `test_id`
 - `title`
-- `failure_mode`
-- `target_module`
 
 The first three are filled structurally if you use normal group/test entries.
 
-You must ensure the resolved test defines:
-
-- `failure_mode`
-- `target_module`
-
-These should be part of the fire-hazard spec design from the start.
+`failure_mode` and `target_module` are no longer globally required by the module. They are still useful fire-hazard metadata, but they should only be treated as required when your specific spec marks them required or your workflow depends on them.
 
 ## Recommended Fire-Hazard Metadata Model
 

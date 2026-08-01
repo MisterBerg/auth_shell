@@ -157,7 +157,7 @@ type ProcedureDefinition = {
 type ArtifactRef = {
   id: string;
   fieldId?: string;
-  kind: "typed" | "supporting";
+  kind: "typed" | "supporting" | "overview";
   name: string;
   bucket: string;
   key: string;
@@ -165,6 +165,11 @@ type ArtifactRef = {
   sizeBytes: number;
   uploadedAt: string;
   uploadedBy?: string;
+};
+
+type OverviewArtifact = {
+  artifact: ArtifactRef;
+  caption?: string;
 };
 
 type StepResult = {
@@ -193,6 +198,8 @@ type TestRun = {
   createdAt: string;
   updatedAt: string;
   createdBy?: string;
+  overviewNotes?: string;
+  overviewArtifacts?: OverviewArtifact[];
   resultsByTestId: Record<string, ResultRecord>;
   excludedTestIds?: string[];
   excludedTestReasons?: Record<string, string>;
@@ -230,6 +237,7 @@ type ReportGenerationOptions = {
   detailHref?: (test: ResolvedTest) => string;
   backToSummaryHref?: string;
   artifactHref?: (context: ReportArtifactContext) => string;
+  overviewArtifactHref?: (artifact: ArtifactRef) => string;
   notes?: string[];
 };
 
@@ -277,7 +285,7 @@ const C = {
   header: "linear-gradient(135deg, #08111d, #0f2135 55%, #173149)",
 };
 
-const STRUCTURAL_REQUIRED_FIELDS = ["test_group_id", "test_id", "title", "failure_mode", "target_module"];
+const STRUCTURAL_REQUIRED_FIELDS = ["test_group_id", "test_id", "title"];
 const FINGERPRINT_EXCLUDED_KEYS = new Set([
   "test_group_id", "test_group_title", "test_id", "title", "description",
   "pre_test_guidance", "pre_test_assets", "equipment_runtime",
@@ -1002,8 +1010,40 @@ function createDefaultRun(currentUser?: string, label = "Run 1"): TestRun {
     createdAt,
     updatedAt: createdAt,
     createdBy: currentUser,
+    overviewNotes: "",
+    overviewArtifacts: [],
     resultsByTestId: {},
   };
+}
+
+function normalizeOverviewArtifacts(value: unknown): OverviewArtifact[] {
+  return Array.isArray(value)
+    ? value.flatMap((entry) => {
+        const record = toRecord(entry);
+        const artifactCandidate = record.artifact ?? record;
+        const artifactRecord = toRecord(artifactCandidate);
+        const id = toStringValue(artifactRecord.id, "");
+        const name = toStringValue(artifactRecord.name, "");
+        const bucket = toStringValue(artifactRecord.bucket, "");
+        const key = toStringValue(artifactRecord.key, "");
+        if (!id || !name || !bucket || !key) return [];
+        return [{
+          artifact: {
+            id,
+            fieldId: toStringValue(artifactRecord.fieldId, "") || undefined,
+            kind: "overview",
+            name,
+            bucket,
+            key,
+            contentType: toStringValue(artifactRecord.contentType, "") || undefined,
+            sizeBytes: Number(artifactRecord.sizeBytes) || 0,
+            uploadedAt: toStringValue(artifactRecord.uploadedAt, nowIso()),
+            uploadedBy: toStringValue(artifactRecord.uploadedBy, "") || undefined,
+          },
+          caption: toStringValue(record.caption, "") || undefined,
+        }];
+      })
+    : [];
 }
 
 function normalizeResultRecord(value: unknown): ResultRecord {
@@ -1043,6 +1083,8 @@ function normalizeWorkspaceState(store: unknown, projectId: string, currentUser?
     activeRunId: toStringValue(record.activeRunId, runs[0]?.id ?? defaultRun.id),
     runs: runs.length > 0 ? runs.map((run) => ({
       ...run,
+      overviewNotes: toStringValue(run.overviewNotes, ""),
+      overviewArtifacts: normalizeOverviewArtifacts(run.overviewArtifacts),
       resultsByTestId: Object.fromEntries(
         Object.entries(run.resultsByTestId ?? {}).map(([testId, result]) => [testId, normalizeResultRecord(result)])
       ),
@@ -1384,6 +1426,10 @@ function artifactArchivePath(testId: string, artifact: ArtifactRef, fieldId?: st
   return `evidence/${safeFileSegment(testId)}/${area}/${safeFileSegment(artifact.id)}-${safeFileSegment(artifact.name)}`;
 }
 
+function overviewArtifactArchivePath(artifact: ArtifactRef): string {
+  return `overview/${safeFileSegment(artifact.id)}-${safeFileSegment(artifact.name)}`;
+}
+
 function markdownArtifactLink(label: string, href: string): string {
   return `[${label}](${href})`;
 }
@@ -1493,6 +1539,7 @@ function generateReportPages(
   const assets: Record<string, { content: string; contentType: string }> = {};
   const detailHref = options.detailHref ?? ((test: ResolvedTest) => `tests/${safeFileSegment(test.id)}.md`);
   const artifactHref = options.artifactHref ?? ((context: ReportArtifactContext) => `s3://${context.artifact.bucket}/${context.artifact.key}`);
+  const overviewArtifactHref = options.overviewArtifactHref ?? ((artifact: ArtifactRef) => `s3://${artifact.bucket}/${artifact.key}`);
   const backToSummaryHref = options.backToSummaryHref ?? "../report.md";
 
   summary.push(`# ${title} Report`);
@@ -1509,6 +1556,24 @@ function generateReportPages(
     }
   }
   summary.push("");
+  if (isMeaningful(run.overviewNotes)) {
+    summary.push("## Run Notes");
+    summary.push("");
+    summary.push(run.overviewNotes?.trim() ?? "");
+    summary.push("");
+  }
+  if ((run.overviewArtifacts?.length ?? 0) > 0) {
+    summary.push("## Run Overview Images");
+    summary.push("");
+    for (const entry of run.overviewArtifacts ?? []) {
+      summary.push(`![${escapeMarkdownCell(entry.caption || entry.artifact.name)}](${overviewArtifactHref(entry.artifact)})`);
+      if (isMeaningful(entry.caption)) {
+        summary.push("");
+        summary.push(`_${escapeMarkdownCell(entry.caption ?? "")}_`);
+      }
+      summary.push("");
+    }
+  }
   if (definition.programAssets.length > 0) {
     summary.push("## Program Overview");
     summary.push("");
@@ -1958,6 +2023,7 @@ function TestManagerInner({ config }: ModuleProps) {
   const getS3Client = useAwsS3Client();
   const storage = useMemo(() => getStorageInfo(config), [config]);
   const importRef = useRef<HTMLInputElement>(null);
+  const overviewImportRef = useRef<HTMLInputElement>(null);
 
   const [definition, setDefinition] = useState<TestDefinition | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
@@ -1970,6 +2036,8 @@ function TestManagerInner({ config }: ModuleProps) {
   const [reportDialogOpen, setReportDialogOpen] = useState(false);
   const [printReportOpen, setPrintReportOpen] = useState(false);
   const [reportArtifactLinks, setReportArtifactLinks] = useState<Record<string, string>>({});
+  const [overviewDragActive, setOverviewDragActive] = useState(false);
+  const [pendingOverviewImages, setPendingOverviewImages] = useState<Array<{ id: string; file: File; caption: string }>>([]);
 
   const resolvedTests = useMemo(() => definition ? buildResolvedTests(definition) : [], [definition]);
   const testsById = useMemo(() => new Map(resolvedTests.map((test) => [test.id, test])), [resolvedTests]);
@@ -2129,6 +2197,104 @@ function TestManagerInner({ config }: ModuleProps) {
       };
     }, "Exclusion reason updated");
   }, [activeRun, updateWorkspace, workspace]);
+
+  const queueOverviewImages = useCallback((files: FileList | null) => {
+    if (!files?.length) return;
+    const accepted = Array.from(files).filter((file) => file.type.startsWith("image/"));
+    if (accepted.length === 0) return;
+    setPendingOverviewImages((current) => [
+      ...current,
+      ...accepted.map((file) => ({ id: makeId("overview-pending"), file, caption: "" })),
+    ]);
+  }, []);
+
+  const uploadOverviewImages = useCallback(async (): Promise<boolean> => {
+    if (!activeRun || pendingOverviewImages.length === 0) return false;
+    setSaving(true);
+    setError("");
+    try {
+      const s3 = await getS3Client(storage.bucket);
+      const uploaded: OverviewArtifact[] = [];
+      for (const entry of pendingOverviewImages) {
+        const key = `${storage.basePrefix}/runs/${activeRun.id}/overview/${makeId("artifact")}-${entry.file.name.replace(/[^a-zA-Z0-9._-]+/g, "-")}`;
+        await s3.send(new PutObjectCommand({
+          Bucket: storage.bucket,
+          Key: key,
+          Body: new Uint8Array(await entry.file.arrayBuffer()),
+          ContentType: entry.file.type || "application/octet-stream",
+          CacheControl: "no-store",
+        }));
+        uploaded.push({
+          artifact: {
+            id: makeId("artifact"),
+            kind: "overview",
+            name: entry.file.name,
+            bucket: storage.bucket,
+            key,
+            contentType: entry.file.type || undefined,
+            sizeBytes: entry.file.size,
+            uploadedAt: nowIso(),
+            uploadedBy: user?.email,
+          },
+          caption: entry.caption.trim() || undefined,
+        });
+      }
+      updateWorkspace((current) => ({
+        ...current,
+        runs: current.runs.map((run) => run.id !== activeRun.id ? run : {
+          ...run,
+          overviewArtifacts: [...(run.overviewArtifacts ?? []), ...uploaded],
+          updatedAt: nowIso(),
+        }),
+      }), "Overview images uploaded");
+      setPendingOverviewImages([]);
+      return true;
+    } catch (uploadError: unknown) {
+      setError((uploadError as Error).message);
+      setSaving(false);
+      return false;
+    }
+  }, [activeRun, getS3Client, pendingOverviewImages, storage.basePrefix, storage.bucket, updateWorkspace, user?.email]);
+
+  const updateOverviewArtifactCaption = useCallback((artifactId: string, caption: string) => {
+    if (!activeRun) return;
+    updateWorkspace((current) => ({
+      ...current,
+      runs: current.runs.map((run) => run.id !== activeRun.id ? run : {
+        ...run,
+        overviewArtifacts: (run.overviewArtifacts ?? []).map((entry) => entry.artifact.id === artifactId ? { ...entry, caption } : entry),
+        updatedAt: nowIso(),
+      }),
+    }), "Overview image caption updated");
+  }, [activeRun, updateWorkspace]);
+
+  const deleteOverviewArtifact = useCallback(async (artifactId: string) => {
+    if (!activeRun) return;
+    const entry = (activeRun.overviewArtifacts ?? []).find((candidate) => candidate.artifact.id === artifactId);
+    if (!entry) return;
+    const confirmed = window.confirm(`Delete "${entry.artifact.name}" from the run overview and permanently remove it from S3?\n\nThis cannot be undone.`);
+    if (!confirmed) return;
+    setSaving(true);
+    setError("");
+    try {
+      const s3 = await getS3Client(entry.artifact.bucket);
+      await s3.send(new DeleteObjectCommand({
+        Bucket: entry.artifact.bucket,
+        Key: entry.artifact.key,
+      }));
+      updateWorkspace((current) => ({
+        ...current,
+        runs: current.runs.map((run) => run.id !== activeRun.id ? run : {
+          ...run,
+          overviewArtifacts: (run.overviewArtifacts ?? []).filter((candidate) => candidate.artifact.id !== artifactId),
+          updatedAt: nowIso(),
+        }),
+      }), "Overview image deleted");
+    } catch (deleteError: unknown) {
+      setError((deleteError as Error).message);
+      setSaving(false);
+    }
+  }, [activeRun, getS3Client, updateWorkspace]);
 
   const uploadArtifacts = useCallback(async (files: File[], testId: string, fieldId: string | null): Promise<boolean> => {
     if (!files.length || !activeRun) return false;
@@ -2291,6 +2457,9 @@ function TestManagerInner({ config }: ModuleProps) {
   const reportArtifacts = useMemo(() => {
     if (!activeRun) return [] as ArtifactRef[];
     const deduped = new Map<string, ArtifactRef>();
+    for (const entry of activeRun.overviewArtifacts ?? []) {
+      deduped.set(entry.artifact.id, entry.artifact);
+    }
     for (const test of includedTests) {
       const result = ensureResult(activeRun, test, user?.email);
       for (const artifacts of Object.values(result.typedArtifacts)) {
@@ -2334,6 +2503,7 @@ function TestManagerInner({ config }: ModuleProps) {
     if (!definition || !activeRun) return null;
     return generateReportPages(definition, activeRun, includedTests, {
       artifactHref: ({ artifact }) => reportArtifactLinks[artifact.id] ?? `s3://${artifact.bucket}/${artifact.key}`,
+      overviewArtifactHref: (artifact) => reportArtifactLinks[artifact.id] ?? `s3://${artifact.bucket}/${artifact.key}`,
       notes: reportArtifacts.length > 0
         ? ["Evidence links in the live report and PDF are time-limited access URLs and may expire after about 7 days."]
         : undefined,
@@ -2344,6 +2514,7 @@ function TestManagerInner({ config }: ModuleProps) {
     if (!definition || !activeRun) return null;
     const zipPages = generateReportPages(definition, activeRun, includedTests, {
       artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
+      overviewArtifactHref: (artifact) => overviewArtifactArchivePath(artifact),
     });
     const files: Record<string, ZipFileContent> = {
       "report.md": zipPages.summary,
@@ -2355,6 +2526,23 @@ function TestManagerInner({ config }: ModuleProps) {
 
     const manifest: Array<Record<string, string | number | null>> = [];
     const s3 = await getS3Client(storage.bucket);
+    for (const entry of activeRun.overviewArtifacts ?? []) {
+      const archivePath = overviewArtifactArchivePath(entry.artifact);
+      const bytes = await readOptionalBytes(s3, entry.artifact.bucket, entry.artifact.key);
+      if (bytes) files[archivePath] = bytes;
+      manifest.push({
+        testId: null,
+        fieldId: null,
+        kind: entry.artifact.kind,
+        name: entry.artifact.name,
+        archivePath,
+        bucket: entry.artifact.bucket,
+        key: entry.artifact.key,
+        contentType: entry.artifact.contentType ?? null,
+        sizeBytes: entry.artifact.sizeBytes,
+        caption: entry.caption ?? null,
+      });
+    }
     for (const test of includedTests) {
       const result = ensureResult(activeRun, test, user?.email);
       for (const [fieldId, artifacts] of Object.entries(result.typedArtifacts)) {
@@ -2868,6 +3056,126 @@ function TestManagerInner({ config }: ModuleProps) {
                     </section>
                   ) : null}
                   <section style={cardStyle()}>
+                    <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Run Notes</div>
+                    <div style={{ marginTop: "0.35rem", color: C.muted, fontSize: "0.84rem", lineHeight: 1.6 }}>
+                      Capture run-wide setup details such as the vehicle used, hardware stack, software build, wiring configuration, fixtures, ambient conditions, or other operator notes.
+                    </div>
+                    <div style={{ marginTop: "0.85rem" }}>
+                      <DraftTextInput
+                        value={activeRun?.overviewNotes ?? ""}
+                        onCommit={(nextValue) => updateWorkspace((current) => ({
+                          ...current,
+                          runs: current.runs.map((run) => run.id === activeRun?.id ? { ...run, overviewNotes: nextValue, updatedAt: nowIso() } : run),
+                        }), "Run notes updated")}
+                        multiline
+                        rows={8}
+                        placeholder="Example: 2023 F-150 XLT, GO9 + custom IOX harness rev B, bench supply at 13.6 V, firmware build 1.5.7-rc2, relay load simulator installed."
+                        style={{ lineHeight: 1.6 }}
+                      />
+                    </div>
+                  </section>
+                  <section style={cardStyle()}>
+                    <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Overview Images</div>
+                    <div style={{ marginTop: "0.35rem", color: C.muted, fontSize: "0.84rem", lineHeight: 1.6 }}>
+                      Drop setup photos, vehicle photos, harness photos, or other run-wide reference images here. They will be added to the report summary once saved.
+                    </div>
+                    <div
+                      onDragOver={(event) => { event.preventDefault(); setOverviewDragActive(true); }}
+                      onDragLeave={() => setOverviewDragActive(false)}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        setOverviewDragActive(false);
+                        queueOverviewImages(event.dataTransfer.files);
+                      }}
+                      style={{
+                        marginTop: "0.85rem",
+                        border: `1px dashed ${overviewDragActive ? C.accent : C.border}`,
+                        borderRadius: 12,
+                        background: overviewDragActive ? C.accentSoft : C.panel2,
+                        padding: "0.9rem",
+                      }}
+                    >
+                      <div style={{ color: C.text, fontSize: "0.9rem" }}>
+                        Drop images here, or{" "}
+                        <button type="button" onClick={() => overviewImportRef.current?.click()} style={{ ...buttonStyle("ghost"), padding: "0.25rem 0.45rem", display: "inline-block" }}>
+                          browse
+                        </button>
+                      </div>
+                      <div style={{ marginTop: "0.4rem", color: C.muted, fontSize: "0.8rem" }}>
+                        Files stay in review until you save them. Supported files are standard browser image types.
+                      </div>
+                    </div>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      hidden
+                      ref={overviewImportRef}
+                      onChange={(event) => {
+                        queueOverviewImages(event.target.files);
+                        event.target.value = "";
+                      }}
+                    />
+                    {pendingOverviewImages.length > 0 ? (
+                      <div style={{ marginTop: "0.85rem", border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.85rem", display: "grid", gap: "0.75rem" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
+                          <div style={{ color: C.text, fontSize: "0.86rem", fontWeight: 700 }}>Pending overview images</div>
+                          <button type="button" onClick={() => void uploadOverviewImages()} style={buttonStyle("primary")}>Save Overview Images</button>
+                        </div>
+                        {pendingOverviewImages.map((entry) => (
+                          <div key={entry.id} style={{ border: `1px solid ${C.border}`, borderRadius: 10, background: C.panel, padding: "0.75rem" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center" }}>
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ color: C.text, fontSize: "0.88rem", fontWeight: 600, overflowWrap: "anywhere" }}>{entry.file.name}</div>
+                                <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.78rem" }}>{formatBytes(entry.file.size)}</div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setPendingOverviewImages((current) => current.filter((candidate) => candidate.id !== entry.id))}
+                                style={{ ...buttonStyle("danger"), padding: "0.3rem 0.55rem" }}
+                              >
+                                x
+                              </button>
+                            </div>
+                            <div style={{ marginTop: "0.6rem" }}>
+                              <label style={labelStyle()}>
+                                Caption
+                                <input
+                                  value={entry.caption}
+                                  onChange={(event) => setPendingOverviewImages((current) => current.map((candidate) => candidate.id === entry.id ? { ...candidate, caption: event.target.value } : candidate))}
+                                  placeholder="Caption shown under the image in the overview summary"
+                                  style={inputStyle()}
+                                />
+                              </label>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                    {(activeRun?.overviewArtifacts?.length ?? 0) > 0 ? (
+                      <div style={{ marginTop: "0.85rem", display: "grid", gap: "0.75rem" }}>
+                        {(activeRun?.overviewArtifacts ?? []).map((entry) => (
+                          <div key={entry.artifact.id} style={{ border: `1px solid ${C.border}`, borderRadius: 10, background: C.panel2, padding: "0.75rem" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center" }}>
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ color: C.text, fontSize: "0.88rem", fontWeight: 600, overflowWrap: "anywhere" }}>{entry.artifact.name}</div>
+                                <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.78rem" }}>{formatBytes(entry.artifact.sizeBytes)}</div>
+                              </div>
+                              <button type="button" onClick={() => void deleteOverviewArtifact(entry.artifact.id)} style={{ ...buttonStyle("danger"), padding: "0.3rem 0.55rem" }}>x</button>
+                            </div>
+                            <div style={{ marginTop: "0.6rem" }}>
+                              <DraftTextInput
+                                value={entry.caption ?? ""}
+                                onCommit={(nextValue) => updateOverviewArtifactCaption(entry.artifact.id, nextValue)}
+                                placeholder="Caption shown under the image in the overview summary"
+                              />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </section>
+                  <section style={cardStyle()}>
                     <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>System Diagrams</div>
                     <div style={{ marginTop: "0.85rem" }}>
                       {definition.programAssets.length > 0 ? (
@@ -2947,6 +3255,12 @@ function TestManagerInner({ config }: ModuleProps) {
           <article className="test-manager-print-article" style={{ width: "calc(100vw - 0.4rem)", maxWidth: "none", margin: "0 auto 0.5rem", background: "white", border: "1px solid #dbe4ee", borderRadius: 8, padding: "1rem 1.1rem", boxShadow: "0 8px 24px rgba(15,23,42,0.06)", boxSizing: "border-box", fontSize: "1.05rem", lineHeight: 1.65 }}>
             <h1 style={{ marginTop: 0, marginBottom: "0.6rem", fontSize: "2rem", lineHeight: 1.2 }}>{getProgramTitle(definition, config)} Report</h1>
             <p style={{ color: "#374151", fontSize: "1rem", lineHeight: 1.6 }}><strong>Run:</strong> {activeRun.label}<br /><strong>Generated:</strong> {formatDate(nowIso())}</p>
+            {isMeaningful(activeRun.overviewNotes) ? (
+              <section style={{ marginBottom: "1.5rem", paddingBottom: "1.5rem", borderBottom: "1px solid #e5e7eb" }}>
+                <h2 style={{ color: "#0f172a", fontSize: "1.45rem", lineHeight: 1.25 }}>Run Notes</h2>
+                <div style={{ color: "#374151", lineHeight: 1.7, fontSize: "1.02rem", whiteSpace: "pre-wrap" }}>{activeRun.overviewNotes?.trim()}</div>
+              </section>
+            ) : null}
             {definition.programAssets.length > 0 ? (
               <section style={{ marginBottom: "1.5rem", paddingBottom: "1.5rem", borderBottom: "1px solid #e5e7eb" }}>
                 <h2 style={{ color: "#0f172a", fontSize: "1.45rem", lineHeight: 1.25 }}>Program Overview</h2>
@@ -3003,6 +3317,7 @@ export async function onExport(ctx: ExportContext): Promise<void> {
     const tests = buildResolvedTests(definition);
     const pages = generateReportPages(definition, activeRun, tests, {
       artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
+      overviewArtifactHref: (artifact) => overviewArtifactArchivePath(artifact),
     });
     await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/report.md`, pages.summary, "text/markdown;charset=utf-8");
     for (const [testId, detail] of Object.entries(pages.details)) {
@@ -3013,6 +3328,25 @@ export async function onExport(ctx: ExportContext): Promise<void> {
     }
 
     const manifest: Array<Record<string, string | number | null>> = [];
+    for (const entry of activeRun.overviewArtifacts ?? []) {
+      const exportPath = `${ctx.projectPrefix}${ctx.config.id}/export/${overviewArtifactArchivePath(entry.artifact)}`;
+      const bytes = await readOptionalBytes(ctx.s3Client as S3Client, entry.artifact.bucket, entry.artifact.key);
+      if (bytes) {
+        await writeBytes(ctx.s3Client as S3Client, storage.bucket, exportPath, bytes, entry.artifact.contentType || "application/octet-stream");
+      }
+      manifest.push({
+        testId: null,
+        fieldId: null,
+        kind: entry.artifact.kind,
+        name: entry.artifact.name,
+        archivePath: overviewArtifactArchivePath(entry.artifact),
+        bucket: entry.artifact.bucket,
+        key: entry.artifact.key,
+        contentType: entry.artifact.contentType ?? null,
+        sizeBytes: entry.artifact.sizeBytes,
+        caption: entry.caption ?? null,
+      });
+    }
     for (const test of tests) {
       const result = ensureResult(activeRun, test);
       for (const [fieldId, artifacts] of Object.entries(result.typedArtifacts)) {
