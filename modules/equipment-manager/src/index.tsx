@@ -790,13 +790,24 @@ function createKnownSiglentPreset(targetDeviceId?: string, targetAddress?: strin
   return { device, scripts };
 }
 
+function dedupeById<T extends { id: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  const deduped: T[] = [];
+  for (const item of items) {
+    if (!item.id || seen.has(item.id)) continue;
+    seen.add(item.id);
+    deduped.push(item);
+  }
+  return deduped;
+}
+
 function normalizeState(value: unknown): EquipmentManagerState {
   const record = toRecord(value);
   const fallback = createDefaultState();
   return repairBuiltInScripts({
     version: 1,
-    devices: Array.isArray(record.devices) ? record.devices.map(normalizeDevice) : fallback.devices,
-    scripts: Array.isArray(record.scripts) ? record.scripts.map(normalizeScript) : fallback.scripts,
+    devices: dedupeById(Array.isArray(record.devices) ? record.devices.map(normalizeDevice) : fallback.devices),
+    scripts: dedupeById(Array.isArray(record.scripts) ? record.scripts.map(normalizeScript) : fallback.scripts),
   });
 }
 
@@ -3725,10 +3736,11 @@ export default function EquipmentManager({ config }: ModuleProps) {
                   onClick={() => {
                     const device = preset.create();
                     const presetScripts = preset.createScripts?.(device) ?? [];
+                    const retainedScripts = state.scripts.filter((script) => !(script.builtIn && script.deviceId === device.id));
                     const next = {
                       ...state,
                       devices: [...state.devices, device],
-                      scripts: [...state.scripts.filter((script) => !(script.builtIn && script.deviceId === device.id)), ...presetScripts, ...state.scripts],
+                      scripts: [...retainedScripts, ...presetScripts],
                     };
                     setState(next);
                     setSelectedDeviceId(device.id);
