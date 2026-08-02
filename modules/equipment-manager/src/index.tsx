@@ -11,10 +11,30 @@ type CommandMode = "scpi" | "http" | "raw" | "custom";
 type ParserMode = "text" | "json" | "number" | "csv" | "binary" | "none" | "siglent-waveform";
 type ArtifactMode = "none" | "text" | "json" | "csv" | "image" | "binary";
 type ScriptStepType = "command" | "wait" | "capture" | "note";
+type CommandOutputSource = "json-path" | "regex";
+type StepInputSource = "literal" | "step-output";
+
+type CommandInputDef = {
+  id: string;
+  name: string;
+  required: boolean;
+  defaultValue?: string;
+  description?: string;
+};
+
+type CommandOutputDef = {
+  id: string;
+  name: string;
+  source: CommandOutputSource;
+  selector: string;
+  captureGroup?: number;
+  description?: string;
+};
 
 type EquipmentCommand = {
   id: string;
   name: string;
+  builtIn?: boolean;
   mode: CommandMode;
   payload: string;
   parser: ParserMode;
@@ -22,6 +42,18 @@ type EquipmentCommand = {
   saveAs?: string;
   artifactMode: ArtifactMode;
   notes?: string;
+  inputDefs: CommandInputDef[];
+  outputDefs: CommandOutputDef[];
+  testValues?: Record<string, string>;
+};
+
+type ScriptStepInputBinding = {
+  id: string;
+  inputName: string;
+  source: StepInputSource;
+  literalValue?: string;
+  sourceStepId?: string;
+  sourceOutputName?: string;
 };
 
 type EquipmentScriptStep = {
@@ -33,6 +65,7 @@ type EquipmentScriptStep = {
   waitMs?: number;
   saveAs?: string;
   notes?: string;
+  inputBindings: ScriptStepInputBinding[];
 };
 
 type EquipmentDevice = {
@@ -48,6 +81,7 @@ type EquipmentDevice = {
 type EquipmentScript = {
   id: string;
   name: string;
+  builtIn?: boolean;
   deviceId?: string;
   description?: string;
   steps: EquipmentScriptStep[];
@@ -89,7 +123,21 @@ type ExecutionResult = {
   startedAt: string;
   commandId?: string;
   scriptId?: string;
-  steps?: Array<{ title: string; ok: boolean; output?: unknown }>;
+  outputs?: Record<string, unknown>;
+  steps?: Array<{
+    stepId?: string;
+    title: string;
+    ok: boolean;
+    output?: unknown;
+    outputs?: Record<string, unknown>;
+    commandName?: string;
+    artifactMode?: ArtifactMode;
+    parser?: ParserMode;
+    payload?: string;
+    resolvedInputs?: Record<string, unknown>;
+    notes?: string;
+    saveAs?: string;
+  }>;
   output?: unknown;
 };
 
@@ -133,11 +181,33 @@ type SiglentWaveformResult = {
   };
   transport: {
     waveformBytes: number;
+    descriptorBytes?: number;
     setupCommand: string;
     setupReadMode: string;
     queries: Record<string, string>;
+    descriptor?: {
+      waveArrayCount: number;
+      returnedPointCount: number;
+      sourceIntervalSeconds: number;
+      effectiveIntervalSeconds: number;
+      totalSpanSeconds: number;
+    };
+  };
+  preferredViewport?: {
+    xMinSeconds?: number;
+    xMaxSeconds?: number;
+    yMinVolts?: number;
+    yMaxVolts?: number;
   };
   points: SiglentWaveformPoint[];
+};
+
+type SiglentWaveDescriptor = {
+  waveArrayCount: number;
+  returnedPointCount: number;
+  sourceIntervalSeconds: number;
+  effectiveIntervalSeconds: number;
+  totalSpanSeconds: number;
 };
 
 type WaveformCursor = {
@@ -161,6 +231,7 @@ type KnownDevicePreset = {
   name: string;
   description: string;
   create: () => EquipmentDevice;
+  createScripts?: (device: EquipmentDevice) => EquipmentScript[];
 };
 
 const C = {
@@ -185,6 +256,7 @@ const PARSER_MODES: ParserMode[] = ["text", "json", "number", "csv", "binary", "
 const ARTIFACT_MODES: ArtifactMode[] = ["none", "text", "json", "csv", "image", "binary"];
 const STEP_TYPES: ScriptStepType[] = ["command", "wait", "capture", "note"];
 const SIGLENT_WAVEFORM_SETUP = "WFSU SP,1,NP,20000,FP,0";
+const SIGLENT_WAVEFORM_POINT_LIMIT = 20000;
 const WAVEFORM_CURSOR_COLORS = ["#ef4444", "#2563eb", "#16a34a", "#d97706", "#7c3aed", "#db2777"];
 
 function dirname(path: string): string {
@@ -212,6 +284,32 @@ function toNumberValue(value: unknown, fallback: number): number {
   return Number.isFinite(candidate) ? candidate : fallback;
 }
 
+function normalizeCommandInputDef(value: unknown, index: number): CommandInputDef {
+  const record = toRecord(value);
+  return {
+    id: toStringValue(record.id, `input-${index + 1}`),
+    name: toStringValue(record.name, `input${index + 1}`),
+    required: Boolean(record.required ?? true),
+    defaultValue: toStringValue(record.defaultValue ?? record.default_value, "") || undefined,
+    description: toStringValue(record.description, "") || undefined,
+  };
+}
+
+function normalizeCommandOutputDef(value: unknown, index: number): CommandOutputDef {
+  const record = toRecord(value);
+  const source = toStringValue(record.source, "json-path");
+  return {
+    id: toStringValue(record.id, `output-${index + 1}`),
+    name: toStringValue(record.name, `output${index + 1}`),
+    source: source === "regex" ? "regex" : "json-path",
+    selector: toStringValue(record.selector, ""),
+    captureGroup: typeof record.captureGroup === "undefined" && typeof record.capture_group === "undefined"
+      ? undefined
+      : toNumberValue(record.captureGroup ?? record.capture_group, 1),
+    description: toStringValue(record.description, "") || undefined,
+  };
+}
+
 function normalizeCommand(value: unknown, index: number): EquipmentCommand {
   const record = toRecord(value);
   const mode = toStringValue(record.mode, "scpi");
@@ -220,6 +318,7 @@ function normalizeCommand(value: unknown, index: number): EquipmentCommand {
   return {
     id: toStringValue(record.id, `command-${index + 1}`),
     name: toStringValue(record.name, `Command ${index + 1}`),
+    builtIn: Boolean(record.builtIn ?? record.built_in),
     mode: COMMAND_MODES.includes(mode as CommandMode) ? mode as CommandMode : "custom",
     payload: toStringValue(record.payload, ""),
     parser: PARSER_MODES.includes(parser as ParserMode) ? parser as ParserMode : "text",
@@ -227,8 +326,26 @@ function normalizeCommand(value: unknown, index: number): EquipmentCommand {
     saveAs: toStringValue(record.saveAs ?? record.save_as, "") || undefined,
     artifactMode: ARTIFACT_MODES.includes(artifactMode as ArtifactMode) ? artifactMode as ArtifactMode : "none",
     notes: toStringValue(record.notes, "") || undefined,
+    inputDefs: Array.isArray(record.inputDefs ?? record.input_defs) ? ((record.inputDefs ?? record.input_defs) as unknown[]).map(normalizeCommandInputDef) : [],
+    outputDefs: Array.isArray(record.outputDefs ?? record.output_defs) ? ((record.outputDefs ?? record.output_defs) as unknown[]).map(normalizeCommandOutputDef) : [],
+    testValues: toRecord(record.testValues ?? record.test_values) as Record<string, string>,
   };
 }
+
+function normalizeStepInputBinding(value: unknown, index: number): ScriptStepInputBinding {
+  const record = toRecord(value);
+  const source = toStringValue(record.source, "literal");
+  return {
+    id: toStringValue(record.id, `binding-${index + 1}`),
+    inputName: toStringValue(record.inputName ?? record.input_name, ""),
+    source: source === "step-output" ? "step-output" : "literal",
+    literalValue: toStringValue(record.literalValue ?? record.literal_value, "") || undefined,
+    sourceStepId: toStringValue(record.sourceStepId ?? record.source_step_id, "") || undefined,
+    sourceOutputName: toStringValue(record.sourceOutputName ?? record.source_output_name, "") || undefined,
+  };
+}
+
+const SCPI_VALUE_REGEX = "(?:^|[\\s,])(-?\\d+(?:\\.\\d+)?(?:E[+-]?\\d+)?[GMKmunp]?)";
 
 function normalizeStep(value: unknown, index: number): EquipmentScriptStep {
   const record = toRecord(value);
@@ -242,6 +359,7 @@ function normalizeStep(value: unknown, index: number): EquipmentScriptStep {
     waitMs: typeof record.waitMs === "undefined" && typeof record.wait_ms === "undefined" ? undefined : toNumberValue(record.waitMs ?? record.wait_ms, 1000),
     saveAs: toStringValue(record.saveAs ?? record.save_as, "") || undefined,
     notes: toStringValue(record.notes, "") || undefined,
+    inputBindings: Array.isArray(record.inputBindings ?? record.input_bindings) ? ((record.inputBindings ?? record.input_bindings) as unknown[]).map(normalizeStepInputBinding) : [],
   };
 }
 
@@ -252,17 +370,82 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
   const commands = Array.isArray(record.commands) ? record.commands.map(normalizeCommand) : [];
   const upgradedCommands = /siglent\s+sds1202x-e/i.test(name)
     ? commands.map((command) => {
-        if (command.name !== "Capture Screenshot") return command;
-        if (command.payload.trim() !== ":DISPlay:DATA? PNG, COLor") return command;
-        return {
-          ...command,
-          payload: "SCDP",
-          parser: "binary" as ParserMode,
-          timeoutMs: Math.max(command.timeoutMs, 15000),
-          artifactMode: "image" as ArtifactMode,
-          saveAs: "scope-screen.bmp",
-          notes: "Siglent SDS1202X-E screenshot capture returns bitmap bytes over SCPI via the SCDP command.",
-        };
+        const commandName = command.name.trim().toLowerCase();
+        if (command.name === "Capture Screenshot" && command.payload.trim() === ":DISPlay:DATA? PNG, COLor") {
+          return {
+            ...command,
+            payload: "SCDP",
+            parser: "binary" as ParserMode,
+            timeoutMs: Math.max(command.timeoutMs, 15000),
+            artifactMode: "image" as ArtifactMode,
+            saveAs: "scope-screen.bmp",
+            notes: "Siglent SDS1202X-E screenshot capture returns bitmap bytes over SCPI via the SCDP command.",
+          };
+        }
+        if (commandName === "read ch1 scale") {
+          return {
+            ...command,
+            outputDefs: [
+              { id: command.outputDefs[0]?.id ?? makeId("output"), name: "voltsPerDivText", source: "json-path" as CommandOutputSource, selector: "text" },
+              { id: command.outputDefs[1]?.id ?? makeId("output"), name: "voltsPerDiv", source: "regex" as CommandOutputSource, selector: SCPI_VALUE_REGEX, captureGroup: 1 },
+            ],
+          };
+        }
+        if (commandName === "read ch1 offset") {
+          return {
+            ...command,
+            outputDefs: [
+              { id: command.outputDefs[0]?.id ?? makeId("output"), name: "offsetVoltsText", source: "json-path" as CommandOutputSource, selector: "text" },
+              { id: command.outputDefs[1]?.id ?? makeId("output"), name: "offsetVolts", source: "regex" as CommandOutputSource, selector: SCPI_VALUE_REGEX, captureGroup: 1 },
+            ],
+          };
+        }
+        if (commandName === "read timebase") {
+          return {
+            ...command,
+            outputDefs: [
+              { id: command.outputDefs[0]?.id ?? makeId("output"), name: "timeDivText", source: "json-path" as CommandOutputSource, selector: "text" },
+              { id: command.outputDefs[1]?.id ?? makeId("output"), name: "timePerDivSeconds", source: "regex" as CommandOutputSource, selector: SCPI_VALUE_REGEX, captureGroup: 1 },
+            ],
+          };
+        }
+        if (commandName === "read trigger delay") {
+          return {
+            ...command,
+            outputDefs: [
+              { id: command.outputDefs[0]?.id ?? makeId("output"), name: "triggerDelayText", source: "json-path" as CommandOutputSource, selector: "text" },
+              { id: command.outputDefs[1]?.id ?? makeId("output"), name: "triggerDelaySeconds", source: "regex" as CommandOutputSource, selector: SCPI_VALUE_REGEX, captureGroup: 1 },
+            ],
+          };
+        }
+        if (commandName === "capture ch1 waveform" || commandName === "capture waveform") {
+          return {
+            ...command,
+            name: "Capture Waveform",
+            payload: command.payload.includes("{{channel}}") ? command.payload : "{{channel}}:WF? DAT2",
+            inputDefs: [
+              { id: command.inputDefs[0]?.id ?? makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel to capture, such as C1." },
+              { id: command.inputDefs[1]?.id ?? makeId("input"), name: "centerTimeSeconds", required: false, description: "Optional horizontal center of the viewport in seconds." },
+              { id: command.inputDefs[2]?.id ?? makeId("input"), name: "timePerDivSeconds", required: false, description: "Optional horizontal scale in seconds per division." },
+              { id: command.inputDefs[3]?.id ?? makeId("input"), name: "scopeOffsetVolts", required: false, description: "Optional scope offset value read from the instrument; used to reconstruct the visible vertical center." },
+              { id: command.inputDefs[4]?.id ?? makeId("input"), name: "voltsPerDiv", required: false, description: "Optional vertical scale in volts per division." },
+              { id: command.inputDefs[5]?.id ?? makeId("input"), name: "centerVolts", required: false, description: "Optional explicit vertical center override in volts." },
+            ],
+            outputDefs: [
+              { id: command.outputDefs[0]?.id ?? makeId("output"), name: "sampleRateHz", source: "json-path" as CommandOutputSource, selector: "metadata.sampleRateHz" },
+              { id: command.outputDefs[1]?.id ?? makeId("output"), name: "timePerDivSeconds", source: "json-path" as CommandOutputSource, selector: "metadata.timePerDivSeconds" },
+              { id: command.outputDefs[2]?.id ?? makeId("output"), name: "voltsPerDiv", source: "json-path" as CommandOutputSource, selector: "metadata.voltsPerDiv" },
+              { id: command.outputDefs[3]?.id ?? makeId("output"), name: "triggerDelaySeconds", source: "json-path" as CommandOutputSource, selector: "metadata.triggerDelaySeconds" },
+              { id: command.outputDefs[4]?.id ?? makeId("output"), name: "offsetVolts", source: "json-path" as CommandOutputSource, selector: "metadata.offsetVolts" },
+              { id: command.outputDefs[5]?.id ?? makeId("output"), name: "windowStartSeconds", source: "json-path" as CommandOutputSource, selector: "startTimeSeconds" },
+              { id: command.outputDefs[6]?.id ?? makeId("output"), name: "windowEndSeconds", source: "json-path" as CommandOutputSource, selector: "endTimeSeconds" },
+              { id: command.outputDefs[7]?.id ?? makeId("output"), name: "minVoltage", source: "json-path" as CommandOutputSource, selector: "minVoltage" },
+              { id: command.outputDefs[8]?.id ?? makeId("output"), name: "maxVoltage", source: "json-path" as CommandOutputSource, selector: "maxVoltage" },
+            ],
+            notes: "Fetches waveform samples plus scaling metadata, then renders an interactive waveform chart. Optional viewport inputs can recreate the visible scope window.",
+          };
+        }
+        return command;
       })
     : commands;
   return {
@@ -281,9 +464,76 @@ function normalizeScript(value: unknown, index: number): EquipmentScript {
   return {
     id: toStringValue(record.id, `script-${index + 1}`),
     name: toStringValue(record.name, `Script ${index + 1}`),
+    builtIn: Boolean(record.builtIn ?? record.built_in),
     deviceId: toStringValue(record.deviceId ?? record.device_id, "") || undefined,
     description: toStringValue(record.description, "") || undefined,
     steps: Array.isArray(record.steps) ? record.steps.map(normalizeStep) : [],
+  };
+}
+
+function repairBuiltInScripts(state: EquipmentManagerState): EquipmentManagerState {
+  const devicesById = new Map(state.devices.map((device) => [device.id, device] as const));
+  const allCommands = state.devices.flatMap((device) => device.commands);
+  const builtInCommandByName = new Map(
+    allCommands
+      .filter((command) => command.builtIn)
+      .map((command) => [command.name.trim().toLowerCase(), command] as const),
+  );
+  const builtInCommandNameByStepTitle = new Map<string, string>([
+    ["identify instrument", "identify"],
+    ["read ch1 scale", "read ch1 scale"],
+    ["read ch1 offset", "read ch1 offset"],
+    ["read timebase", "read timebase"],
+    ["read sample rate", "read sample rate"],
+    ["read trigger delay", "read trigger delay"],
+    ["read trigger mode", "read trigger mode"],
+    ["read trigger source", "read trigger source"],
+    ["read trigger level", "read trigger level"],
+    ["capture scope screen", "capture screenshot"],
+    ["capture ch1 waveform", "capture ch1 waveform"],
+    ["capture waveform", "capture waveform"],
+  ]);
+
+  return {
+    ...state,
+    scripts: state.scripts.map((script) => {
+      if (!script.builtIn) return script;
+      const deviceCommands = script.deviceId ? (devicesById.get(script.deviceId)?.commands ?? []) : allCommands;
+      const availableCommands = deviceCommands.length ? deviceCommands : allCommands;
+      const availableById = new Map(availableCommands.map((command) => [command.id, command] as const));
+      let changed = false;
+      const repairedSteps = script.steps.map((step) => {
+        if (step.type !== "command" && step.type !== "capture") return step;
+        if (step.commandId && availableById.has(step.commandId)) return step;
+        const expectedCommandName = builtInCommandNameByStepTitle.get(step.title.trim().toLowerCase());
+        if (!expectedCommandName) return step;
+        const replacement = availableCommands.find((command) => command.name.trim().toLowerCase() === expectedCommandName)
+          ?? builtInCommandByName.get(expectedCommandName);
+        if (!replacement || replacement.id === step.commandId) return step;
+        changed = true;
+        return { ...step, commandId: replacement.id };
+      });
+      let nextSteps = repairedSteps;
+      const captureWaveformStep = nextSteps.find((step) => step.title.trim().toLowerCase() === "capture waveform" || step.title.trim().toLowerCase() === "capture ch1 waveform");
+      if (captureWaveformStep) {
+        const normalizedBindings: ScriptStepInputBinding[] = [
+          { id: captureWaveformStep.inputBindings.find((entry) => entry.inputName === "channel")?.id ?? makeId("binding"), inputName: "channel", source: "literal", literalValue: captureWaveformStep.inputBindings.find((entry) => entry.inputName === "channel")?.literalValue ?? "C1" },
+        ];
+        const triggerDelayStep = nextSteps.find((step) => step.title.trim().toLowerCase() === "read trigger delay");
+        const timebaseStep = nextSteps.find((step) => step.title.trim().toLowerCase() === "read timebase");
+        const offsetStep = nextSteps.find((step) => step.title.trim().toLowerCase() === "read ch1 offset");
+        const scaleStep = nextSteps.find((step) => step.title.trim().toLowerCase() === "read ch1 scale");
+        if (triggerDelayStep) normalizedBindings.push({ id: makeId("binding"), inputName: "centerTimeSeconds", source: "step-output", sourceStepId: triggerDelayStep.id, sourceOutputName: "triggerDelaySeconds" });
+        if (timebaseStep) normalizedBindings.push({ id: makeId("binding"), inputName: "timePerDivSeconds", source: "step-output", sourceStepId: timebaseStep.id, sourceOutputName: "timePerDivSeconds" });
+        if (offsetStep) normalizedBindings.push({ id: makeId("binding"), inputName: "scopeOffsetVolts", source: "step-output", sourceStepId: offsetStep.id, sourceOutputName: "offsetVolts" });
+        if (scaleStep) normalizedBindings.push({ id: makeId("binding"), inputName: "voltsPerDiv", source: "step-output", sourceStepId: scaleStep.id, sourceOutputName: "voltsPerDiv" });
+        nextSteps = nextSteps.map((step) => step.id === captureWaveformStep.id
+          ? { ...step, title: "Capture waveform", inputBindings: normalizedBindings }
+          : step);
+        changed = true;
+      }
+      return changed ? { ...script, steps: nextSteps } : script;
+    }),
   };
 }
 
@@ -291,9 +541,26 @@ function createDefaultState(): EquipmentManagerState {
   const demoDeviceId = makeId("device");
   const identifyCommandId = makeId("command");
   const channelScaleCommandId = makeId("command");
+  const channelOffsetCommandId = makeId("command");
   const timebaseCommandId = makeId("command");
+  const sampleRateCommandId = makeId("command");
+  const triggerDelayCommandId = makeId("command");
   const triggerModeCommandId = makeId("command");
+  const triggerLevelCommandId = makeId("command");
+  const triggerSourceCommandId = makeId("command");
   const captureCommandId = makeId("command");
+  const waveformCommandId = makeId("command");
+  const identifyStepId = makeId("step");
+  const channelScaleStepId = makeId("step");
+  const channelOffsetStepId = makeId("step");
+  const timebaseStepId = makeId("step");
+  const sampleRateStepId = makeId("step");
+  const triggerDelayStepId = makeId("step");
+  const triggerModeStepId = makeId("step");
+  const triggerSourceStepId = makeId("step");
+  const triggerLevelStepId = makeId("step");
+  const captureScreenStepId = makeId("step");
+  const captureWaveformStepId = makeId("step");
   return {
     version: 1,
     devices: [{
@@ -307,46 +574,136 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: identifyCommandId,
           name: "Identify",
+          builtIn: true,
           mode: "scpi",
           payload: "*IDN?",
           parser: "text",
           timeoutMs: 3000,
           artifactMode: "text",
           saveAs: "identity.txt",
+          inputDefs: [],
+          outputDefs: [],
         },
         {
           id: channelScaleCommandId,
           name: "Read CH1 Scale",
+          builtIn: true,
           mode: "scpi",
           payload: "C1:VDIV?",
           parser: "text",
           timeoutMs: 3000,
           artifactMode: "text",
           saveAs: "ch1-scale.txt",
+          inputDefs: [],
+          outputDefs: [
+            { id: makeId("output"), name: "voltsPerDivText", source: "json-path", selector: "text" },
+            { id: makeId("output"), name: "voltsPerDiv", source: "regex", selector: SCPI_VALUE_REGEX, captureGroup: 1 },
+          ],
+        },
+        {
+          id: channelOffsetCommandId,
+          name: "Read CH1 Offset",
+          builtIn: true,
+          mode: "scpi",
+          payload: "C1:OFST?",
+          parser: "text",
+          timeoutMs: 3000,
+          artifactMode: "text",
+          saveAs: "ch1-offset.txt",
+          inputDefs: [],
+          outputDefs: [
+            { id: makeId("output"), name: "offsetVoltsText", source: "json-path", selector: "text" },
+            { id: makeId("output"), name: "offsetVolts", source: "regex", selector: SCPI_VALUE_REGEX, captureGroup: 1 },
+          ],
         },
         {
           id: timebaseCommandId,
           name: "Read Timebase",
+          builtIn: true,
           mode: "scpi",
           payload: "TDIV?",
           parser: "text",
           timeoutMs: 3000,
           artifactMode: "text",
           saveAs: "timebase.txt",
+          inputDefs: [],
+          outputDefs: [
+            { id: makeId("output"), name: "timeDivText", source: "json-path", selector: "text" },
+            { id: makeId("output"), name: "timePerDivSeconds", source: "regex", selector: SCPI_VALUE_REGEX, captureGroup: 1 },
+          ],
+        },
+        {
+          id: sampleRateCommandId,
+          name: "Read Sample Rate",
+          builtIn: true,
+          mode: "scpi",
+          payload: "SARA?",
+          parser: "text",
+          timeoutMs: 3000,
+          artifactMode: "text",
+          saveAs: "sample-rate.txt",
+          inputDefs: [],
+          outputDefs: [{ id: makeId("output"), name: "sampleRateText", source: "json-path", selector: "text" }],
+        },
+        {
+          id: triggerDelayCommandId,
+          name: "Read Trigger Delay",
+          builtIn: true,
+          mode: "scpi",
+          payload: "TRDL?",
+          parser: "text",
+          timeoutMs: 3000,
+          artifactMode: "text",
+          saveAs: "trigger-delay.txt",
+          inputDefs: [],
+          outputDefs: [
+            { id: makeId("output"), name: "triggerDelayText", source: "json-path", selector: "text" },
+            { id: makeId("output"), name: "triggerDelaySeconds", source: "regex", selector: SCPI_VALUE_REGEX, captureGroup: 1 },
+          ],
         },
         {
           id: triggerModeCommandId,
           name: "Read Trigger Mode",
+          builtIn: true,
           mode: "scpi",
           payload: "TRMD?",
           parser: "text",
           timeoutMs: 3000,
           artifactMode: "text",
           saveAs: "trigger-mode.txt",
+          inputDefs: [],
+          outputDefs: [{ id: makeId("output"), name: "triggerMode", source: "json-path", selector: "text" }],
+        },
+        {
+          id: triggerLevelCommandId,
+          name: "Read Trigger Level",
+          builtIn: true,
+          mode: "scpi",
+          payload: "C1:TRLV?",
+          parser: "text",
+          timeoutMs: 3000,
+          artifactMode: "text",
+          saveAs: "trigger-level.txt",
+          inputDefs: [],
+          outputDefs: [{ id: makeId("output"), name: "triggerLevelText", source: "json-path", selector: "text" }],
+        },
+        {
+          id: triggerSourceCommandId,
+          name: "Read Trigger Source",
+          builtIn: true,
+          mode: "scpi",
+          payload: "TRSE?",
+          parser: "text",
+          timeoutMs: 3000,
+          artifactMode: "text",
+          saveAs: "trigger-source.txt",
+          inputDefs: [],
+          outputDefs: [{ id: makeId("output"), name: "triggerSourceText", source: "json-path", selector: "text" }],
         },
         {
           id: captureCommandId,
           name: "Capture Screenshot",
+          builtIn: true,
           mode: "scpi",
           payload: "SCDP",
           parser: "binary",
@@ -354,44 +711,93 @@ function createDefaultState(): EquipmentManagerState {
           artifactMode: "image",
           saveAs: "scope-screen.bmp",
           notes: "Returns a bitmap screenshot from the instrument over SCPI.",
+          inputDefs: [],
+          outputDefs: [],
         },
         {
-          id: makeId("command"),
-          name: "Capture CH1 Waveform",
+          id: waveformCommandId,
+          name: "Capture Waveform",
+          builtIn: true,
           mode: "scpi",
-          payload: "C1:WF? DAT2",
+          payload: "{{channel}}:WF? DAT2",
           parser: "siglent-waveform",
           timeoutMs: 15000,
           artifactMode: "csv",
           saveAs: "ch1-waveform.csv",
-          notes: "Fetches up to 20,000 CH1 waveform samples plus scaling metadata, then renders an interactive waveform chart.",
+          notes: "Fetches up to 20,000 waveform samples plus scaling metadata, then renders an interactive waveform chart. Optional viewport inputs can recreate the visible scope window.",
+          inputDefs: [
+            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel to capture, such as C1." },
+            { id: makeId("input"), name: "centerTimeSeconds", required: false, description: "Optional horizontal center of the viewport in seconds." },
+            { id: makeId("input"), name: "timePerDivSeconds", required: false, description: "Optional horizontal scale in seconds per division." },
+            { id: makeId("input"), name: "scopeOffsetVolts", required: false, description: "Optional scope offset value read from the instrument; used to reconstruct the visible vertical center." },
+            { id: makeId("input"), name: "voltsPerDiv", required: false, description: "Optional vertical scale in volts per division." },
+            { id: makeId("input"), name: "centerVolts", required: false, description: "Optional explicit vertical center override in volts." },
+          ],
+          outputDefs: [
+            { id: makeId("output"), name: "sampleRateHz", source: "json-path", selector: "metadata.sampleRateHz" },
+            { id: makeId("output"), name: "timePerDivSeconds", source: "json-path", selector: "metadata.timePerDivSeconds" },
+            { id: makeId("output"), name: "voltsPerDiv", source: "json-path", selector: "metadata.voltsPerDiv" },
+            { id: makeId("output"), name: "triggerDelaySeconds", source: "json-path", selector: "metadata.triggerDelaySeconds" },
+            { id: makeId("output"), name: "offsetVolts", source: "json-path", selector: "metadata.offsetVolts" },
+            { id: makeId("output"), name: "windowStartSeconds", source: "json-path", selector: "startTimeSeconds" },
+            { id: makeId("output"), name: "windowEndSeconds", source: "json-path", selector: "endTimeSeconds" },
+            { id: makeId("output"), name: "minVoltage", source: "json-path", selector: "minVoltage" },
+            { id: makeId("output"), name: "maxVoltage", source: "json-path", selector: "maxVoltage" },
+          ],
         },
       ],
     }],
-    scripts: [{
+      scripts: [{
       id: makeId("script"),
-      name: "Startup Capture",
+      name: "Scope Window Snapshot",
+      builtIn: true,
       deviceId: demoDeviceId,
-      description: "Example Siglent workflow that identifies the scope, reads a couple of setup values, waits for a DUT event, then captures an image artifact.",
+      description: "Collect the key scope settings needed to reproduce the currently displayed waveform window, then capture both screenshot and waveform data.",
       steps: [
-        { id: makeId("step"), type: "command", title: "Identify instrument", commandId: identifyCommandId, saveAs: "identity.txt", notes: "Later this can be replaced by a richer preset or a raw command step." },
-        { id: makeId("step"), type: "command", title: "Read CH1 scale", commandId: channelScaleCommandId, saveAs: "ch1-scale.txt" },
-        { id: makeId("step"), type: "command", title: "Read timebase", commandId: timebaseCommandId, saveAs: "timebase.txt" },
-        { id: makeId("step"), type: "command", title: "Read trigger mode", commandId: triggerModeCommandId, saveAs: "trigger-mode.txt" },
-        { id: makeId("step"), type: "wait", title: "Wait for DUT startup", waitMs: 2000, notes: "This should later support conditional waits and polling loops." },
-        { id: makeId("step"), type: "capture", title: "Capture startup screen", commandId: captureCommandId, saveAs: "startup-waveform.png" },
+        { id: identifyStepId, type: "command", title: "Identify instrument", commandId: identifyCommandId, saveAs: "identity.txt", notes: "Built-in scope identity query.", inputBindings: [] },
+        { id: channelScaleStepId, type: "command", title: "Read CH1 scale", commandId: channelScaleCommandId, saveAs: "ch1-scale.txt", inputBindings: [] },
+        { id: channelOffsetStepId, type: "command", title: "Read CH1 offset", commandId: channelOffsetCommandId, saveAs: "ch1-offset.txt", inputBindings: [] },
+        { id: timebaseStepId, type: "command", title: "Read timebase", commandId: timebaseCommandId, saveAs: "timebase.txt", inputBindings: [] },
+        { id: sampleRateStepId, type: "command", title: "Read sample rate", commandId: sampleRateCommandId, saveAs: "sample-rate.txt", inputBindings: [] },
+        { id: triggerDelayStepId, type: "command", title: "Read trigger delay", commandId: triggerDelayCommandId, saveAs: "trigger-delay.txt", inputBindings: [] },
+        { id: triggerModeStepId, type: "command", title: "Read trigger mode", commandId: triggerModeCommandId, saveAs: "trigger-mode.txt", inputBindings: [] },
+        { id: triggerSourceStepId, type: "command", title: "Read trigger source", commandId: triggerSourceCommandId, saveAs: "trigger-source.txt", inputBindings: [] },
+        { id: triggerLevelStepId, type: "command", title: "Read trigger level", commandId: triggerLevelCommandId, saveAs: "trigger-level.txt", inputBindings: [] },
+        { id: captureScreenStepId, type: "capture", title: "Capture scope screen", commandId: captureCommandId, saveAs: "scope-screen.bmp", inputBindings: [] },
+        {
+          id: captureWaveformStepId,
+          type: "capture",
+          title: "Capture waveform",
+          commandId: waveformCommandId,
+          saveAs: "ch1-waveform.csv",
+          inputBindings: [
+            { id: makeId("binding"), inputName: "channel", source: "literal", literalValue: "C1" },
+            { id: makeId("binding"), inputName: "centerTimeSeconds", source: "step-output", sourceStepId: triggerDelayStepId, sourceOutputName: "triggerDelaySeconds" },
+            { id: makeId("binding"), inputName: "timePerDivSeconds", source: "step-output", sourceStepId: timebaseStepId, sourceOutputName: "timePerDivSeconds" },
+            { id: makeId("binding"), inputName: "scopeOffsetVolts", source: "step-output", sourceStepId: channelOffsetStepId, sourceOutputName: "offsetVolts" },
+            { id: makeId("binding"), inputName: "voltsPerDiv", source: "step-output", sourceStepId: channelScaleStepId, sourceOutputName: "voltsPerDiv" },
+          ],
+        },
       ],
     }],
   };
 }
 
+function createKnownSiglentPreset(targetDeviceId?: string, targetAddress?: string): { device: EquipmentDevice; scripts: EquipmentScript[] } {
+  const base = createDefaultState();
+  const device = { ...base.devices[0]!, id: targetDeviceId ?? base.devices[0]!.id, address: targetAddress ?? base.devices[0]!.address };
+  const scripts = base.scripts.map((script) => ({ ...script, deviceId: device.id }));
+  return { device, scripts };
+}
+
 function normalizeState(value: unknown): EquipmentManagerState {
   const record = toRecord(value);
-  return {
+  const fallback = createDefaultState();
+  return repairBuiltInScripts({
     version: 1,
-    devices: Array.isArray(record.devices) ? record.devices.map(normalizeDevice) : createDefaultState().devices,
-    scripts: Array.isArray(record.scripts) ? record.scripts.map(normalizeScript) : createDefaultState().scripts,
-  };
+    devices: Array.isArray(record.devices) ? record.devices.map(normalizeDevice) : fallback.devices,
+    scripts: Array.isArray(record.scripts) ? record.scripts.map(normalizeScript) : fallback.scripts,
+  });
 }
 
 function getStorageInfo(config: ModuleProps["config"]): StorageInfo {
@@ -524,7 +930,8 @@ function base64ToBytes(value: string): Uint8Array {
 }
 
 function parseScpiNumber(text: string): number {
-  const match = text.match(/(-?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/);
+  const matches = Array.from(text.matchAll(/(?:^|[\s,])(-?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/g));
+  const match = matches.at(-1);
   if (!match) {
     throw new Error(`Unable to parse numeric value from response: ${text}`);
   }
@@ -550,7 +957,17 @@ function decodeSiglentWaveformBlock(bytesBase64: string): number[] {
   const bytes = base64ToBytes(bytesBase64);
   const hashIndex = bytes.indexOf(35);
   if (hashIndex < 0 || hashIndex + 1 >= bytes.length) {
-    throw new Error("Waveform response did not contain a SCPI binary block.");
+    const printableCount = bytes.reduce((count, value) => (value >= 32 && value <= 126 ? count + 1 : count), 0);
+    const printableRatio = bytes.length > 0 ? printableCount / bytes.length : 1;
+    if (bytes.length >= 256 && printableRatio < 0.6) {
+      const samples: number[] = [];
+      for (const value of bytes) {
+        samples.push(value > 127 ? value - 255 : value);
+      }
+      return samples;
+    }
+    const prefix = new TextDecoder().decode(bytes.slice(0, Math.min(bytes.length, 32)));
+    throw new Error(`Waveform response did not contain a SCPI binary block. Prefix: ${JSON.stringify(prefix)}`);
   }
   const digitCount = bytes[hashIndex + 1] - 48;
   if (digitCount < 1 || digitCount > 9) {
@@ -574,9 +991,81 @@ function decodeSiglentWaveformBlock(bytesBase64: string): number[] {
   return samples;
 }
 
+function extractScpiBlockPayload(bytesBase64: string): Uint8Array {
+  const bytes = base64ToBytes(bytesBase64);
+  const hashIndex = bytes.indexOf(35);
+  if (hashIndex < 0 || hashIndex + 1 >= bytes.length) {
+    return bytes;
+  }
+  const digitCount = bytes[hashIndex + 1] - 48;
+  if (digitCount < 1 || digitCount > 9) {
+    return bytes;
+  }
+  const lengthText = new TextDecoder().decode(bytes.slice(hashIndex + 2, hashIndex + 2 + digitCount));
+  const blockLength = Number(lengthText);
+  if (!Number.isFinite(blockLength) || blockLength < 0) {
+    return bytes;
+  }
+  const dataStart = hashIndex + 2 + digitCount;
+  const dataEnd = Math.min(bytes.length, dataStart + blockLength);
+  return bytes.slice(dataStart, dataEnd);
+}
+
+function readInt16LE(bytes: Uint8Array, offset: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt16(offset, true);
+}
+
+function readInt32LE(bytes: Uint8Array, offset: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(offset, true);
+}
+
+function readFloat32LE(bytes: Uint8Array, offset: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getFloat32(offset, true);
+}
+
+function parseSiglentWaveDescriptor(bytesBase64: string, returnedPointCount: number, fallbackSpanSeconds: number): SiglentWaveDescriptor | null {
+  const payload = extractScpiBlockPayload(bytesBase64);
+  const marker = new TextEncoder().encode("WAVEDESC");
+  let start = -1;
+  for (let index = 0; index <= payload.length - marker.length; index += 1) {
+    let matches = true;
+    for (let markerIndex = 0; markerIndex < marker.length; markerIndex += 1) {
+      if (payload[index + markerIndex] !== marker[markerIndex]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      start = index;
+      break;
+    }
+  }
+  if (start < 0 || start + 184 > payload.length) return null;
+  const descriptor = payload.slice(start);
+  const waveArrayCount = readInt32LE(descriptor, 116);
+  const sourceIntervalSeconds = readFloat32LE(descriptor, 176);
+  const safeReturnedCount = Math.max(1, returnedPointCount);
+  const sourcePointCount = waveArrayCount > 0 ? waveArrayCount : safeReturnedCount;
+  const totalSpanSeconds = sourcePointCount > 0 && sourceIntervalSeconds > 0
+    ? sourcePointCount * sourceIntervalSeconds
+    : fallbackSpanSeconds;
+  const effectiveIntervalSeconds = totalSpanSeconds / safeReturnedCount;
+  if (!Number.isFinite(totalSpanSeconds) || totalSpanSeconds <= 0 || !Number.isFinite(effectiveIntervalSeconds) || effectiveIntervalSeconds <= 0) {
+    return null;
+  }
+  return {
+    waveArrayCount: sourcePointCount,
+    returnedPointCount: safeReturnedCount,
+    sourceIntervalSeconds,
+    effectiveIntervalSeconds,
+    totalSpanSeconds,
+  };
+}
+
 function buildSiglentWaveformResult(args: {
   channel: string;
   waveform: TcpCommandResult;
+  descriptor?: TcpCommandResult;
   voltsPerDivResponse: string;
   offsetResponse: string;
   timeDivResponse: string;
@@ -590,8 +1079,13 @@ function buildSiglentWaveformResult(args: {
   const sampleRateHz = parseScpiNumber(args.sampleRateResponse);
   const grid = 14;
   const codes = decodeSiglentWaveformBlock(args.waveform.bytesBase64 ?? "");
-  const intervalSeconds = 1 / sampleRateHz;
-  const startTimeSeconds = triggerDelaySeconds - (timePerDivSeconds * grid / 2);
+  const fallbackSpanSeconds = timePerDivSeconds * grid;
+  const descriptor = args.descriptor?.bytesBase64
+    ? parseSiglentWaveDescriptor(args.descriptor.bytesBase64, codes.length, fallbackSpanSeconds)
+    : null;
+  const intervalSeconds = descriptor?.effectiveIntervalSeconds ?? (fallbackSpanSeconds / Math.max(1, codes.length));
+  const totalSpanSeconds = descriptor?.totalSpanSeconds ?? fallbackSpanSeconds;
+  const startTimeSeconds = triggerDelaySeconds - (totalSpanSeconds / 2);
   const points = codes.map((rawCode, index) => ({
     index,
     rawCode,
@@ -619,6 +1113,7 @@ function buildSiglentWaveformResult(args: {
     },
     transport: {
       waveformBytes: args.waveform.bytesLength ?? 0,
+      descriptorBytes: args.descriptor?.bytesLength ?? 0,
       setupCommand: SIGLENT_WAVEFORM_SETUP,
       setupReadMode: "none",
       queries: {
@@ -628,6 +1123,7 @@ function buildSiglentWaveformResult(args: {
         triggerDelay: args.triggerDelayResponse,
         sampleRate: args.sampleRateResponse,
       },
+      descriptor: descriptor ?? undefined,
     },
     points,
   };
@@ -648,6 +1144,194 @@ async function callBridge<T>(bridge: BridgeConfig, method: string, params: Recor
     throw new Error(payload.error || `Bridge request failed with status ${response.status}.`);
   }
   return payload.result as T;
+}
+
+function parseMaybeJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function buildCommandResponseModel(command: EquipmentCommand, output: unknown): Record<string, unknown> {
+  if (isSiglentWaveformResult(output)) {
+    return {
+      kind: output.kind,
+      channel: output.channel,
+      sampleCount: output.sampleCount,
+      intervalSeconds: output.intervalSeconds,
+      startTimeSeconds: output.startTimeSeconds,
+      endTimeSeconds: output.endTimeSeconds,
+      minVoltage: output.minVoltage,
+      maxVoltage: output.maxVoltage,
+      metadata: output.metadata,
+      transport: output.transport,
+    };
+  }
+  if (isTcpCommandResult(output)) {
+    const text = output.text ?? output.data ?? "";
+    const parsed = command.parser === "json" ? parseMaybeJson(text) : undefined;
+    return {
+      text,
+      bytesLength: output.bytesLength,
+      timedOut: output.timedOut,
+      matchedMarker: output.matchedMarker,
+      parsed,
+      raw: output,
+    };
+  }
+  if (output && typeof output === "object") {
+    return output as Record<string, unknown>;
+  }
+  return { value: output };
+}
+
+function getValueByPath(value: unknown, selector: string): unknown {
+  const trimmed = selector.trim();
+  if (!trimmed) return undefined;
+  const parts = trimmed.split(".").filter(Boolean);
+  let current: unknown = value;
+  for (const part of parts) {
+    if (current == null) return undefined;
+    const indexMatch = part.match(/^([^[\]]+)\[(\d+)\]$/);
+    if (indexMatch) {
+      const container = (current as Record<string, unknown>)[indexMatch[1]!];
+      if (!Array.isArray(container)) return undefined;
+      current = container[Number(indexMatch[2])];
+      continue;
+    }
+    if (Array.isArray(current)) {
+      const numeric = Number(part);
+      current = Number.isInteger(numeric) ? current[numeric] : undefined;
+      continue;
+    }
+    if (typeof current === "object") {
+      current = (current as Record<string, unknown>)[part];
+      continue;
+    }
+    return undefined;
+  }
+  return current;
+}
+
+function extractCommandOutputs(command: EquipmentCommand, output: unknown): Record<string, unknown> {
+  const model = buildCommandResponseModel(command, output);
+  const rawText = typeof model.text === "string"
+    ? model.text
+    : typeof output === "string"
+      ? output
+      : renderExecutionOutput(output);
+  const extracted: Record<string, unknown> = {};
+  for (const def of command.outputDefs) {
+    if (!def.name.trim()) continue;
+    if (def.source === "regex") {
+      try {
+        const match = new RegExp(def.selector, "m").exec(rawText);
+        if (match) extracted[def.name] = match[def.captureGroup ?? 1] ?? match[0];
+      } catch {
+        // Ignore bad regex in extraction and let validation catch it later.
+      }
+      continue;
+    }
+    extracted[def.name] = getValueByPath(model, def.selector);
+  }
+  return extracted;
+}
+
+function stringifyTemplateValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (value == null) return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function applyTemplate(template: string, values: Record<string, unknown>): string {
+  return template.replace(/\{\{\s*([a-zA-Z0-9_.-]+)\s*\}\}/g, (_, key: string) => stringifyTemplateValue(values[key]));
+}
+
+function parseOptionalNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const text = String(value ?? "").trim();
+  if (!text) return undefined;
+  const direct = Number(text);
+  if (Number.isFinite(direct)) return direct;
+  try {
+    return parseScpiNumber(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function cloneStateWithCommand(state: EquipmentManagerState, deviceId: string, commandId: string, mutate: (command: EquipmentCommand) => EquipmentCommand): EquipmentManagerState {
+  return {
+    ...state,
+    devices: state.devices.map((device) => device.id === deviceId ? {
+      ...device,
+      commands: device.commands.map((command) => command.id === commandId ? mutate(command) : command),
+    } : device),
+  };
+}
+
+function cloneStateWithScript(state: EquipmentManagerState, scriptId: string, mutate: (script: EquipmentScript) => EquipmentScript): EquipmentManagerState {
+  return {
+    ...state,
+    scripts: state.scripts.map((script) => script.id === scriptId ? mutate(script) : script),
+  };
+}
+
+function upsertStepInputBinding(step: EquipmentScriptStep, binding: ScriptStepInputBinding): EquipmentScriptStep {
+  return {
+    ...step,
+    inputBindings: [
+      ...step.inputBindings.filter((entry) => entry.inputName !== binding.inputName),
+      binding,
+    ],
+  };
+}
+
+function normalizeStepCommandNameFromTitle(title: string): string | null {
+  const key = title.trim().toLowerCase();
+  const stepToCommand = new Map<string, string>([
+    ["identify instrument", "identify"],
+    ["read ch1 scale", "read ch1 scale"],
+    ["read ch1 offset", "read ch1 offset"],
+    ["read timebase", "read timebase"],
+    ["read sample rate", "read sample rate"],
+    ["read trigger delay", "read trigger delay"],
+    ["read trigger mode", "read trigger mode"],
+    ["read trigger source", "read trigger source"],
+    ["read trigger level", "read trigger level"],
+    ["capture scope screen", "capture screenshot"],
+    ["capture ch1 waveform", "capture waveform"],
+    ["capture waveform", "capture waveform"],
+  ]);
+  return stepToCommand.get(key) ?? null;
+}
+
+function resolveCommandForStep(step: EquipmentScriptStep, commands: EquipmentCommand[]): EquipmentCommand | undefined {
+  if (step.commandId) {
+    const byId = commands.find((entry) => entry.id === step.commandId);
+    if (byId) return byId;
+  }
+  const expectedName = normalizeStepCommandNameFromTitle(step.title);
+  if (expectedName) {
+    const byTitle = commands.find((entry) => entry.name.trim().toLowerCase() === expectedName);
+    if (byTitle) return byTitle;
+  }
+  return undefined;
+}
+
+function getCommandInputValues(command: EquipmentCommand): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const def of command.inputDefs) {
+    values[def.name] = command.testValues?.[def.name] ?? def.defaultValue ?? "";
+  }
+  return values;
 }
 
 function summarizeExecutionValue(value: unknown): unknown {
@@ -687,7 +1371,7 @@ function renderExecutionOutput(value: unknown): string {
   }
 }
 
-function isTcpCommandResult(value: unknown): value is { text?: string; bytesBase64?: string; data?: string; bytesLength?: number } {
+function isTcpCommandResult(value: unknown): value is TcpCommandResult {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
   return typeof record["text"] === "string" || typeof record["bytesBase64"] === "string";
@@ -698,12 +1382,16 @@ function isSiglentWaveformResult(value: unknown): value is SiglentWaveformResult
   return (value as { kind?: string }).kind === "siglent-waveform";
 }
 
-function guessImageMimeType(command: EquipmentCommand): string {
-  const saveAs = (command.saveAs ?? "").toLowerCase();
+function guessImageMimeTypeFromName(name?: string): string {
+  const saveAs = (name ?? "").toLowerCase();
   if (saveAs.endsWith(".jpg") || saveAs.endsWith(".jpeg")) return "image/jpeg";
   if (saveAs.endsWith(".bmp")) return "image/bmp";
   if (saveAs.endsWith(".gif")) return "image/gif";
   return "image/png";
+}
+
+function guessImageMimeType(command: EquipmentCommand): string {
+  return guessImageMimeTypeFromName(command.saveAs);
 }
 
 function formatEngineeringTime(seconds: number): string {
@@ -721,6 +1409,93 @@ function formatEngineeringVoltage(volts: number): string {
   if (absolute >= 1e-3) return `${(volts * 1e3).toFixed(3)} mV`;
   if (absolute >= 1e-6) return `${(volts * 1e6).toFixed(3)} uV`;
   return `${(volts * 1e9).toFixed(3)} nV`;
+}
+
+function ExecutionArtifactView(props: { output: unknown; artifactMode?: ArtifactMode; saveAs?: string; label: string }) {
+  const { output, artifactMode, saveAs, label } = props;
+  if (isSiglentWaveformResult(output)) {
+    return <WaveformChartInteractive key={`wave-${label}-${output.channel}-${output.sampleCount}-${output.startTimeSeconds}`} result={output} />;
+  }
+  if (isTcpCommandResult(output)) {
+    if (artifactMode === "image" && output.bytesBase64) {
+      return (
+        <img
+          src={`data:${guessImageMimeTypeFromName(saveAs)};base64,${output.bytesBase64}`}
+          alt={label}
+          style={{ display: "block", maxWidth: "100%", height: "auto", background: "white", borderRadius: 8 }}
+        />
+      );
+    }
+    return (
+      <pre style={{ margin: 0, color: C.text, fontSize: "0.84rem", lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+        {output.text || output.data || "No interpreted output available."}
+      </pre>
+    );
+  }
+  return (
+    <pre style={{ margin: 0, color: C.text, fontSize: "0.84rem", lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+      {renderExecutionOutput(output)}
+    </pre>
+  );
+}
+
+function ScriptExecutionTimeline({ result }: { result: ExecutionResult }) {
+  if (!result.steps?.length) return null;
+  return (
+    <section style={{ ...cardStyle(), marginTop: "0.9rem" }}>
+      <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Latest Run</div>
+      <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.84rem" }}>
+        {new Date(result.startedAt).toLocaleString()}
+      </div>
+      <div style={{ marginTop: "0.85rem", display: "grid", gap: "0.85rem" }}>
+        {result.steps.map((step, index) => (
+          <article key={`${step.stepId ?? "step"}-${index}`} style={{ border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.85rem", display: "grid", gap: "0.75rem" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
+              <div>
+                <div style={{ fontWeight: 700 }}>{step.title}</div>
+                <div style={{ marginTop: "0.18rem", color: C.muted, fontSize: "0.8rem" }}>
+                  {step.commandName ?? "Step"} {step.payload ? "-> executed" : ""}
+                </div>
+              </div>
+              <div style={{ color: step.ok ? C.ok : C.danger, fontSize: "0.78rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                {step.ok ? "OK" : "Failed"}
+              </div>
+            </div>
+            {step.resolvedInputs && Object.keys(step.resolvedInputs).length ? (
+              <div style={{ display: "grid", gap: "0.35rem" }}>
+                <div style={{ fontSize: "0.76rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Inputs</div>
+                <pre style={{ margin: 0, padding: "0.75rem", borderRadius: 10, background: C.panel, color: C.text, fontSize: "0.82rem", lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+                  {Object.entries(step.resolvedInputs).map(([key, value]) => `${key}: ${stringifyTemplateValue(value)}`).join("\n")}
+                </pre>
+              </div>
+            ) : null}
+            {step.payload ? (
+              <div style={{ display: "grid", gap: "0.35rem" }}>
+                <div style={{ fontSize: "0.76rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Command</div>
+                <pre style={{ margin: 0, padding: "0.75rem", borderRadius: 10, background: "#07111e", color: "#d6ecff", fontSize: "0.82rem", lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+                  {step.payload}
+                </pre>
+              </div>
+            ) : null}
+            {step.outputs && Object.keys(step.outputs).length ? (
+              <div style={{ display: "grid", gap: "0.35rem" }}>
+                <div style={{ fontSize: "0.76rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Parsed Outputs</div>
+                <pre style={{ margin: 0, padding: "0.75rem", borderRadius: 10, background: C.panel, color: C.text, fontSize: "0.82rem", lineHeight: 1.5, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+                  {Object.entries(step.outputs).map(([key, value]) => `${key}: ${stringifyTemplateValue(value)}`).join("\n")}
+                </pre>
+              </div>
+            ) : null}
+            <div style={{ display: "grid", gap: "0.35rem" }}>
+              <div style={{ fontSize: "0.76rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Interpreted Output</div>
+              <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, background: C.panel, padding: "0.8rem", overflow: "auto", maxHeight: 560 }}>
+                <ExecutionArtifactView output={step.output} artifactMode={step.artifactMode} saveAs={step.saveAs} label={step.commandName ?? step.title} />
+              </div>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 function WaveformChart({ result }: { result: SiglentWaveformResult }) {
@@ -892,16 +1667,35 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
   const [cursorMode, setCursorMode] = useState(false);
   const [cursors, setCursors] = useState<WaveformCursor[]>([]);
   const [mathRows, setMathRows] = useState<WaveformMathRow[]>([]);
-  const dragRef = useRef<{ startX: number; startRange: [number, number] } | null>(null);
+  const dragRef = useRef<{ startX: number; startY: number; startRange: [number, number]; startYRange: [number, number] } | null>(null);
+  const plotLeft = 64;
+  const plotTop = 12;
+  const plotWidth = 916;
+  const plotHeight = 320;
+  const plotRight = plotLeft + plotWidth;
+  const plotBottom = plotTop + plotHeight;
+  const baseVoltageSpan = Math.max(result.maxVoltage - result.minVoltage, 1e-6);
+  const defaultVoltagePadding = Math.max(baseVoltageSpan * 0.05, result.metadata.voltsPerDiv * 0.1, 1e-6);
+  const defaultYMin = result.minVoltage - defaultVoltagePadding;
+  const defaultYMax = result.maxVoltage + defaultVoltagePadding;
+  const minVerticalSpan = Math.max(baseVoltageSpan / 20, result.metadata.voltsPerDiv / 20, 1e-6);
+  const maxVerticalSpan = Math.max(defaultYMax - defaultYMin, minVerticalSpan);
 
   useEffect(() => {
-    setVisibleRange([0, result.sampleCount]);
-    setYRange([result.minVoltage, result.maxVoltage]);
+    const preferred = result.preferredViewport;
+    const preferredStartIndex = typeof preferred?.xMinSeconds === "number"
+      ? Math.max(0, Math.min(result.sampleCount - 2, Math.round((preferred.xMinSeconds - result.startTimeSeconds) / Math.max(result.intervalSeconds, 1e-18))))
+      : 0;
+    const preferredEndIndex = typeof preferred?.xMaxSeconds === "number"
+      ? Math.max(preferredStartIndex + 2, Math.min(result.sampleCount, Math.round((preferred.xMaxSeconds - result.startTimeSeconds) / Math.max(result.intervalSeconds, 1e-18))))
+      : result.sampleCount;
+    setVisibleRange([preferredStartIndex, preferredEndIndex]);
+    setYRange([defaultYMin, defaultYMax]);
     setHoverIndex(null);
     setCursorMode(false);
     setCursors([]);
     setMathRows([]);
-  }, [result.channel, result.sampleCount, result.startTimeSeconds, result.endTimeSeconds, result.minVoltage, result.maxVoltage]);
+  }, [defaultYMax, defaultYMin, result.channel, result.sampleCount, result.startTimeSeconds, result.endTimeSeconds, result.minVoltage, result.maxVoltage, result.intervalSeconds, result.preferredViewport]);
 
   const clampedRange = useMemo<[number, number]>(() => {
     const start = Math.max(0, Math.min(result.sampleCount - 2, Math.floor(visibleRange[0])));
@@ -931,22 +1725,24 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
     .filter((cursor): cursor is WaveformCursor & { point: SiglentWaveformPoint } => Boolean(cursor.point));
 
   const polylinePoints = visiblePoints.map((point) => {
-    const x = ((point.timeSeconds - timeStart) / timeSpan) * 1000;
-    const y = 360 - (((point.voltage - yMin) / voltageSpan) * 360);
+    const x = plotLeft + (((point.timeSeconds - timeStart) / timeSpan) * plotWidth);
+    const y = plotBottom - (((point.voltage - yMin) / voltageSpan) * plotHeight);
     return `${x.toFixed(2)},${y.toFixed(2)}`;
   }).join(" ");
 
   const xGridLines = Array.from({ length: 11 }, (_, index) => {
     const fraction = index / 10;
-    return { x: 1000 * fraction, value: timeStart + (timeSpan * fraction) };
+    return { x: plotLeft + (plotWidth * fraction), value: timeStart + (timeSpan * fraction) };
   });
   const yGridLines = Array.from({ length: 11 }, (_, index) => {
     const fraction = index / 10;
-    return { y: 360 - (360 * fraction), value: yMin + (voltageSpan * fraction) };
+    return { y: plotBottom - (plotHeight * fraction), value: yMin + (voltageSpan * fraction) };
   });
 
   const updateHoverFromPoint = (clientX: number, bounds: DOMRect) => {
-    const fraction = Math.max(0, Math.min(1, (clientX - bounds.left) / Math.max(1, bounds.width)));
+    const plotClientLeft = bounds.left + ((plotLeft / 1000) * bounds.width);
+    const plotClientWidth = (plotWidth / 1000) * bounds.width;
+    const fraction = Math.max(0, Math.min(1, (clientX - plotClientLeft) / Math.max(1, plotClientWidth)));
     const [start, end] = clampedRange;
     const index = start + Math.round(fraction * Math.max(0, end - start - 1));
     setHoverIndex(index);
@@ -957,10 +1753,8 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
   const maxXStart = Math.max(0, result.sampleCount - xWindowSize);
   const yWindowSize = Math.max(yMax - yMin, 1e-9);
   const yCenter = (yMin + yMax) / 2;
-  const fullYMin = result.minVoltage - (yWindowSize * 0.25);
-  const fullYMax = result.maxVoltage + (yWindowSize * 0.25);
-  const minYCenter = fullYMin + (yWindowSize / 2);
-  const maxYCenter = fullYMax - (yWindowSize / 2);
+  const fullYMin = defaultYMin;
+  const fullYMax = defaultYMax;
 
   const mathResults = mathRows.map((row) => {
     const a = cursorOptions.find((cursor) => cursor.id === row.aCursorId)?.point;
@@ -1003,17 +1797,15 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
       <div style={{ display: "grid", gridTemplateColumns: "1fr 52px", gap: "0.75rem", alignItems: "stretch" }}>
         <div
           style={{ border: `1px solid ${C.border}`, borderRadius: 12, background: "#06101a", padding: "0.75rem", overflow: "hidden", overscrollBehavior: "contain", userSelect: "none", WebkitUserSelect: "none" as React.CSSProperties["WebkitUserSelect"] }}
-          onWheelCapture={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-          }}
           onWheel={(event) => {
             event.preventDefault();
             event.stopPropagation();
             const bounds = (event.currentTarget as HTMLDivElement).getBoundingClientRect();
             if (event.shiftKey) {
-              const nextSpan = Math.max(1e-6, Math.min(fullYMax - fullYMin, yWindowSize * (event.deltaY > 0 ? 1.2 : 0.8)));
-              const focusFraction = Math.max(0, Math.min(1, (bounds.bottom - event.clientY) / Math.max(1, bounds.height)));
+              const plotClientTop = bounds.top + ((plotTop / 360) * bounds.height);
+              const plotClientHeight = (plotHeight / 360) * bounds.height;
+              const nextSpan = Math.max(minVerticalSpan, Math.min(maxVerticalSpan, yWindowSize * (event.deltaY > 0 ? 1.2 : 0.8)));
+              const focusFraction = Math.max(0, Math.min(1, 1 - ((event.clientY - plotClientTop) / Math.max(1, plotClientHeight))));
               const focusValue = yMin + (voltageSpan * focusFraction);
               let nextMin = focusValue - (nextSpan * focusFraction);
               let nextMax = nextMin + nextSpan;
@@ -1028,7 +1820,9 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
               setYRange([nextMin, nextMax]);
               return;
             }
-            const fraction = Math.max(0, Math.min(1, (event.clientX - bounds.left) / Math.max(1, bounds.width)));
+            const plotClientLeft = bounds.left + ((plotLeft / 1000) * bounds.width);
+            const plotClientWidth = (plotWidth / 1000) * bounds.width;
+            const fraction = Math.max(0, Math.min(1, (event.clientX - plotClientLeft) / Math.max(1, plotClientWidth)));
             const currentSpan = clampedRange[1] - clampedRange[0];
             const nextSpan = Math.max(50, Math.min(result.sampleCount, Math.round(currentSpan * (event.deltaY > 0 ? 1.2 : 0.8))));
             const center = clampedRange[0] + (currentSpan * fraction);
@@ -1048,9 +1842,14 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
             const bounds = (event.currentTarget as HTMLDivElement).getBoundingClientRect();
             updateHoverFromPoint(event.clientX, bounds);
             if (!dragRef.current) return;
-            const pixelDelta = event.clientX - dragRef.current.startX;
-            const pointsPerPixel = (dragRef.current.startRange[1] - dragRef.current.startRange[0]) / Math.max(1, bounds.width);
-            const pointDelta = Math.round(pixelDelta * pointsPerPixel);
+            const plotClientWidth = (plotWidth / 1000) * bounds.width;
+            const plotClientHeight = (plotHeight / 360) * bounds.height;
+            const pixelDeltaX = event.clientX - dragRef.current.startX;
+            const pixelDeltaY = event.clientY - dragRef.current.startY;
+            const pointsPerPixel = (dragRef.current.startRange[1] - dragRef.current.startRange[0]) / Math.max(1, plotClientWidth);
+            const voltsPerPixel = (dragRef.current.startYRange[1] - dragRef.current.startYRange[0]) / Math.max(1, plotClientHeight);
+            const pointDelta = Math.round(pixelDeltaX * pointsPerPixel);
+            const voltDelta = pixelDeltaY * voltsPerPixel;
             let nextStart = dragRef.current.startRange[0] - pointDelta;
             let nextEnd = dragRef.current.startRange[1] - pointDelta;
             const span = nextEnd - nextStart;
@@ -1062,7 +1861,19 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
               nextEnd = result.sampleCount;
               nextStart = Math.max(0, nextEnd - span);
             }
+            let nextYMin = dragRef.current.startYRange[0] + voltDelta;
+            let nextYMax = dragRef.current.startYRange[1] + voltDelta;
+            const nextYSpan = nextYMax - nextYMin;
+            if (nextYMin < fullYMin) {
+              nextYMin = fullYMin;
+              nextYMax = nextYMin + nextYSpan;
+            }
+            if (nextYMax > fullYMax) {
+              nextYMax = fullYMax;
+              nextYMin = nextYMax - nextYSpan;
+            }
             setVisibleRange([nextStart, nextEnd]);
+            setYRange([nextYMin, nextYMax]);
           }}
           onPointerLeave={() => {
             dragRef.current = null;
@@ -1078,7 +1889,7 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
               setCursorMode(false);
               return;
             }
-            dragRef.current = { startX: event.clientX, startRange: clampedRange };
+            dragRef.current = { startX: event.clientX, startY: event.clientY, startRange: clampedRange, startYRange: [yMin, yMax] };
             (event.currentTarget as HTMLDivElement).setPointerCapture(event.pointerId);
           }}
           onPointerUp={(event) => {
@@ -1088,26 +1899,27 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
         >
           <svg viewBox="0 0 1000 360" style={{ display: "block", width: "100%", height: 360, background: "#ffffff", borderRadius: 8, userSelect: "none", WebkitUserSelect: "none" as React.CSSProperties["WebkitUserSelect"] }}>
             <rect x="0" y="0" width="1000" height="360" fill="#ffffff" />
+            <rect x={plotLeft} y={plotTop} width={plotWidth} height={plotHeight} fill="#ffffff" stroke="#d9e3ef" strokeWidth="1" />
             {yGridLines.map((line, index) => (
               <g key={`h-${index}`}>
-                <line x1="0" x2="1000" y1={line.y} y2={line.y} stroke="#dde5ee" strokeWidth="1" />
-                <text x="6" y={Math.max(12, Math.min(354, line.y - 4))} fill="#5b6b7f" fontSize="11">{formatEngineeringVoltage(line.value)}</text>
+                <line x1={plotLeft} x2={plotRight} y1={line.y} y2={line.y} stroke="#c9d6e4" strokeWidth="1" />
+                <text x="6" y={Math.max(plotTop + 10, Math.min(plotBottom, line.y - 4))} fill="#5b6b7f" fontSize="11">{formatEngineeringVoltage(line.value)}</text>
               </g>
             ))}
             {xGridLines.map((line, index) => (
               <g key={`v-${index}`}>
-                <line x1={line.x} x2={line.x} y1="0" y2="360" stroke="#e8edf5" strokeWidth="1" />
-                <text x={Math.max(4, Math.min(930, line.x + 4))} y="354" fill="#5b6b7f" fontSize="11">{formatEngineeringTime(line.value)}</text>
+                <line x1={line.x} x2={line.x} y1={plotTop} y2={plotBottom} stroke="#d4deea" strokeWidth="1" />
+                <text x={Math.max(plotLeft, Math.min(plotRight - 50, line.x + 4))} y="352" fill="#5b6b7f" fontSize="11">{formatEngineeringTime(line.value)}</text>
               </g>
             ))}
             <polyline fill="none" stroke="#0f766e" strokeWidth="2" points={polylinePoints} />
             {cursorOptions.map((cursor) => {
-              const x = ((cursor.point.timeSeconds - timeStart) / timeSpan) * 1000;
-              const y = 360 - (((cursor.point.voltage - yMin) / voltageSpan) * 360);
+              const x = plotLeft + (((cursor.point.timeSeconds - timeStart) / timeSpan) * plotWidth);
+              const y = plotBottom - (((cursor.point.voltage - yMin) / voltageSpan) * plotHeight);
               return (
                 <g key={cursor.id}>
-                  <line x1={x} x2={x} y1="0" y2="360" stroke={cursor.color} strokeDasharray="8 6" strokeWidth="2" />
-                  <line x1="0" x2="1000" y1={y} y2={y} stroke={cursor.color} strokeDasharray="8 6" strokeWidth="2" opacity="0.9" />
+                  <line x1={x} x2={x} y1={plotTop} y2={plotBottom} stroke={cursor.color} strokeDasharray="8 6" strokeWidth="2" />
+                  <line x1={plotLeft} x2={plotRight} y1={y} y2={y} stroke={cursor.color} strokeDasharray="8 6" strokeWidth="2" opacity="0.9" />
                   <circle cx={x} cy={y} r="4.5" fill={cursor.color} />
                   <rect x={Math.min(760, x + 8)} y={Math.max(6, y - 28)} width="236" height="24" rx="6" fill={cursor.color} opacity="0.95" />
                   <text x={Math.min(772, x + 18)} y={Math.max(22, y - 12)} fill="#ffffff" fontSize="11" fontWeight="700">
@@ -1118,8 +1930,8 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
             })}
             {hoverPoint ? (
               <>
-                <line x1={((hoverPoint.timeSeconds - timeStart) / timeSpan) * 1000} x2={((hoverPoint.timeSeconds - timeStart) / timeSpan) * 1000} y1="0" y2="360" stroke="#fb7185" strokeDasharray="6 6" />
-                <circle cx={((hoverPoint.timeSeconds - timeStart) / timeSpan) * 1000} cy={360 - (((hoverPoint.voltage - yMin) / voltageSpan) * 360)} r="4" fill="#fb7185" />
+                <line x1={plotLeft + (((hoverPoint.timeSeconds - timeStart) / timeSpan) * plotWidth)} x2={plotLeft + (((hoverPoint.timeSeconds - timeStart) / timeSpan) * plotWidth)} y1={plotTop} y2={plotBottom} stroke="#fb7185" strokeDasharray="6 6" />
+                <circle cx={plotLeft + (((hoverPoint.timeSeconds - timeStart) / timeSpan) * plotWidth)} cy={plotBottom - (((hoverPoint.voltage - yMin) / voltageSpan) * plotHeight)} r="4" fill="#fb7185" />
               </>
             ) : null}
           </svg>
@@ -1127,13 +1939,23 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
         <div style={{ display: "flex", justifyContent: "center", alignItems: "center", paddingBlock: "1rem" }}>
           <input
             type="range"
-            min={minYCenter}
-            max={maxYCenter}
-            step={Math.max((maxYCenter - minYCenter) / 200, 1e-9)}
-            value={Math.max(minYCenter, Math.min(maxYCenter, yCenter))}
+            min={minVerticalSpan}
+            max={maxVerticalSpan}
+            step={Math.max((maxVerticalSpan - minVerticalSpan) / 250, 1e-9)}
+            value={Math.max(minVerticalSpan, Math.min(maxVerticalSpan, yWindowSize))}
             onChange={(event) => {
-              const nextCenter = Number(event.target.value);
-              setYRange([nextCenter - (yWindowSize / 2), nextCenter + (yWindowSize / 2)]);
+              const nextSpan = Number(event.target.value);
+              let nextMin = yCenter - (nextSpan / 2);
+              let nextMax = yCenter + (nextSpan / 2);
+              if (nextMin < fullYMin) {
+                nextMin = fullYMin;
+                nextMax = nextMin + nextSpan;
+              }
+              if (nextMax > fullYMax) {
+                nextMax = fullYMax;
+                nextMin = nextMax - nextSpan;
+              }
+              setYRange([nextMin, nextMax]);
             }}
             style={{ width: 240, transform: "rotate(-90deg)" }}
           />
@@ -1217,17 +2039,100 @@ function WaveformChartInteractive({ result }: { result: SiglentWaveformResult })
   );
 }
 
-function buildTcpExecutionParams(target: { host: string; port: number }, command: EquipmentCommand): Record<string, unknown> {
+function buildTcpExecutionParams(target: { host: string; port: number }, command: Pick<EquipmentCommand, "payload" | "parser" | "artifactMode" | "timeoutMs">, payloadOverride?: string): Record<string, unknown> {
   const isBinaryArtifact = command.artifactMode === "image" || command.artifactMode === "binary" || command.parser === "binary";
   return {
     host: target.host,
     port: target.port,
-    command: command.payload,
+    command: payloadOverride ?? command.payload,
     readMode: isBinaryArtifact ? "until-timeout" : "once",
     timeoutMs: command.timeoutMs || (isBinaryArtifact ? 15000 : 5000),
     quietMs: isBinaryArtifact ? 1000 : 250,
     encoding: isBinaryArtifact ? "base64" : "utf8",
   };
+}
+
+function resolveCommandInputValues(command: EquipmentCommand, overrides?: Record<string, unknown>): Record<string, unknown> {
+  const values: Record<string, unknown> = {};
+  for (const def of command.inputDefs) {
+    const override = overrides?.[def.name];
+    values[def.name] = typeof override === "undefined" ? (command.testValues?.[def.name] ?? def.defaultValue ?? "") : override;
+  }
+  return values;
+}
+
+function listMissingCommandInputs(command: EquipmentCommand, values: Record<string, unknown>): string[] {
+  return command.inputDefs
+    .filter((def) => def.required && !String(values[def.name] ?? "").trim())
+    .map((def) => def.name);
+}
+
+function buildStepOutputOptions(script: EquipmentScript, commands: EquipmentCommand[], selectedStepId?: string | null): Array<{ stepId: string; stepTitle: string; outputName: string; label: string }> {
+  const selectedIndex = selectedStepId ? script.steps.findIndex((step) => step.id === selectedStepId) : script.steps.length;
+  return script.steps
+    .slice(0, selectedIndex < 0 ? script.steps.length : selectedIndex)
+    .flatMap((step) => {
+      const command = resolveCommandForStep(step, commands);
+      return (command?.outputDefs ?? []).map((outputDef) => ({
+        stepId: step.id,
+        stepTitle: step.title,
+        outputName: outputDef.name,
+        label: `${step.title} -> ${outputDef.name}`,
+      }));
+    });
+}
+
+function validateScript(script: EquipmentScript, devices: EquipmentDevice[]): string[] {
+  const issues: string[] = [];
+  const device = devices.find((candidate) => candidate.id === script.deviceId);
+  const commands = device?.commands ?? devices.flatMap((entry) => entry.commands);
+  const stepIndex = new Map(script.steps.map((step, index) => [step.id, index]));
+  for (const step of script.steps) {
+    const command = resolveCommandForStep(step, commands);
+    if (!command && (step.type === "command" || step.type === "capture")) {
+      issues.push(`${step.title}: command reference is missing.`);
+      continue;
+    }
+    if (!command) continue;
+    for (const inputDef of command.inputDefs) {
+      const binding = step.inputBindings.find((entry) => entry.inputName === inputDef.name);
+      if (!binding) {
+        if (inputDef.required && !String(command.testValues?.[inputDef.name] ?? inputDef.defaultValue ?? "").trim()) {
+          issues.push(`${step.title}: required input "${inputDef.name}" is not bound.`);
+        }
+        continue;
+      }
+      if (binding.source === "step-output") {
+        if (!binding.sourceStepId || !binding.sourceOutputName) {
+          issues.push(`${step.title}: input "${inputDef.name}" has an incomplete step-output reference.`);
+          continue;
+        }
+        const sourceIndex = stepIndex.get(binding.sourceStepId);
+        const currentIndex = stepIndex.get(step.id) ?? 0;
+        if (typeof sourceIndex !== "number") {
+          issues.push(`${step.title}: input "${inputDef.name}" references a missing step.`);
+          continue;
+        }
+        if (sourceIndex >= currentIndex) {
+          issues.push(`${step.title}: input "${inputDef.name}" references a step that executes later.`);
+        }
+      } else if (inputDef.required && !String(binding.literalValue ?? "").trim()) {
+        issues.push(`${step.title}: input "${inputDef.name}" is empty.`);
+      }
+    }
+    for (const outputDef of command.outputDefs) {
+      if (!outputDef.name.trim()) issues.push(`${step.title}: an output is missing its name.`);
+      if (!outputDef.selector.trim()) issues.push(`${step.title}: output "${outputDef.name || "(unnamed)"}" is missing its selector.`);
+      if (outputDef.source === "regex") {
+        try {
+          void new RegExp(outputDef.selector, "m");
+        } catch {
+          issues.push(`${step.title}: output "${outputDef.name || "(unnamed)"}" has an invalid regex.`);
+        }
+      }
+    }
+  }
+  return issues;
 }
 
 async function fetchTcpText(bridge: BridgeConfig, target: { host: string; port: number }, command: string, timeoutMs = 5000): Promise<string> {
@@ -1338,6 +2243,8 @@ export default function EquipmentManager({ config }: ModuleProps) {
   const [bridgeChecking, setBridgeChecking] = useState(false);
   const [executing, setExecuting] = useState(false);
   const [executionResult, setExecutionResult] = useState<ExecutionResult | null>(null);
+  const [commandExecutions, setCommandExecutions] = useState<Record<string, ExecutionResult>>({});
+  const [scriptExecutions, setScriptExecutions] = useState<Record<string, ExecutionResult>>({});
   const [deviceProfileOpen, setDeviceProfileOpen] = useState(false);
   const [deviceChooserOpen, setDeviceChooserOpen] = useState(false);
 
@@ -1345,12 +2252,23 @@ export default function EquipmentManager({ config }: ModuleProps) {
   const selectedScript = state.scripts.find((script) => script.id === selectedScriptId) ?? state.scripts[0] ?? null;
   const selectedCommand = selectedDevice?.commands.find((command) => command.id === selectedCommandId) ?? selectedDevice?.commands[0] ?? null;
   const selectedStep = selectedScript?.steps.find((step) => step.id === selectedStepId) ?? selectedScript?.steps[0] ?? null;
-  const currentCommandExecution = executionResult?.scope === "command" && executionResult.commandId && executionResult.commandId === selectedCommand?.id
-    ? executionResult
+  const currentCommandExecution = selectedCommand ? commandExecutions[selectedCommand.id] ?? null : null;
+  const currentScriptExecution = selectedScript ? scriptExecutions[selectedScript.id] ?? null : null;
+  const selectedCommandInputValues = selectedCommand ? resolveCommandInputValues(selectedCommand) : {};
+  const selectedCommandPreviewPayload = selectedCommand ? applyTemplate(selectedCommand.payload, selectedCommandInputValues) : "";
+  const selectedStepCommand = selectedScript && selectedStep
+    ? resolveCommandForStep(
+      selectedStep,
+      selectedScript.deviceId
+        ? (state.devices.find((device) => device.id === selectedScript.deviceId)?.commands ?? [])
+        : state.devices.flatMap((device) => device.commands),
+    ) ?? null
     : null;
-  const currentScriptExecution = executionResult?.scope === "script" && executionResult.scriptId && executionResult.scriptId === selectedScript?.id
-    ? executionResult
-    : null;
+  const selectedStepOutputOptions = selectedScript
+    ? buildStepOutputOptions(selectedScript, selectedScript.deviceId
+      ? (state.devices.find((device) => device.id === selectedScript.deviceId)?.commands ?? [])
+      : state.devices.flatMap((device) => device.commands), selectedStep?.id)
+    : [];
   const activeBridge = bridgeUrl.trim() ? { url: bridgeUrl.trim(), token: bridgeToken.trim() || undefined } : null;
   const knownDevicePresets = useMemo<KnownDevicePreset[]>(() => [
     {
@@ -1358,6 +2276,7 @@ export default function EquipmentManager({ config }: ModuleProps) {
       name: "Siglent SDS1202X-E",
       description: "SCPI over TCP with known starter queries and screenshot capture.",
       create: () => normalizeDevice(createDefaultState().devices[0], 0),
+      createScripts: (device) => createKnownSiglentPreset(device.id, device.address).scripts,
     },
     {
       id: "blank",
@@ -1460,43 +2379,101 @@ export default function EquipmentManager({ config }: ModuleProps) {
     }
   }, [activeBridge, bridgeToken, bridgeTokenKey, bridgeUrl, bridgeUrlKey]);
 
-  const executeSiglentWaveformCommand = useCallback(async (target: { host: string; port: number }, command: EquipmentCommand): Promise<SiglentWaveformResult> => {
+  const executeSiglentWaveformCommand = useCallback(async (target: { host: string; port: number }, command: EquipmentCommand, inputValues?: Record<string, unknown>): Promise<SiglentWaveformResult> => {
     if (!activeBridge) throw new Error("Bridge URL is required before executing device commands.");
-    const channel = parseSiglentWaveformChannel(command.payload);
-    await callBridge<unknown>(activeBridge, "execute_tcp_command", {
-      host: target.host,
-      port: target.port,
-      command: SIGLENT_WAVEFORM_SETUP,
-      readMode: "none",
-      timeoutMs: 1500,
+    const waveformPayload = applyTemplate(command.payload, {
+      ...(inputValues ?? {}),
+      channel: String(inputValues?.["channel"] ?? parseSiglentWaveformChannel(command.payload)),
     });
-
-    const [voltsPerDivResponse, offsetResponse, timeDivResponse, triggerDelayResponse, sampleRateResponse, waveform] = await Promise.all([
+    const channel = parseSiglentWaveformChannel(waveformPayload);
+    const [voltsPerDivResponse, offsetResponse, timeDivResponse, triggerDelayResponse, sampleRateResponse] = await Promise.all([
       fetchTcpText(activeBridge, target, `${channel}:VDIV?`),
       fetchTcpText(activeBridge, target, `${channel}:OFST?`),
       fetchTcpText(activeBridge, target, "TDIV?"),
       fetchTcpText(activeBridge, target, "TRDL?"),
       fetchTcpText(activeBridge, target, "SARA?"),
-      callBridge<TcpCommandResult>(activeBridge, "execute_tcp_command", {
+    ]);
+    const sourcePointCount = Math.max(1, Math.round(parseScpiNumber(timeDivResponse) * 14 * parseScpiNumber(sampleRateResponse)));
+    const computedSparsing = Math.max(1, Math.floor((sourcePointCount - 1) / Math.max(1, SIGLENT_WAVEFORM_POINT_LIMIT - 1)));
+    const sparsingCandidates = Array.from(new Set([
+      Math.max(1, computedSparsing - 1),
+      computedSparsing,
+      Math.max(1, computedSparsing + 1),
+      1,
+    ]));
+    let result: SiglentWaveformResult | null = null;
+    let waveformSetup = `WFSU SP,${computedSparsing},NP,${SIGLENT_WAVEFORM_POINT_LIMIT},FP,0`;
+    let lastWaveformError: Error | null = null;
+    for (const sparsing of sparsingCandidates) {
+      waveformSetup = `WFSU SP,${sparsing},NP,${SIGLENT_WAVEFORM_POINT_LIMIT},FP,0`;
+      await callBridge<unknown>(activeBridge, "execute_tcp_command", {
         host: target.host,
         port: target.port,
-        command: command.payload,
-        readMode: "until-timeout",
-        timeoutMs: command.timeoutMs || 15000,
-        quietMs: 600,
-        encoding: "base64",
-      }),
-    ]);
+        command: waveformSetup,
+        readMode: "none",
+        timeoutMs: 1500,
+      });
 
-    return buildSiglentWaveformResult({
-      channel,
-      waveform,
-      voltsPerDivResponse,
-      offsetResponse,
-      timeDivResponse,
-      triggerDelayResponse,
-      sampleRateResponse,
-    });
+      const [descriptor, waveform] = await Promise.all([
+        callBridge<TcpCommandResult>(activeBridge, "execute_tcp_command", {
+          host: target.host,
+          port: target.port,
+          command: `${channel}:WF? DESC`,
+          readMode: "until-timeout",
+          timeoutMs: 8000,
+          quietMs: 1500,
+          encoding: "base64",
+        }),
+        callBridge<TcpCommandResult>(activeBridge, "execute_tcp_command", {
+          host: target.host,
+          port: target.port,
+          command: waveformPayload,
+          readMode: "until-timeout",
+          timeoutMs: command.timeoutMs || 15000,
+          quietMs: 1500,
+          encoding: "base64",
+        }),
+      ]);
+      try {
+        result = buildSiglentWaveformResult({
+          channel,
+          waveform,
+          descriptor,
+          voltsPerDivResponse,
+          offsetResponse,
+          timeDivResponse,
+          triggerDelayResponse,
+          sampleRateResponse,
+        });
+        break;
+      } catch (error) {
+        lastWaveformError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    if (!result) {
+      throw lastWaveformError ?? new Error("Unable to capture a valid waveform block from the scope.");
+    }
+    const centerTimeSeconds = parseOptionalNumber(inputValues?.["centerTimeSeconds"]);
+    const timePerDivSeconds = parseOptionalNumber(inputValues?.["timePerDivSeconds"]);
+    const centerVolts = parseOptionalNumber(inputValues?.["centerVolts"]);
+    const scopeOffsetVolts = parseOptionalNumber(inputValues?.["scopeOffsetVolts"]);
+    const voltsPerDiv = parseOptionalNumber(inputValues?.["voltsPerDiv"]);
+    const horizontalHalfSpan = typeof timePerDivSeconds === "number" ? (timePerDivSeconds * result.metadata.grid / 2) : undefined;
+    const verticalHalfSpan = typeof voltsPerDiv === "number" ? (voltsPerDiv * result.metadata.grid / 2) : undefined;
+    const resolvedCenterVolts = typeof centerVolts === "number"
+      ? centerVolts
+      : (typeof scopeOffsetVolts === "number" ? -scopeOffsetVolts : undefined);
+    const preferredViewport = {
+      xMinSeconds: typeof centerTimeSeconds === "number" && typeof horizontalHalfSpan === "number" ? centerTimeSeconds - horizontalHalfSpan : undefined,
+      xMaxSeconds: typeof centerTimeSeconds === "number" && typeof horizontalHalfSpan === "number" ? centerTimeSeconds + horizontalHalfSpan : undefined,
+      yMinVolts: typeof resolvedCenterVolts === "number" && typeof verticalHalfSpan === "number" ? resolvedCenterVolts - verticalHalfSpan : undefined,
+      yMaxVolts: typeof resolvedCenterVolts === "number" && typeof verticalHalfSpan === "number" ? resolvedCenterVolts + verticalHalfSpan : undefined,
+    };
+    if (Object.values(preferredViewport).some((value) => typeof value === "number")) {
+      result.preferredViewport = preferredViewport;
+    }
+    result.transport.setupCommand = waveformSetup;
+    return result;
   }, [activeBridge]);
 
   const runDeviceCommand = useCallback(async (device: EquipmentDevice, command: EquipmentCommand) => {
@@ -1511,18 +2488,26 @@ export default function EquipmentManager({ config }: ModuleProps) {
     }
     setExecuting(true);
     setError("");
-    setExecutionResult(null);
     try {
+      const inputValues = resolveCommandInputValues(command);
+      const missingInputs = listMissingCommandInputs(command, inputValues);
+      if (missingInputs.length) {
+        throw new Error(`Missing required inputs: ${missingInputs.join(", ")}`);
+      }
+      const payload = applyTemplate(command.payload, inputValues);
       const output = command.parser === "siglent-waveform"
-        ? await executeSiglentWaveformCommand(target, command)
-        : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, command));
-      setExecutionResult({
+        ? await executeSiglentWaveformCommand(target, command, inputValues)
+        : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, command, payload));
+      const result: ExecutionResult = {
         scope: "command",
         title: `${device.name} · ${command.name}`,
         startedAt: new Date().toISOString(),
         commandId: command.id,
+        outputs: extractCommandOutputs(command, output),
         output,
-      });
+      };
+      setExecutionResult(result);
+      setCommandExecutions((current) => ({ ...current, [command.id]: result }));
       setMessage(`Executed ${command.name}`);
     } catch (executionError: unknown) {
       setError((executionError as Error).message);
@@ -1550,9 +2535,7 @@ export default function EquipmentManager({ config }: ModuleProps) {
     const commandMap = new Map(device.commands.map((command) => [command.id, command]));
     setExecuting(true);
     setError("");
-    setExecutionResult(null);
-
-    const stepResults: Array<{ title: string; ok: boolean; output?: unknown }> = [];
+    const stepResults: NonNullable<ExecutionResult["steps"]> = [];
     try {
       for (const step of script.steps) {
         if (step.type === "wait") {
@@ -1566,7 +2549,7 @@ export default function EquipmentManager({ config }: ModuleProps) {
           continue;
         }
 
-        const ref = step.commandId ? commandMap.get(step.commandId) : undefined;
+        const ref = resolveCommandForStep(step, device.commands);
         const payload = step.rawCommand ?? ref?.payload ?? "";
         if (!payload.trim()) {
           throw new Error(`Step "${step.title}" does not have a command payload.`);
@@ -1574,15 +2557,10 @@ export default function EquipmentManager({ config }: ModuleProps) {
 
         const timeoutMs = ref?.timeoutMs ?? 5000;
         const output = await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, {
-          id: ref?.id ?? step.id,
-          name: ref?.name ?? step.title,
-          mode: ref?.mode ?? "raw",
           payload,
           parser: ref?.parser ?? "text",
           timeoutMs,
-          saveAs: step.saveAs ?? ref?.saveAs,
           artifactMode: ref?.artifactMode ?? (step.type === "capture" ? "image" : "text"),
-          notes: ref?.notes,
         }));
         stepResults.push({ title: step.title, ok: true, output });
       }
@@ -1609,6 +2587,128 @@ export default function EquipmentManager({ config }: ModuleProps) {
       setExecuting(false);
     }
   }, [activeBridge, state.devices]);
+
+  const runScriptBound = useCallback(async (script: EquipmentScript) => {
+    if (!activeBridge) {
+      setError("Bridge URL is required before executing scripts.");
+      return;
+    }
+    const device = state.devices.find((candidate) => candidate.id === script.deviceId);
+    if (!device) {
+      setError("Bind the script to a device before running it.");
+      return;
+    }
+    const target = parseDeviceAddress(device.address);
+    if (!target) {
+      setError("Device address must be set before executing scripts.");
+      return;
+    }
+
+    const commandMap = new Map(device.commands.map((command) => [command.id, command]));
+    setExecuting(true);
+    setError("");
+    const stepResults: NonNullable<ExecutionResult["steps"]> = [];
+    const stepOutputContext = new Map<string, Record<string, unknown>>();
+    try {
+      for (const step of script.steps) {
+        if (step.type === "wait") {
+          await new Promise((resolve) => window.setTimeout(resolve, step.waitMs ?? 1000));
+          stepResults.push({ stepId: step.id, title: step.title, ok: true, output: { waitedMs: step.waitMs ?? 1000 } });
+          continue;
+        }
+        if (step.type === "note") {
+          stepResults.push({ stepId: step.id, title: step.title, ok: true, output: { notes: step.notes ?? "" } });
+          continue;
+        }
+
+        const ref = resolveCommandForStep(step, device.commands);
+        const baseCommand: EquipmentCommand = ref ?? {
+          id: step.id,
+          name: step.title,
+          mode: "raw",
+          payload: step.rawCommand ?? "",
+          parser: "text",
+          timeoutMs: 5000,
+          saveAs: step.saveAs,
+          artifactMode: step.type === "capture" ? "image" : "text",
+          notes: step.notes,
+          inputDefs: [],
+          outputDefs: [],
+          testValues: {},
+        };
+        const resolvedInputs: Record<string, unknown> = {};
+        for (const inputDef of baseCommand.inputDefs) {
+          const binding = step.inputBindings.find((entry) => entry.inputName === inputDef.name);
+          if (binding?.source === "step-output") {
+            resolvedInputs[inputDef.name] = stepOutputContext.get(binding.sourceStepId ?? "")?.[binding.sourceOutputName ?? ""];
+          } else if (binding?.source === "literal") {
+            resolvedInputs[inputDef.name] = binding.literalValue ?? "";
+          } else {
+            resolvedInputs[inputDef.name] = baseCommand.testValues?.[inputDef.name] ?? inputDef.defaultValue ?? "";
+          }
+        }
+        const missingInputs = listMissingCommandInputs(baseCommand, resolvedInputs);
+        if (missingInputs.length) {
+          throw new Error(`Step "${step.title}" is missing required inputs: ${missingInputs.join(", ")}`);
+        }
+
+        const payload = applyTemplate(step.rawCommand ?? baseCommand.payload ?? "", resolvedInputs);
+        if (!payload.trim()) {
+          throw new Error(`Step "${step.title}" does not have a command payload.`);
+        }
+
+        const resolvedCommand: EquipmentCommand = {
+          ...baseCommand,
+          payload,
+          saveAs: step.saveAs ?? baseCommand.saveAs,
+        };
+        const output = resolvedCommand.parser === "siglent-waveform"
+          ? await executeSiglentWaveformCommand(target, resolvedCommand, resolvedInputs)
+          : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, resolvedCommand, payload));
+        const outputs = extractCommandOutputs(resolvedCommand, output);
+        stepOutputContext.set(step.id, outputs);
+        stepResults.push({
+          stepId: step.id,
+          title: step.title,
+          ok: true,
+          output,
+          outputs,
+          commandName: baseCommand.name,
+          artifactMode: resolvedCommand.artifactMode,
+          parser: resolvedCommand.parser,
+          payload,
+          resolvedInputs,
+          notes: step.notes ?? baseCommand.notes,
+          saveAs: resolvedCommand.saveAs,
+        });
+      }
+
+      const result: ExecutionResult = {
+        scope: "script",
+        title: `${device.name} · ${script.name}`,
+        startedAt: new Date().toISOString(),
+        scriptId: script.id,
+        steps: stepResults,
+      };
+      setExecutionResult(result);
+      setScriptExecutions((current) => ({ ...current, [script.id]: result }));
+      setMessage(`Executed script ${script.name}`);
+    } catch (executionError: unknown) {
+      stepResults.push({ title: "Execution halted", ok: false, output: { error: (executionError as Error).message } });
+      const result: ExecutionResult = {
+        scope: "script",
+        title: `${device.name} · ${script.name}`,
+        startedAt: new Date().toISOString(),
+        scriptId: script.id,
+        steps: stepResults,
+      };
+      setExecutionResult(result);
+      setScriptExecutions((current) => ({ ...current, [script.id]: result }));
+      setError((executionError as Error).message);
+    } finally {
+      setExecuting(false);
+    }
+  }, [activeBridge, executeSiglentWaveformCommand, state.devices]);
 
   const contractSummary = useMemo(() => [
     "get_capabilities",
@@ -1763,6 +2863,9 @@ export default function EquipmentManager({ config }: ModuleProps) {
                             parser: "text",
                             timeoutMs: 5000,
                             artifactMode: "none",
+                            inputDefs: [],
+                            outputDefs: [],
+                            testValues: {},
                           };
                           const next = {
                             ...state,
@@ -1780,8 +2883,8 @@ export default function EquipmentManager({ config }: ModuleProps) {
                         Add Command
                       </button>
                     </div>
-                    <div style={{ marginTop: "0.9rem", display: "grid", gridTemplateColumns: "280px minmax(0, 1fr)", gap: "1rem", minHeight: 520 }}>
-                      <div style={{ minHeight: 0, overflowY: "auto", border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.75rem", display: "grid", gap: "0.6rem" }}>
+                      <div style={{ marginTop: "0.9rem", display: "grid", gridTemplateColumns: "260px minmax(0, 1fr)", gap: "1rem", minHeight: 520 }}>
+                      <div style={{ minHeight: 0, overflowY: "auto", border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.55rem", display: "grid", gap: "0.45rem" }}>
                         {selectedDevice.commands.map((command) => {
                           const active = command.id === selectedCommand?.id;
                           return (
@@ -1794,12 +2897,12 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                 background: active ? C.accentSoft : C.panel,
                                 color: C.text,
                                 borderRadius: 10,
-                                padding: "0.55rem 0.65rem",
+                                padding: "0.38rem 0.5rem",
                                 cursor: "pointer",
                               }}
                             >
-                              <div style={{ fontWeight: 700 }}>{command.name}</div>
-                              <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.78rem" }}>
+                              <div style={{ fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", lineHeight: 1.15 }}>{command.name}</div>
+                              <div style={{ marginTop: "0.14rem", color: C.muted, fontSize: "0.72rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                                 {command.mode} · {command.parser} · {command.artifactMode}
                               </div>
                             </button>
@@ -1816,6 +2919,40 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                   <button onClick={() => void runDeviceCommand(selectedDevice, selectedCommand)} style={buttonStyle()} disabled={executing}>
                                     {executing ? "Running..." : "Run"}
                                   </button>
+                                  {selectedCommand.builtIn ? (
+                                    <>
+                                      <button
+                                        onClick={() => {
+                                          const copy: EquipmentCommand = { ...selectedCommand, id: makeId("command"), builtIn: false, name: `${selectedCommand.name} Copy` };
+                                          const next = {
+                                            ...state,
+                                            devices: state.devices.map((device) => device.id === selectedDevice.id ? { ...device, commands: [...device.commands, copy] } : device),
+                                          };
+                                          setState(next);
+                                          setSelectedCommandId(copy.id);
+                                          void persistState(next, "Command duplicated");
+                                        }}
+                                        style={buttonStyle()}
+                                      >
+                                        Duplicate
+                                      </button>
+                                      <button
+                                        onClick={() => {
+                                          const preset = createKnownSiglentPreset(selectedDevice.id, selectedDevice.address);
+                                          const next = {
+                                            ...state,
+                                            devices: state.devices.map((device) => device.id === selectedDevice.id ? preset.device : device),
+                                            scripts: [...state.scripts.filter((script) => !(script.builtIn && script.deviceId === selectedDevice.id)), ...preset.scripts],
+                                          };
+                                          setState(next);
+                                          void persistState(next, "Known Siglent preset restored");
+                                        }}
+                                        style={buttonStyle()}
+                                      >
+                                        Restore Known
+                                      </button>
+                                    </>
+                                  ) : null}
                                   <button
                                     onClick={() => {
                                       const next = {
@@ -1826,11 +2963,17 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                       void persistState(next, "Command removed");
                                     }}
                                     style={buttonStyle("danger")}
+                                    disabled={selectedCommand.builtIn}
                                   >
                                     Delete
                                   </button>
                                 </div>
                               </div>
+                              {selectedCommand.builtIn ? (
+                                <div style={{ marginTop: "0.55rem", color: C.muted, fontSize: "0.82rem" }}>
+                                  Built-in command. Duplicate it if you want an editable copy, or use Restore Known to recover the preset set.
+                                </div>
+                              ) : null}
                               <div style={{ marginTop: "0.8rem", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0.8rem" }}>
                                 <label style={labelStyle()}>
                                   Name
@@ -1879,6 +3022,163 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                 Payload
                                 <textarea value={selectedCommand.payload} onChange={(event) => setState((current) => ({ ...current, devices: current.devices.map((device) => device.id === selectedDevice.id ? { ...device, commands: device.commands.map((item) => item.id === selectedCommand.id ? { ...item, payload: event.target.value } : item) } : device) }))} onBlur={() => void persistState(state, "Command updated")} rows={4} style={{ ...inputStyle(), resize: "vertical", lineHeight: 1.6, fontFamily: "Consolas, monospace" }} />
                               </label>
+                              <section style={{ ...cardStyle(), marginTop: "0.9rem", padding: "0.85rem" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+                                  <div>
+                                    <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Inputs</div>
+                                    <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.82rem" }}>Define named variables that can be referenced in the payload with <code>{"{{name}}"}</code>.</div>
+                                  </div>
+                                  <button
+                                    onClick={() => {
+                                      const next = cloneStateWithCommand(state, selectedDevice.id, selectedCommand.id, (command) => ({
+                                        ...command,
+                                        inputDefs: [...command.inputDefs, { id: makeId("input"), name: `input${command.inputDefs.length + 1}`, required: true }],
+                                      }));
+                                      setState(next);
+                                      void persistState(next, "Command updated");
+                                    }}
+                                    style={buttonStyle("primary")}
+                                  >
+                                    Add Input
+                                  </button>
+                                </div>
+                                <div style={{ marginTop: "0.75rem", display: "grid", gap: "0.65rem" }}>
+                                  {selectedCommand.inputDefs.length ? selectedCommand.inputDefs.map((inputDef) => (
+                                    <div key={inputDef.id} style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: "0.7rem", background: C.panel }}>
+                                      <div style={{ display: "grid", gridTemplateColumns: "minmax(140px, 1fr) 110px minmax(140px, 1fr) auto", gap: "0.6rem", alignItems: "end" }}>
+                                        <label style={labelStyle()}>
+                                          Name
+                                          <input value={inputDef.name} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, inputDefs: command.inputDefs.map((entry) => entry.id === inputDef.id ? { ...entry, name: event.target.value } : entry) })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                        </label>
+                                        <label style={labelStyle()}>
+                                          Required
+                                          <select value={inputDef.required ? "yes" : "no"} onChange={(event) => {
+                                            const next = cloneStateWithCommand(state, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, inputDefs: command.inputDefs.map((entry) => entry.id === inputDef.id ? { ...entry, required: event.target.value === "yes" } : entry) }));
+                                            setState(next);
+                                            void persistState(next, "Command updated");
+                                          }} style={inputStyle()}>
+                                            <option value="yes">Yes</option>
+                                            <option value="no">No</option>
+                                          </select>
+                                        </label>
+                                        <label style={labelStyle()}>
+                                          Default
+                                          <input value={inputDef.defaultValue ?? ""} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, inputDefs: command.inputDefs.map((entry) => entry.id === inputDef.id ? { ...entry, defaultValue: event.target.value || undefined } : entry) })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                        </label>
+                                        <button
+                                          onClick={() => {
+                                            const next = cloneStateWithCommand(state, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, inputDefs: command.inputDefs.filter((entry) => entry.id !== inputDef.id) }));
+                                            setState(next);
+                                            void persistState(next, "Command updated");
+                                          }}
+                                          style={buttonStyle("danger")}
+                                        >
+                                          Remove
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )) : (
+                                    <div style={{ color: C.muted, fontSize: "0.84rem" }}>No command inputs defined.</div>
+                                  )}
+                                </div>
+                              </section>
+                              <section style={{ ...cardStyle(), marginTop: "0.9rem", padding: "0.85rem", display: "none" }}>
+                                <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Try It</div>
+                                <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.82rem" }}>Provide test values for the command inputs and preview the rendered payload.</div>
+                                <div style={{ marginTop: "0.75rem", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: "0.65rem" }}>
+                                  {selectedCommand.inputDefs.map((inputDef) => (
+                                    <label key={`try-${inputDef.id}`} style={labelStyle()}>
+                                      {inputDef.name}
+                                      <input value={selectedCommand.testValues?.[inputDef.name] ?? ""} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, testValues: { ...(command.testValues ?? {}), [inputDef.name]: event.target.value } })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                    </label>
+                                  ))}
+                                </div>
+                                <label style={{ ...labelStyle(), marginTop: "0.75rem" }}>
+                                  Rendered Payload
+                                  <textarea value={selectedCommandPreviewPayload} readOnly rows={3} style={{ ...inputStyle(), resize: "vertical", lineHeight: 1.6, fontFamily: "Consolas, monospace", opacity: 0.92 }} />
+                                </label>
+                              </section>
+                              <section style={{ ...cardStyle(), marginTop: "0.9rem", padding: "0.85rem" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+                                  <div>
+                                    <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Outputs</div>
+                                    <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.82rem" }}>Expose named values from the response for later script steps.</div>
+                                  </div>
+                                  <button
+                                    onClick={() => {
+                                      const next = cloneStateWithCommand(state, selectedDevice.id, selectedCommand.id, (command) => ({
+                                        ...command,
+                                        outputDefs: [...command.outputDefs, { id: makeId("output"), name: `output${command.outputDefs.length + 1}`, source: "json-path", selector: "" }],
+                                      }));
+                                      setState(next);
+                                      void persistState(next, "Command updated");
+                                    }}
+                                    style={buttonStyle("primary")}
+                                  >
+                                    Add Output
+                                  </button>
+                                </div>
+                                <div style={{ marginTop: "0.75rem", display: "grid", gap: "0.65rem" }}>
+                                  {selectedCommand.outputDefs.length ? selectedCommand.outputDefs.map((outputDef) => (
+                                    <div key={outputDef.id} style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: "0.7rem", background: C.panel }}>
+                                      <div style={{ display: "grid", gridTemplateColumns: "minmax(140px, 1fr) 130px minmax(180px, 1fr) auto", gap: "0.6rem", alignItems: "end" }}>
+                                        <label style={labelStyle()}>
+                                          Name
+                                          <input value={outputDef.name} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, outputDefs: command.outputDefs.map((entry) => entry.id === outputDef.id ? { ...entry, name: event.target.value } : entry) })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                        </label>
+                                        <label style={labelStyle()}>
+                                          Source
+                                          <select value={outputDef.source} onChange={(event) => {
+                                            const next = cloneStateWithCommand(state, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, outputDefs: command.outputDefs.map((entry) => entry.id === outputDef.id ? { ...entry, source: event.target.value as CommandOutputSource } : entry) }));
+                                            setState(next);
+                                            void persistState(next, "Command updated");
+                                          }} style={inputStyle()}>
+                                            <option value="json-path">json-path</option>
+                                            <option value="regex">regex</option>
+                                          </select>
+                                        </label>
+                                        <label style={labelStyle()}>
+                                          {outputDef.source === "regex" ? "Pattern" : "Selector"}
+                                          <input value={outputDef.selector} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, outputDefs: command.outputDefs.map((entry) => entry.id === outputDef.id ? { ...entry, selector: event.target.value } : entry) })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                        </label>
+                                        <button
+                                          onClick={() => {
+                                            const next = cloneStateWithCommand(state, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, outputDefs: command.outputDefs.filter((entry) => entry.id !== outputDef.id) }));
+                                            setState(next);
+                                            void persistState(next, "Command updated");
+                                          }}
+                                          style={buttonStyle("danger")}
+                                        >
+                                          Remove
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )) : (
+                                    <div style={{ color: C.muted, fontSize: "0.84rem" }}>No command outputs defined.</div>
+                                  )}
+                                </div>
+                              </section>
+                              <section style={{ ...cardStyle(), marginTop: "0.9rem", padding: "0.85rem" }}>
+                                <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Try It</div>
+                                <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.82rem" }}>Provide test values for the command inputs and preview the rendered payload.</div>
+                                <div style={{ marginTop: "0.75rem", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: "0.65rem" }}>
+                                  {selectedCommand.inputDefs.map((inputDef) => (
+                                    <label key={`try-bottom-${inputDef.id}`} style={labelStyle()}>
+                                      {inputDef.name}
+                                      <input value={selectedCommand.testValues?.[inputDef.name] ?? ""} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, testValues: { ...(command.testValues ?? {}), [inputDef.name]: event.target.value } })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                    </label>
+                                  ))}
+                                </div>
+                                <label style={{ ...labelStyle(), marginTop: "0.75rem" }}>
+                                  Rendered Payload
+                                  <textarea value={selectedCommandPreviewPayload} readOnly rows={3} style={{ ...inputStyle(), resize: "vertical", lineHeight: 1.6, fontFamily: "Consolas, monospace", opacity: 0.92 }} />
+                                </label>
+                                <div style={{ marginTop: "0.75rem", display: "flex", justifyContent: "flex-end" }}>
+                                  <button onClick={() => void runDeviceCommand(selectedDevice, selectedCommand)} style={buttonStyle("primary")} disabled={executing}>
+                                    {executing ? "Running..." : "Run"}
+                                  </button>
+                                </div>
+                              </section>
                             </div>
 
                             <div style={{ display: "grid", gap: "1rem", minWidth: 0 }}>
@@ -1887,6 +3187,16 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                 <div style={{ marginTop: "0.85rem", border: `1px solid ${C.border}`, borderRadius: 12, background: "#07111e", padding: "0.9rem", maxHeight: 240, overflow: "auto", minWidth: 0 }}>
                                   <pre style={{ margin: 0, color: "#d6ecff", fontSize: "0.84rem", lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
                                     {currentCommandExecution ? renderExecutionOutput(currentCommandExecution.output) : "Run the selected command to inspect raw response content."}
+                                  </pre>
+                                </div>
+                              </section>
+                              <section style={cardStyle()}>
+                                <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Parsed Outputs</div>
+                                <div style={{ marginTop: "0.85rem", border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel, padding: "0.9rem", minWidth: 0 }}>
+                                  <pre style={{ margin: 0, color: C.text, fontSize: "0.84rem", lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+                                    {currentCommandExecution?.outputs && Object.keys(currentCommandExecution.outputs).length
+                                      ? Object.entries(currentCommandExecution.outputs).map(([key, value]) => `${key}: ${stringifyTemplateValue(value)}`).join("\n")
+                                      : "Run the selected command to see parsed key/value outputs here."}
                                   </pre>
                                 </div>
                               </section>
@@ -1934,8 +3244,32 @@ export default function EquipmentManager({ config }: ModuleProps) {
                         <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.84rem" }}>Reusable automation flow that later maps to bridge execution.</div>
                       </div>
                       <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                        <button onClick={() => void runScript(selectedScript)} style={buttonStyle("primary")} disabled={executing}>
+                        <button
+                          onClick={() => {
+                            const issues = validateScript(selectedScript, state.devices);
+                            if (issues.length) {
+                              setError(issues.join(" "));
+                              return;
+                            }
+                            void runScriptBound(selectedScript);
+                          }}
+                          style={buttonStyle("primary")}
+                          disabled={executing}
+                        >
                           {executing ? "Running..." : "Run Script"}
+                        </button>
+                        <button
+                          onClick={() => {
+                            const issues = validateScript(selectedScript, state.devices);
+                            if (issues.length) setError(issues.join(" "));
+                            else {
+                              setError("");
+                              setMessage("Script validation passed");
+                            }
+                          }}
+                          style={buttonStyle()}
+                        >
+                          Validate
                         </button>
                         <button
                           onClick={() => {
@@ -1968,11 +3302,7 @@ export default function EquipmentManager({ config }: ModuleProps) {
                       Description
                       <textarea value={selectedScript.description ?? ""} onChange={(event) => setState((current) => ({ ...current, scripts: current.scripts.map((script) => script.id === selectedScript.id ? { ...script, description: event.target.value } : script) }))} onBlur={() => void persistState(state, "Script updated")} rows={4} style={{ ...inputStyle(), resize: "vertical", lineHeight: 1.6 }} />
                     </label>
-                    {currentScriptExecution ? (
-                      <pre style={{ margin: "0.9rem 0 0", padding: "0.9rem", borderRadius: 12, background: "#07111e", color: "#d6ecff", overflow: "auto", fontSize: "0.84rem", lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
-                        {renderExecutionOutput(currentScriptExecution)}
-                      </pre>
-                    ) : null}
+                    {currentScriptExecution ? <ScriptExecutionTimeline result={currentScriptExecution} /> : null}
                   </section>
 
                   <section style={cardStyle()}>
@@ -1987,6 +3317,7 @@ export default function EquipmentManager({ config }: ModuleProps) {
                             id: makeId("step"),
                             type: "command",
                             title: `Step ${selectedScript.steps.length + 1}`,
+                            inputBindings: [],
                           };
                           const next = {
                             ...state,
@@ -2038,19 +3369,81 @@ export default function EquipmentManager({ config }: ModuleProps) {
                           <div style={{ border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.85rem" }}>
                             <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
                               <strong>{selectedStep.title}</strong>
-                              <button
-                                onClick={() => {
-                                  const next = {
-                                    ...state,
-                                    scripts: state.scripts.map((script) => script.id === selectedScript.id ? { ...script, steps: script.steps.filter((item) => item.id !== selectedStep.id) } : script),
-                                  };
-                                  setState(next);
-                                  void persistState(next, "Step removed");
-                                }}
-                                style={buttonStyle("danger")}
-                              >
-                                Delete
-                              </button>
+                              <div style={{ display: "flex", gap: "0.45rem", flexWrap: "wrap" }}>
+                                <button
+                                  onClick={() => {
+                                    const currentIndex = selectedScript.steps.findIndex((entry) => entry.id === selectedStep.id);
+                                    if (currentIndex <= 0) return;
+                                    const reordered = [...selectedScript.steps];
+                                    const [moved] = reordered.splice(currentIndex, 1);
+                                    reordered.splice(currentIndex - 1, 0, moved!);
+                                    const next = cloneStateWithScript(state, selectedScript.id, (script) => ({ ...script, steps: reordered }));
+                                    setState(next);
+                                    void persistState(next, "Step updated");
+                                  }}
+                                  style={buttonStyle()}
+                                >
+                                  Move Up
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    const currentIndex = selectedScript.steps.findIndex((entry) => entry.id === selectedStep.id);
+                                    if (currentIndex < 0 || currentIndex >= selectedScript.steps.length - 1) return;
+                                    const reordered = [...selectedScript.steps];
+                                    const [moved] = reordered.splice(currentIndex, 1);
+                                    reordered.splice(currentIndex + 1, 0, moved!);
+                                    const next = cloneStateWithScript(state, selectedScript.id, (script) => ({ ...script, steps: reordered }));
+                                    setState(next);
+                                    void persistState(next, "Step updated");
+                                  }}
+                                  style={buttonStyle()}
+                                >
+                                  Move Down
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    const currentIndex = selectedScript.steps.findIndex((entry) => entry.id === selectedStep.id);
+                                    const newStep: EquipmentScriptStep = { id: makeId("step"), type: "command", title: `${selectedStep.title} Copy`, inputBindings: [] };
+                                    const reordered = [...selectedScript.steps];
+                                    reordered.splice(Math.max(0, currentIndex), 0, newStep);
+                                    const next = cloneStateWithScript(state, selectedScript.id, (script) => ({ ...script, steps: reordered }));
+                                    setState(next);
+                                    setSelectedStepId(newStep.id);
+                                    void persistState(next, "Step added");
+                                  }}
+                                  style={buttonStyle()}
+                                >
+                                  Add Above
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    const currentIndex = selectedScript.steps.findIndex((entry) => entry.id === selectedStep.id);
+                                    const newStep: EquipmentScriptStep = { id: makeId("step"), type: "command", title: `${selectedStep.title} Follow-up`, inputBindings: [] };
+                                    const reordered = [...selectedScript.steps];
+                                    reordered.splice(currentIndex + 1, 0, newStep);
+                                    const next = cloneStateWithScript(state, selectedScript.id, (script) => ({ ...script, steps: reordered }));
+                                    setState(next);
+                                    setSelectedStepId(newStep.id);
+                                    void persistState(next, "Step added");
+                                  }}
+                                  style={buttonStyle()}
+                                >
+                                  Add Below
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    const next = {
+                                      ...state,
+                                      scripts: state.scripts.map((script) => script.id === selectedScript.id ? { ...script, steps: script.steps.filter((item) => item.id !== selectedStep.id) } : script),
+                                    };
+                                    setState(next);
+                                    void persistState(next, "Step removed");
+                                  }}
+                                  style={buttonStyle("danger")}
+                                >
+                                  Delete
+                                </button>
+                              </div>
                             </div>
                             <div style={{ marginTop: "0.8rem", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0.8rem", minWidth: 0 }}>
                               <label style={labelStyle()}>
@@ -2095,6 +3488,142 @@ export default function EquipmentManager({ config }: ModuleProps) {
                               Notes
                               <textarea value={selectedStep.notes ?? ""} onChange={(event) => setState((current) => ({ ...current, scripts: current.scripts.map((script) => script.id === selectedScript.id ? { ...script, steps: script.steps.map((item) => item.id === selectedStep.id ? { ...item, notes: event.target.value || undefined } : item) } : script) }))} onBlur={() => void persistState(state, "Step updated")} rows={3} style={{ ...inputStyle(), resize: "vertical", lineHeight: 1.6 }} />
                             </label>
+                            {selectedStepCommand?.inputDefs.length ? (
+                              <section style={{ ...cardStyle(), marginTop: "0.85rem", padding: "0.8rem" }}>
+                                <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Step Inputs</div>
+                                <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.82rem" }}>Bind each required command input to a literal value or an output from an earlier step.</div>
+                                <div style={{ marginTop: "0.75rem", display: "grid", gap: "0.7rem" }}>
+                                  {selectedStepCommand.inputDefs.map((inputDef) => {
+                                    const binding = selectedStep.inputBindings.find((entry) => entry.inputName === inputDef.name);
+                                    const effectiveSource: StepInputSource = binding?.source ?? (inputDef.required && selectedStepOutputOptions.length ? "step-output" : "literal");
+                                    const sourceOptionsForStep = selectedStepOutputOptions.filter((option) => !binding?.sourceStepId || option.stepId === binding.sourceStepId);
+                                    return (
+                                      <div key={`binding-${inputDef.id}`} style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: "0.7rem", background: C.panel }}>
+                                        <div style={{ display: "grid", gap: "0.65rem" }}>
+                                          <div style={{ display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
+                                            <div>
+                                              <div style={{ fontWeight: 700, fontSize: "0.9rem" }}>{inputDef.name}</div>
+                                              <div style={{ marginTop: "0.15rem", color: C.muted, fontSize: "0.8rem" }}>
+                                                {inputDef.description || (inputDef.required ? "Required input." : "Optional input.")}
+                                              </div>
+                                            </div>
+                                            <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
+                                              <button
+                                                type="button"
+                                                onClick={() => {
+                                                  const defaultOption = selectedStepOutputOptions[0];
+                                                  const next = cloneStateWithScript(state, selectedScript.id, (script) => ({
+                                                    ...script,
+                                                    steps: script.steps.map((step) => step.id === selectedStep.id
+                                                      ? upsertStepInputBinding(step, {
+                                                        id: binding?.id ?? makeId("binding"),
+                                                        inputName: inputDef.name,
+                                                        source: "step-output",
+                                                        sourceStepId: binding?.sourceStepId ?? defaultOption?.stepId,
+                                                        sourceOutputName: binding?.sourceOutputName ?? defaultOption?.outputName,
+                                                      })
+                                                      : step),
+                                                  }));
+                                                  setState(next);
+                                                  void persistState(next, "Step updated");
+                                                }}
+                                                style={buttonStyle(effectiveSource === "step-output" ? "primary" : "ghost")}
+                                              >
+                                                Previous Output
+                                              </button>
+                                              <button
+                                                type="button"
+                                                onClick={() => {
+                                                  const next = cloneStateWithScript(state, selectedScript.id, (script) => ({
+                                                    ...script,
+                                                    steps: script.steps.map((step) => step.id === selectedStep.id
+                                                      ? upsertStepInputBinding(step, {
+                                                        id: binding?.id ?? makeId("binding"),
+                                                        inputName: inputDef.name,
+                                                        source: "literal",
+                                                        literalValue: binding?.literalValue ?? inputDef.defaultValue ?? "",
+                                                      })
+                                                      : step),
+                                                  }));
+                                                  setState(next);
+                                                  void persistState(next, "Step updated");
+                                                }}
+                                                style={buttonStyle(effectiveSource === "literal" ? "primary" : "ghost")}
+                                              >
+                                                Literal Value
+                                              </button>
+                                            </div>
+                                          </div>
+                                          <div style={{ display: "grid", gridTemplateColumns: effectiveSource === "step-output" ? "minmax(180px, 1fr) minmax(180px, 1fr)" : "minmax(220px, 1fr)", gap: "0.6rem", alignItems: "end" }}>
+                                          {effectiveSource === "step-output" ? (
+                                            <>
+                                              <label style={labelStyle()}>
+                                                Source Step
+                                                <select value={binding?.sourceStepId ?? ""} onChange={(event) => {
+                                                  const selectedOption = selectedStepOutputOptions.find((option) => option.stepId === event.target.value);
+                                                  const next = cloneStateWithScript(state, selectedScript.id, (script) => ({
+                                                    ...script,
+                                                    steps: script.steps.map((step) => step.id === selectedStep.id
+                                                      ? upsertStepInputBinding(step, {
+                                                        id: binding?.id ?? makeId("binding"),
+                                                        inputName: inputDef.name,
+                                                        source: "step-output",
+                                                        sourceStepId: event.target.value || undefined,
+                                                        sourceOutputName: selectedOption?.outputName,
+                                                      })
+                                                      : step),
+                                                  }));
+                                                  setState(next);
+                                                  void persistState(next, "Step updated");
+                                                }} style={inputStyle()}>
+                                                  <option value="">Select step</option>
+                                                  {Array.from(new Map(selectedStepOutputOptions.map((option) => [option.stepId, option.stepTitle])).entries()).map(([stepId, stepTitle]) => (
+                                                    <option key={`step-src-${stepId}`} value={stepId}>{stepTitle}</option>
+                                                  ))}
+                                                </select>
+                                              </label>
+                                              <label style={labelStyle()}>
+                                                Output
+                                                <select value={binding?.sourceOutputName ?? ""} onChange={(event) => {
+                                                  const next = cloneStateWithScript(state, selectedScript.id, (script) => ({
+                                                    ...script,
+                                                    steps: script.steps.map((step) => step.id === selectedStep.id
+                                                      ? upsertStepInputBinding(step, {
+                                                        id: binding?.id ?? makeId("binding"),
+                                                        inputName: inputDef.name,
+                                                        source: "step-output",
+                                                        sourceStepId: binding?.sourceStepId,
+                                                        sourceOutputName: event.target.value || undefined,
+                                                      })
+                                                      : step),
+                                                  }));
+                                                  setState(next);
+                                                  void persistState(next, "Step updated");
+                                                }} style={inputStyle()}>
+                                                  <option value="">Select output</option>
+                                                  {sourceOptionsForStep.map((option) => <option key={`output-src-${option.stepId}-${option.outputName}`} value={option.outputName}>{option.outputName}</option>)}
+                                                </select>
+                                              </label>
+                                            </>
+                                          ) : (
+                                            <label style={labelStyle()}>
+                                              Literal Value
+                                              <input value={binding?.literalValue ?? inputDef.defaultValue ?? ""} onChange={(event) => setState((current) => cloneStateWithScript(current, selectedScript.id, (script) => ({
+                                                ...script,
+                                                steps: script.steps.map((step) => step.id === selectedStep.id
+                                                  ? upsertStepInputBinding(step, { id: binding?.id ?? makeId("binding"), inputName: inputDef.name, source: "literal", literalValue: event.target.value })
+                                                  : step),
+                                              })))} onBlur={() => void persistState(state, "Step updated")} style={inputStyle()} />
+                                            </label>
+                                          )}
+                                        </div>
+                                      </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </section>
+                            ) : null}
                           </div>
                         );
                       })() : (
@@ -2195,11 +3724,17 @@ export default function EquipmentManager({ config }: ModuleProps) {
                   key={preset.id}
                   onClick={() => {
                     const device = preset.create();
-                    const next = { ...state, devices: [...state.devices, device] };
+                    const presetScripts = preset.createScripts?.(device) ?? [];
+                    const next = {
+                      ...state,
+                      devices: [...state.devices, device],
+                      scripts: [...state.scripts.filter((script) => !(script.builtIn && script.deviceId === device.id)), ...presetScripts, ...state.scripts],
+                    };
                     setState(next);
                     setSelectedDeviceId(device.id);
+                    if (presetScripts[0]) setSelectedScriptId(presetScripts[0].id);
                     setDeviceChooserOpen(false);
-                    void persistState(next, "Device added");
+                    void persistState(next, presetScripts.length ? "Device and scripts added" : "Device added");
                   }}
                   style={{ textAlign: "left", border: `1px solid ${C.border}`, background: C.panel2, color: C.text, borderRadius: 12, padding: "0.95rem 1rem", cursor: "pointer" }}
                 >

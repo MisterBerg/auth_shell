@@ -1219,9 +1219,6 @@ async function executeTcpCommand(params: Record<string, unknown> = {}): Promise<
           });
           return;
         }
-        if (readMode !== "once") {
-          scheduleQuietFinish();
-        }
       };
 
       if (sendDelayMs > 0) {
