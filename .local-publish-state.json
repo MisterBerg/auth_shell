@@ -9,14 +9,15 @@
     "modules/oauth-badge": "13d7f80f395c5d4a7f9ba80fed220097ac17fd80e61345f3de0954e172ad2720",
     "modules/markdown-viewer": "0fa022d9e3e8970bd6c58d75dabf1f48e60efdbc32b457a456216fa2048ddaf2",
     "modules/document-viewer": "1749d8912f4307158c35675ffa1de71596acddc046592d9d758f5c1952b79157",
-    "modules/documentation-viewer": "e694bbbd627643420200ff89541417defd53395321568908aa4ee712ed148c55",
+    "modules/documentation-viewer": "22fbb06a77377972ae0491aeb279470259d061482308c05e207af2cf8dab3e9e",
     "modules/links": "86c90a66d75a1cc6029dd6a12fc6adac234c9a5fb2e2f9dac1cfc8a92312f3a8",
-    "modules/test-manager": "01dd43f69838184c557673155970e8b10404670d31ad6bc4a975f90eaebd3f9c",
+    "modules/test-manager": "7b0e85be3c0d97e78aebd8ad0475aa0f7c33222dd81ae35aae32cbe27dd2589f",
     "modules/task-tracker": "0f787b3a81dd09e34cf247bf8e8e977fcf3a032379ab6201c56892a96b2330e3",
-    "modules/work-manager": "20a0ee509f8c71454c17b538b201665c7d3e0ea63528392647e83bcf3ad6fe3a",
+    "modules/work-manager": "50a1ee67dcee4494bb87af732436e51d21e8deda9f5f45cacaae2905e141411d",
     "modules/kicad-board-viewer": "8182c85010f795f91d193737d0d4cf2cb1233c2c79f4e8d67d79a72d1795b20e",
     "modules/serial-display": "adac340154209797b5c4fe7c84cf6bffe8a7f81e7cf574d08873c593e1fa36c3",
     "modules/shell-core": "671d93c5dc40471d18ccfa799f4986bbc9eb6bcd1b7fae47a976756cc56a71ae",
-    "modules/agent-chat": "58aedaa772ad2c309cd9e7fff0f6362a12758f2eea9b3ee6ea57d08bc6e5930a"
+    "modules/agent-chat": "4dcbf066644182e4d37c51a94de272a689eb3b720c0328df6b14a66f060d613c",
+    "modules/equipment-manager": "7d3a712574c8ffb6df4e3d6feec21d6c226915f1c161ba3811d68044380eb645"
   }
 }

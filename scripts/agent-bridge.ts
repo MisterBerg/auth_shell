@@ -5,6 +5,7 @@ import { dirname, extname, isAbsolute, resolve, join } from "path";
 import { pathToFileURL } from "url";
 import { randomUUID } from "crypto";
 import { homedir } from "os";
+import { Socket } from "net";
 
 type RpcRequest = {
   method?: string;
@@ -42,6 +43,7 @@ const CAPABILITIES = [
   "shell",
   "python",
   "pdf_text",
+  "equipment_tcp",
   "workspace_root",
   "appspace_context",
   "appspace_operation_queue",
@@ -228,6 +230,8 @@ async function runRpc(body: RpcRequest): Promise<unknown> {
       return writeWorkspaceFile(body.params);
     case "run_workspace_command":
       return runWorkspaceCommand(body.params);
+    case "execute_tcp_command":
+      return executeTcpCommand(body.params);
     case "get_python_environment":
       return getPythonEnvironment();
     case "check_python_dependencies":
@@ -1076,6 +1080,157 @@ async function runWorkspaceCommand(params: Record<string, unknown> = {}): Promis
 
   console.log(`[agent-bridge] run_workspace_command ok exit=${result.exitCode}`);
   return result;
+}
+
+async function executeTcpCommand(params: Record<string, unknown> = {}): Promise<unknown> {
+  const host = typeof params["host"] === "string" ? params["host"].trim() : "";
+  if (!host) throw new Error("Host is required.");
+
+  const port = clampNumber(params["port"], 1, 65535, 5025);
+  const command = typeof params["command"] === "string" ? params["command"] : "";
+  const appendNewline = params["appendNewline"] !== false;
+  const newline = params["newline"] === "crlf" ? "\r\n" : params["newline"] === "none" ? "" : "\n";
+  const readMode = params["readMode"] === "none"
+    ? "none"
+    : params["readMode"] === "until-marker"
+    ? "until-marker"
+    : params["readMode"] === "until-timeout"
+      ? "until-timeout"
+      : "once";
+  const readUntil = typeof params["readUntil"] === "string" ? params["readUntil"] : "";
+  const timeoutMs = clampNumber(params["timeoutMs"], 100, 600000, 5000);
+  const quietMs = clampNumber(params["quietMs"], 50, 10000, 250);
+  const sendDelayMs = clampNumber(params["sendDelayMs"], 0, 10000, 0);
+  const encoding = params["encoding"] === "hex" ? "hex" : params["encoding"] === "base64" ? "base64" : "utf8";
+
+  const startedAt = Date.now();
+  const chunks: Buffer[] = [];
+
+  return await new Promise((resolvePromise, rejectPromise) => {
+    const socket = new Socket();
+    let settled = false;
+    let activityTimer: NodeJS.Timeout | undefined;
+    let overallTimer: NodeJS.Timeout | undefined;
+
+    const finish = (result?: unknown, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (activityTimer) clearTimeout(activityTimer);
+      if (overallTimer) clearTimeout(overallTimer);
+      socket.destroy();
+      if (error) {
+        rejectPromise(error);
+        return;
+      }
+      resolvePromise(result);
+    };
+
+    const scheduleQuietFinish = () => {
+      if (activityTimer) clearTimeout(activityTimer);
+      activityTimer = setTimeout(() => {
+        const buffer = Buffer.concat(chunks);
+        finish({
+          host,
+          port,
+          command,
+          text: buffer.toString("utf8"),
+          data: encoding === "hex" ? buffer.toString("hex") : encoding === "base64" ? buffer.toString("base64") : buffer.toString("utf8"),
+          bytesBase64: buffer.toString("base64"),
+          bytesLength: buffer.length,
+          durationMs: Date.now() - startedAt,
+          readMode,
+        });
+      }, quietMs);
+    };
+
+    overallTimer = setTimeout(() => {
+      const buffer = Buffer.concat(chunks);
+      finish({
+        host,
+        port,
+        command,
+        text: buffer.toString("utf8"),
+        data: encoding === "hex" ? buffer.toString("hex") : encoding === "base64" ? buffer.toString("base64") : buffer.toString("utf8"),
+        bytesBase64: buffer.toString("base64"),
+        bytesLength: buffer.length,
+        durationMs: Date.now() - startedAt,
+        readMode,
+        timedOut: true,
+      });
+    }, timeoutMs);
+
+    socket.on("error", (error) => finish(undefined, error));
+
+    socket.on("data", (chunk) => {
+      chunks.push(Buffer.from(chunk));
+      const buffer = Buffer.concat(chunks);
+      const text = buffer.toString("utf8");
+
+      if (readMode === "once") {
+        finish({
+          host,
+          port,
+          command,
+          text,
+          data: encoding === "hex" ? buffer.toString("hex") : encoding === "base64" ? buffer.toString("base64") : text,
+          bytesBase64: buffer.toString("base64"),
+          bytesLength: buffer.length,
+          durationMs: Date.now() - startedAt,
+          readMode,
+        });
+        return;
+      }
+
+      if (readMode === "until-marker" && readUntil && text.includes(readUntil)) {
+        finish({
+          host,
+          port,
+          command,
+          text,
+          data: encoding === "hex" ? buffer.toString("hex") : encoding === "base64" ? buffer.toString("base64") : text,
+          bytesBase64: buffer.toString("base64"),
+          bytesLength: buffer.length,
+          durationMs: Date.now() - startedAt,
+          readMode,
+          matchedMarker: readUntil,
+        });
+        return;
+      }
+
+      scheduleQuietFinish();
+    });
+
+    socket.connect(port, host, () => {
+      const send = () => {
+        if (command.length > 0) {
+          socket.write(command + (appendNewline ? newline : ""));
+        }
+        if (readMode === "none") {
+          finish({
+            host,
+            port,
+            command,
+            text: "",
+            data: "",
+            bytesBase64: "",
+            bytesLength: 0,
+            durationMs: Date.now() - startedAt,
+            readMode,
+          });
+          return;
+        }
+        if (readMode !== "once") {
+          scheduleQuietFinish();
+        }
+      };
+
+      if (sendDelayMs > 0) {
+        setTimeout(send, sendDelayMs);
+      } else {
+        send();
+      }
+    });
+  });
 }
 
 async function extractPdfText(params: Record<string, unknown> = {}): Promise<unknown> {

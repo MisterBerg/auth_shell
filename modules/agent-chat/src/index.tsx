@@ -1727,6 +1727,29 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     type: "function",
+    name: "execute_tcp_command",
+    description: "Open a raw TCP connection through the local workspace bridge, optionally send a command, and read the response. Useful for SCPI/LAN instruments such as oscilloscopes and power supplies.",
+    parameters: {
+      type: "object",
+      properties: {
+        host: { type: "string" },
+        port: { type: "integer", minimum: 1, maximum: 65535 },
+        command: { type: "string" },
+        appendNewline: { type: "boolean" },
+        newline: { type: "string", enum: ["lf", "crlf", "none"] },
+        readMode: { type: "string", enum: ["once", "until-timeout", "until-marker"] },
+        readUntil: { type: "string" },
+        timeoutMs: { type: "integer", minimum: 100, maximum: 600000 },
+        quietMs: { type: "integer", minimum: 50, maximum: 10000 },
+        sendDelayMs: { type: "integer", minimum: 0, maximum: 10000 },
+        encoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+      },
+      required: ["host"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "get_python_environment",
     description: "Inspect the managed local Python environment and its approved dependency allowlist.",
     parameters: {
