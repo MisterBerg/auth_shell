@@ -34,6 +34,7 @@ type CommandOutputDef = {
 type EquipmentCommand = {
   id: string;
   name: string;
+  categoryPath?: string;
   builtIn?: boolean;
   mode: CommandMode;
   payload: string;
@@ -234,6 +235,10 @@ type KnownDevicePreset = {
   createScripts?: (device: EquipmentDevice) => EquipmentScript[];
 };
 
+type CommandListEntry =
+  | { kind: "category"; key: string; label: string; depth: number }
+  | { kind: "command"; key: string; command: EquipmentCommand; depth: number };
+
 const C = {
   bg: "var(--hep-bg, #08111d)",
   panel: "var(--hep-surface, #0d1726)",
@@ -318,6 +323,7 @@ function normalizeCommand(value: unknown, index: number): EquipmentCommand {
   return {
     id: toStringValue(record.id, `command-${index + 1}`),
     name: toStringValue(record.name, `Command ${index + 1}`),
+    categoryPath: toStringValue(record.categoryPath ?? record.category_path, "") || undefined,
     builtIn: Boolean(record.builtIn ?? record.built_in),
     mode: COMMAND_MODES.includes(mode as CommandMode) ? mode as CommandMode : "custom",
     payload: toStringValue(record.payload, ""),
@@ -346,6 +352,69 @@ function normalizeStepInputBinding(value: unknown, index: number): ScriptStepInp
 }
 
 const SCPI_VALUE_REGEX = "(?:^|[\\s,])(-?\\d+(?:\\.\\d+)?(?:E[+-]?\\d+)?[GMKmunp]?)";
+
+function inferKnownCommandCategory(commandName: string): string | undefined {
+  const name = commandName.trim().toLowerCase();
+  if (name === "identify") return "Instrument / Identity";
+  if (name.includes("trigger")) {
+    if (name.includes("read")) return "Trigger / Read";
+    return "Trigger / Control";
+  }
+  if (name.includes("capture screenshot")) return "Acquire / Capture";
+  if (name.includes("capture waveform")) return "Acquire / Waveform";
+  if (name.includes("sample rate") || name.includes("timebase")) return "Acquire / Timing";
+  if (name.includes("scale") || name.includes("offset")) return "Channel / CH1";
+  if (name.includes("screen")) return "Display";
+  return undefined;
+}
+
+function commandCategoryLabel(command: EquipmentCommand): string {
+  return command.categoryPath?.trim() || "Uncategorized";
+}
+
+function buildCommandListEntries(commands: EquipmentCommand[]): CommandListEntry[] {
+  const sorted = [...commands].sort((a, b) => {
+    const categoryCompare = commandCategoryLabel(a).localeCompare(commandCategoryLabel(b));
+    if (categoryCompare !== 0) return categoryCompare;
+    return a.name.localeCompare(b.name);
+  });
+  const entries: CommandListEntry[] = [];
+  let lastCategory = "";
+  for (const command of sorted) {
+    const category = commandCategoryLabel(command);
+    if (category !== lastCategory) {
+      const segments = category.split("/").map((segment) => segment.trim()).filter(Boolean);
+      entries.push({
+        kind: "category",
+        key: `category-${category}`,
+        label: segments[segments.length - 1] ?? category,
+        depth: Math.max(0, segments.length - 1),
+      });
+      lastCategory = category;
+    }
+    const segments = category.split("/").map((segment) => segment.trim()).filter(Boolean);
+    entries.push({
+      kind: "command",
+      key: command.id,
+      command,
+      depth: segments.length,
+    });
+  }
+  return entries;
+}
+
+function buildCommandSelectGroups(commands: EquipmentCommand[]): Array<{ label: string; commands: EquipmentCommand[] }> {
+  const grouped = new Map<string, EquipmentCommand[]>();
+  for (const command of [...commands].sort((a, b) => a.name.localeCompare(b.name))) {
+    const key = commandCategoryLabel(command);
+    const bucket = grouped.get(key) ?? [];
+    bucket.push(command);
+    grouped.set(key, bucket);
+  }
+  return Array.from(grouped.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([label, groupCommands]) => ({ label, commands: groupCommands }));
+}
 
 function normalizeStep(value: unknown, index: number): EquipmentScriptStep {
   const record = toRecord(value);
@@ -385,6 +454,7 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
         if (commandName === "read ch1 scale") {
           return {
             ...command,
+            categoryPath: command.categoryPath ?? "Channel / CH1",
             outputDefs: [
               { id: command.outputDefs[0]?.id ?? makeId("output"), name: "voltsPerDivText", source: "json-path" as CommandOutputSource, selector: "text" },
               { id: command.outputDefs[1]?.id ?? makeId("output"), name: "voltsPerDiv", source: "regex" as CommandOutputSource, selector: SCPI_VALUE_REGEX, captureGroup: 1 },
@@ -394,6 +464,7 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
         if (commandName === "read ch1 offset") {
           return {
             ...command,
+            categoryPath: command.categoryPath ?? "Channel / CH1",
             outputDefs: [
               { id: command.outputDefs[0]?.id ?? makeId("output"), name: "offsetVoltsText", source: "json-path" as CommandOutputSource, selector: "text" },
               { id: command.outputDefs[1]?.id ?? makeId("output"), name: "offsetVolts", source: "regex" as CommandOutputSource, selector: SCPI_VALUE_REGEX, captureGroup: 1 },
@@ -403,6 +474,7 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
         if (commandName === "read timebase") {
           return {
             ...command,
+            categoryPath: command.categoryPath ?? "Acquire / Timing",
             outputDefs: [
               { id: command.outputDefs[0]?.id ?? makeId("output"), name: "timeDivText", source: "json-path" as CommandOutputSource, selector: "text" },
               { id: command.outputDefs[1]?.id ?? makeId("output"), name: "timePerDivSeconds", source: "regex" as CommandOutputSource, selector: SCPI_VALUE_REGEX, captureGroup: 1 },
@@ -412,6 +484,7 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
         if (commandName === "read trigger delay") {
           return {
             ...command,
+            categoryPath: command.categoryPath ?? "Trigger / Read",
             outputDefs: [
               { id: command.outputDefs[0]?.id ?? makeId("output"), name: "triggerDelayText", source: "json-path" as CommandOutputSource, selector: "text" },
               { id: command.outputDefs[1]?.id ?? makeId("output"), name: "triggerDelaySeconds", source: "regex" as CommandOutputSource, selector: SCPI_VALUE_REGEX, captureGroup: 1 },
@@ -422,14 +495,10 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
           return {
             ...command,
             name: "Capture Waveform",
+            categoryPath: command.categoryPath ?? "Acquire / Waveform",
             payload: command.payload.includes("{{channel}}") ? command.payload : "{{channel}}:WF? DAT2",
             inputDefs: [
               { id: command.inputDefs[0]?.id ?? makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel to capture, such as C1." },
-              { id: command.inputDefs[1]?.id ?? makeId("input"), name: "centerTimeSeconds", required: false, description: "Optional horizontal center of the viewport in seconds." },
-              { id: command.inputDefs[2]?.id ?? makeId("input"), name: "timePerDivSeconds", required: false, description: "Optional horizontal scale in seconds per division." },
-              { id: command.inputDefs[3]?.id ?? makeId("input"), name: "scopeOffsetVolts", required: false, description: "Optional scope offset value read from the instrument; used to reconstruct the visible vertical center." },
-              { id: command.inputDefs[4]?.id ?? makeId("input"), name: "voltsPerDiv", required: false, description: "Optional vertical scale in volts per division." },
-              { id: command.inputDefs[5]?.id ?? makeId("input"), name: "centerVolts", required: false, description: "Optional explicit vertical center override in volts." },
             ],
             outputDefs: [
               { id: command.outputDefs[0]?.id ?? makeId("output"), name: "sampleRateHz", source: "json-path" as CommandOutputSource, selector: "metadata.sampleRateHz" },
@@ -442,12 +511,29 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
               { id: command.outputDefs[7]?.id ?? makeId("output"), name: "minVoltage", source: "json-path" as CommandOutputSource, selector: "minVoltage" },
               { id: command.outputDefs[8]?.id ?? makeId("output"), name: "maxVoltage", source: "json-path" as CommandOutputSource, selector: "maxVoltage" },
             ],
-            notes: "Fetches waveform samples plus scaling metadata, then renders an interactive waveform chart. Optional viewport inputs can recreate the visible scope window.",
+            notes: "Fetches waveform samples plus scaling metadata, then renders an interactive waveform chart.",
           };
         }
         return command;
-      })
+      }).map((command) => ({
+        ...command,
+        categoryPath: command.categoryPath ?? inferKnownCommandCategory(command.name),
+      }))
     : commands;
+  const mergedCommands = /siglent\s+sds1202x-e/i.test(name)
+    ? (() => {
+        const presetCommands = createKnownSiglentPreset(undefined, toStringValue(record.address, "")).device.commands;
+        const existingByName = new Map(upgradedCommands.map((command) => [command.name.trim().toLowerCase(), command] as const));
+        const merged = [...upgradedCommands];
+        for (const presetCommand of presetCommands) {
+          const key = presetCommand.name.trim().toLowerCase();
+          if (!existingByName.has(key)) {
+            merged.push(presetCommand);
+          }
+        }
+        return merged;
+      })()
+    : upgradedCommands;
   return {
     id: toStringValue(record.id, `device-${index + 1}`),
     name,
@@ -455,7 +541,7 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
     address: toStringValue(record.address, ""),
     capabilities: Array.isArray(record.capabilities) ? record.capabilities.map((item) => String(item)).filter(Boolean) : [],
     notes: toStringValue(record.notes, "") || undefined,
-    commands: upgradedCommands,
+    commands: mergedCommands,
   };
 }
 
@@ -519,14 +605,6 @@ function repairBuiltInScripts(state: EquipmentManagerState): EquipmentManagerSta
         const normalizedBindings: ScriptStepInputBinding[] = [
           { id: captureWaveformStep.inputBindings.find((entry) => entry.inputName === "channel")?.id ?? makeId("binding"), inputName: "channel", source: "literal", literalValue: captureWaveformStep.inputBindings.find((entry) => entry.inputName === "channel")?.literalValue ?? "C1" },
         ];
-        const triggerDelayStep = nextSteps.find((step) => step.title.trim().toLowerCase() === "read trigger delay");
-        const timebaseStep = nextSteps.find((step) => step.title.trim().toLowerCase() === "read timebase");
-        const offsetStep = nextSteps.find((step) => step.title.trim().toLowerCase() === "read ch1 offset");
-        const scaleStep = nextSteps.find((step) => step.title.trim().toLowerCase() === "read ch1 scale");
-        if (triggerDelayStep) normalizedBindings.push({ id: makeId("binding"), inputName: "centerTimeSeconds", source: "step-output", sourceStepId: triggerDelayStep.id, sourceOutputName: "triggerDelaySeconds" });
-        if (timebaseStep) normalizedBindings.push({ id: makeId("binding"), inputName: "timePerDivSeconds", source: "step-output", sourceStepId: timebaseStep.id, sourceOutputName: "timePerDivSeconds" });
-        if (offsetStep) normalizedBindings.push({ id: makeId("binding"), inputName: "scopeOffsetVolts", source: "step-output", sourceStepId: offsetStep.id, sourceOutputName: "offsetVolts" });
-        if (scaleStep) normalizedBindings.push({ id: makeId("binding"), inputName: "voltsPerDiv", source: "step-output", sourceStepId: scaleStep.id, sourceOutputName: "voltsPerDiv" });
         nextSteps = nextSteps.map((step) => step.id === captureWaveformStep.id
           ? { ...step, title: "Capture waveform", inputBindings: normalizedBindings }
           : step);
@@ -548,6 +626,14 @@ function createDefaultState(): EquipmentManagerState {
   const triggerModeCommandId = makeId("command");
   const triggerLevelCommandId = makeId("command");
   const triggerSourceCommandId = makeId("command");
+  const setTriggerModeCommandId = makeId("command");
+  const setTriggerLevelCommandId = makeId("command");
+  const runScopeCommandId = makeId("command");
+  const stopScopeCommandId = makeId("command");
+  const armSingleCommandId = makeId("command");
+  const setTimebaseCommandId = makeId("command");
+  const setChannelScaleCommandId = makeId("command");
+  const setChannelOffsetCommandId = makeId("command");
   const captureCommandId = makeId("command");
   const waveformCommandId = makeId("command");
   const identifyStepId = makeId("step");
@@ -574,6 +660,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: identifyCommandId,
           name: "Identify",
+          categoryPath: "Instrument / Identity",
           builtIn: true,
           mode: "scpi",
           payload: "*IDN?",
@@ -587,6 +674,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: channelScaleCommandId,
           name: "Read CH1 Scale",
+          categoryPath: "Channel / CH1",
           builtIn: true,
           mode: "scpi",
           payload: "C1:VDIV?",
@@ -603,6 +691,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: channelOffsetCommandId,
           name: "Read CH1 Offset",
+          categoryPath: "Channel / CH1",
           builtIn: true,
           mode: "scpi",
           payload: "C1:OFST?",
@@ -619,6 +708,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: timebaseCommandId,
           name: "Read Timebase",
+          categoryPath: "Acquire / Timing",
           builtIn: true,
           mode: "scpi",
           payload: "TDIV?",
@@ -635,6 +725,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: sampleRateCommandId,
           name: "Read Sample Rate",
+          categoryPath: "Acquire / Timing",
           builtIn: true,
           mode: "scpi",
           payload: "SARA?",
@@ -648,6 +739,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: triggerDelayCommandId,
           name: "Read Trigger Delay",
+          categoryPath: "Trigger / Read",
           builtIn: true,
           mode: "scpi",
           payload: "TRDL?",
@@ -664,6 +756,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: triggerModeCommandId,
           name: "Read Trigger Mode",
+          categoryPath: "Trigger / Read",
           builtIn: true,
           mode: "scpi",
           payload: "TRMD?",
@@ -677,6 +770,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: triggerLevelCommandId,
           name: "Read Trigger Level",
+          categoryPath: "Trigger / Read",
           builtIn: true,
           mode: "scpi",
           payload: "C1:TRLV?",
@@ -690,6 +784,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: triggerSourceCommandId,
           name: "Read Trigger Source",
+          categoryPath: "Trigger / Read",
           builtIn: true,
           mode: "scpi",
           payload: "TRSE?",
@@ -701,8 +796,134 @@ function createDefaultState(): EquipmentManagerState {
           outputDefs: [{ id: makeId("output"), name: "triggerSourceText", source: "json-path", selector: "text" }],
         },
         {
+          id: setTriggerModeCommandId,
+          name: "Set Trigger Mode",
+          categoryPath: "Trigger / Control",
+          builtIn: true,
+          mode: "scpi",
+          payload: "TRMD {{mode}}",
+          parser: "none",
+          timeoutMs: 3000,
+          artifactMode: "none",
+          notes: "Validated on the live SDS1202X-E with AUTO and NORM. SINGLE should be armed with ARM.",
+          inputDefs: [
+            { id: makeId("input"), name: "mode", required: true, defaultValue: "AUTO", description: "Trigger mode such as AUTO or NORM." },
+          ],
+          outputDefs: [],
+        },
+        {
+          id: setTriggerLevelCommandId,
+          name: "Set Trigger Level",
+          categoryPath: "Trigger / Control",
+          builtIn: true,
+          mode: "scpi",
+          payload: "{{channel}}:TRLV {{levelVolts}}V",
+          parser: "none",
+          timeoutMs: 3000,
+          artifactMode: "none",
+          notes: "Validated on the live SDS1202X-E.",
+          inputDefs: [
+            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel, such as C1." },
+            { id: makeId("input"), name: "levelVolts", required: true, defaultValue: "1.00", description: "Trigger level in volts." },
+          ],
+          outputDefs: [],
+        },
+        {
+          id: runScopeCommandId,
+          name: "Run Scope",
+          categoryPath: "Acquire / Control",
+          builtIn: true,
+          mode: "scpi",
+          payload: "RUN",
+          parser: "none",
+          timeoutMs: 3000,
+          artifactMode: "none",
+          notes: "Validated on the live SDS1202X-E.",
+          inputDefs: [],
+          outputDefs: [],
+        },
+        {
+          id: stopScopeCommandId,
+          name: "Stop Scope",
+          categoryPath: "Acquire / Control",
+          builtIn: true,
+          mode: "scpi",
+          payload: "STOP",
+          parser: "none",
+          timeoutMs: 3000,
+          artifactMode: "none",
+          notes: "Validated on the live SDS1202X-E.",
+          inputDefs: [],
+          outputDefs: [],
+        },
+        {
+          id: armSingleCommandId,
+          name: "Arm Single",
+          categoryPath: "Acquire / Control",
+          builtIn: true,
+          mode: "scpi",
+          payload: "ARM",
+          parser: "none",
+          timeoutMs: 3000,
+          artifactMode: "none",
+          notes: "Validated on the live SDS1202X-E; places trigger mode into SINGLE.",
+          inputDefs: [],
+          outputDefs: [],
+        },
+        {
+          id: setTimebaseCommandId,
+          name: "Set Timebase",
+          categoryPath: "Acquire / Timing",
+          builtIn: true,
+          mode: "scpi",
+          payload: "TDIV {{timePerDivSeconds}}S",
+          parser: "none",
+          timeoutMs: 3000,
+          artifactMode: "none",
+          notes: "Validated on the live SDS1202X-E.",
+          inputDefs: [
+            { id: makeId("input"), name: "timePerDivSeconds", required: true, defaultValue: "5.00E-04", description: "Time per division in seconds." },
+          ],
+          outputDefs: [],
+        },
+        {
+          id: setChannelScaleCommandId,
+          name: "Set Channel Scale",
+          categoryPath: "Channel / CH1",
+          builtIn: true,
+          mode: "scpi",
+          payload: "{{channel}}:VDIV {{voltsPerDiv}}V",
+          parser: "none",
+          timeoutMs: 3000,
+          artifactMode: "none",
+          notes: "Validated on the live SDS1202X-E.",
+          inputDefs: [
+            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel, such as C1." },
+            { id: makeId("input"), name: "voltsPerDiv", required: true, defaultValue: "5.00E-01", description: "Volts per division." },
+          ],
+          outputDefs: [],
+        },
+        {
+          id: setChannelOffsetCommandId,
+          name: "Set Channel Offset",
+          categoryPath: "Channel / CH1",
+          builtIn: true,
+          mode: "scpi",
+          payload: "{{channel}}:OFST {{offsetVolts}}V",
+          parser: "none",
+          timeoutMs: 3000,
+          artifactMode: "none",
+          notes: "Validated on the live SDS1202X-E.",
+          inputDefs: [
+            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel, such as C1." },
+            { id: makeId("input"), name: "offsetVolts", required: true, defaultValue: "-1.50E+00", description: "Channel offset in volts." },
+          ],
+          outputDefs: [],
+        },
+        {
           id: captureCommandId,
           name: "Capture Screenshot",
+          categoryPath: "Acquire / Capture",
           builtIn: true,
           mode: "scpi",
           payload: "SCDP",
@@ -717,6 +938,7 @@ function createDefaultState(): EquipmentManagerState {
         {
           id: waveformCommandId,
           name: "Capture Waveform",
+          categoryPath: "Acquire / Waveform",
           builtIn: true,
           mode: "scpi",
           payload: "{{channel}}:WF? DAT2",
@@ -724,14 +946,9 @@ function createDefaultState(): EquipmentManagerState {
           timeoutMs: 15000,
           artifactMode: "csv",
           saveAs: "ch1-waveform.csv",
-          notes: "Fetches up to 20,000 waveform samples plus scaling metadata, then renders an interactive waveform chart. Optional viewport inputs can recreate the visible scope window.",
+          notes: "Fetches up to 20,000 waveform samples plus scaling metadata, then renders an interactive waveform chart.",
           inputDefs: [
             { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel to capture, such as C1." },
-            { id: makeId("input"), name: "centerTimeSeconds", required: false, description: "Optional horizontal center of the viewport in seconds." },
-            { id: makeId("input"), name: "timePerDivSeconds", required: false, description: "Optional horizontal scale in seconds per division." },
-            { id: makeId("input"), name: "scopeOffsetVolts", required: false, description: "Optional scope offset value read from the instrument; used to reconstruct the visible vertical center." },
-            { id: makeId("input"), name: "voltsPerDiv", required: false, description: "Optional vertical scale in volts per division." },
-            { id: makeId("input"), name: "centerVolts", required: false, description: "Optional explicit vertical center override in volts." },
           ],
           outputDefs: [
             { id: makeId("output"), name: "sampleRateHz", source: "json-path", selector: "metadata.sampleRateHz" },
@@ -772,10 +989,6 @@ function createDefaultState(): EquipmentManagerState {
           saveAs: "ch1-waveform.csv",
           inputBindings: [
             { id: makeId("binding"), inputName: "channel", source: "literal", literalValue: "C1" },
-            { id: makeId("binding"), inputName: "centerTimeSeconds", source: "step-output", sourceStepId: triggerDelayStepId, sourceOutputName: "triggerDelaySeconds" },
-            { id: makeId("binding"), inputName: "timePerDivSeconds", source: "step-output", sourceStepId: timebaseStepId, sourceOutputName: "timePerDivSeconds" },
-            { id: makeId("binding"), inputName: "scopeOffsetVolts", source: "step-output", sourceStepId: channelOffsetStepId, sourceOutputName: "offsetVolts" },
-            { id: makeId("binding"), inputName: "voltsPerDiv", source: "step-output", sourceStepId: channelScaleStepId, sourceOutputName: "voltsPerDiv" },
           ],
         },
       ],
@@ -1498,7 +1711,7 @@ function ScriptExecutionTimeline({ result }: { result: ExecutionResult }) {
             ) : null}
             <div style={{ display: "grid", gap: "0.35rem" }}>
               <div style={{ fontSize: "0.76rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Interpreted Output</div>
-              <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, background: C.panel, padding: "0.8rem", overflow: "auto", maxHeight: 560 }}>
+              <div style={{ border: `1px solid ${C.border}`, borderRadius: 10, background: C.panel, padding: "0.8rem", overflow: "visible" }}>
                 <ExecutionArtifactView output={step.output} artifactMode={step.artifactMode} saveAs={step.saveAs} label={step.commandName ?? step.title} />
               </div>
             </div>
@@ -2263,6 +2476,14 @@ export default function EquipmentManager({ config }: ModuleProps) {
   const selectedScript = state.scripts.find((script) => script.id === selectedScriptId) ?? state.scripts[0] ?? null;
   const selectedCommand = selectedDevice?.commands.find((command) => command.id === selectedCommandId) ?? selectedDevice?.commands[0] ?? null;
   const selectedStep = selectedScript?.steps.find((step) => step.id === selectedStepId) ?? selectedScript?.steps[0] ?? null;
+  const selectedDeviceCommandEntries = useMemo(() => selectedDevice ? buildCommandListEntries(selectedDevice.commands) : [], [selectedDevice]);
+  const selectedScriptCommandGroups = useMemo(() => {
+    if (!selectedScript) return [];
+    const commands = selectedScript.deviceId
+      ? state.devices.find((device) => device.id === selectedScript.deviceId)?.commands ?? []
+      : state.devices.flatMap((device) => device.commands.map((command) => ({ ...command, name: `${device.name} / ${command.name}` })));
+    return buildCommandSelectGroups(commands);
+  }, [selectedScript, state.devices]);
   const currentCommandExecution = selectedCommand ? commandExecutions[selectedCommand.id] ?? null : null;
   const currentScriptExecution = selectedScript ? scriptExecutions[selectedScript.id] ?? null : null;
   const selectedCommandInputValues = selectedCommand ? resolveCommandInputValues(selectedCommand) : {};
@@ -2896,11 +3117,29 @@ export default function EquipmentManager({ config }: ModuleProps) {
                     </div>
                       <div style={{ marginTop: "0.9rem", display: "grid", gridTemplateColumns: "260px minmax(0, 1fr)", gap: "1rem", minHeight: 520 }}>
                       <div style={{ minHeight: 0, overflowY: "auto", border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.55rem", display: "grid", gap: "0.45rem" }}>
-                        {selectedDevice.commands.map((command) => {
+                        {selectedDeviceCommandEntries.map((entry) => {
+                          if (entry.kind === "category") {
+                            return (
+                              <div
+                                key={entry.key}
+                                style={{
+                                  padding: `0.2rem 0.35rem 0.15rem ${0.35 + (entry.depth * 0.75)}rem`,
+                                  color: C.accent,
+                                  fontSize: "0.72rem",
+                                  fontWeight: 800,
+                                  letterSpacing: "0.08em",
+                                  textTransform: "uppercase",
+                                }}
+                              >
+                                {entry.label}
+                              </div>
+                            );
+                          }
+                          const command = entry.command;
                           const active = command.id === selectedCommand?.id;
                           return (
                             <button
-                              key={command.id}
+                              key={entry.key}
                               onClick={() => setSelectedCommandId(command.id)}
                               style={{
                                 textAlign: "left",
@@ -2909,6 +3148,7 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                 color: C.text,
                                 borderRadius: 10,
                                 padding: "0.38rem 0.5rem",
+                                marginLeft: `${entry.depth * 0.6}rem`,
                                 cursor: "pointer",
                               }}
                             >
@@ -3027,6 +3267,10 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                 <label style={labelStyle()}>
                                   Save As
                                   <input value={selectedCommand.saveAs ?? ""} onChange={(event) => setState((current) => ({ ...current, devices: current.devices.map((device) => device.id === selectedDevice.id ? { ...device, commands: device.commands.map((item) => item.id === selectedCommand.id ? { ...item, saveAs: event.target.value || undefined } : item) } : device) }))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                </label>
+                                <label style={labelStyle()}>
+                                  Category Path
+                                  <input value={selectedCommand.categoryPath ?? ""} onChange={(event) => setState((current) => ({ ...current, devices: current.devices.map((device) => device.id === selectedDevice.id ? { ...device, commands: device.commands.map((item) => item.id === selectedCommand.id ? { ...item, categoryPath: event.target.value || undefined } : item) } : device) }))} onBlur={() => void persistState(state, "Command updated")} placeholder="Trigger / Read" style={inputStyle()} />
                                 </label>
                               </div>
                               <label style={{ ...labelStyle(), marginTop: "0.8rem" }}>
@@ -3213,7 +3457,7 @@ export default function EquipmentManager({ config }: ModuleProps) {
                               </section>
                               <section style={cardStyle()}>
                                 <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Interpreted Output</div>
-                                <div style={{ marginTop: "0.85rem", border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.9rem", maxHeight: 560, overflow: "auto", minWidth: 0 }}>
+                                <div style={{ marginTop: "0.85rem", border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.9rem", overflow: "visible", minWidth: 0, height: "auto" }}>
                                   {currentCommandExecution && isSiglentWaveformResult(currentCommandExecution.output) ? (
                                     <WaveformChartInteractive key={`${currentCommandExecution.startedAt}-${currentCommandExecution.output.channel}-${currentCommandExecution.output.sampleCount}`} result={currentCommandExecution.output} />
                                   ) : currentCommandExecution && isTcpCommandResult(currentCommandExecution.output) ? (
@@ -3479,7 +3723,11 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                   void persistState(next, "Step updated");
                                 }} style={inputStyle()}>
                                   <option value="">None / raw only</option>
-                                  {commandOptions.map((command) => <option key={command.id} value={command.id}>{command.name}</option>)}
+                                  {selectedScriptCommandGroups.map((group) => (
+                                    <optgroup key={group.label} label={group.label}>
+                                      {group.commands.map((command) => <option key={command.id} value={command.id}>{command.name}</option>)}
+                                    </optgroup>
+                                  ))}
                                 </select>
                               </label>
                               <label style={labelStyle()}>
