@@ -11,6 +11,8 @@ type Scalar = string | number | boolean | null;
 type ValueMap = Record<string, unknown>;
 type AppSection = "overview" | "run" | "report";
 
+const SIGLENT_WAVEFORM_POINT_LIMIT = 20000;
+
 type FieldDefinition = {
   id: string;
   label: string;
@@ -49,6 +51,7 @@ type TestDefinition = {
   diagrams: Record<string, DiagramDefinition>;
   steps: Record<string, ProcedureStep>;
   procedures: Record<string, ProcedureDefinition>;
+  instruments: InstrumentScopeDefinition;
   linkedValues: Record<string, LinkedValueRecord[]>;
   inputFields: FieldDefinition[];
   testDefinedFields: FieldDefinition[];
@@ -71,6 +74,7 @@ type ResolvedTest = {
   preTestGuidance?: string;
   preTestAssets: PreTestAsset[];
   equipmentRuntime: EquipmentRuntimeSpec[];
+  instrumentScope: InstrumentScopeDefinition;
 };
 
 type PreTestAsset = {
@@ -131,6 +135,159 @@ type EquipmentRuntimeSpec = {
   actions: string[];
   outputs: string[];
   notes?: string;
+};
+
+type InstrumentCommandInputSpec = {
+  id: string;
+  name: string;
+  required: boolean;
+  defaultValue?: string;
+  options?: string[];
+  description?: string;
+};
+
+type InstrumentCommandOutputSpec = {
+  id: string;
+  name: string;
+  selector?: string;
+  description?: string;
+};
+
+type InstrumentCommandSpec = {
+  id: string;
+  label: string;
+  mode: "scpi" | "script";
+  payload: string;
+  parser?: string;
+  notes?: string;
+  inputs: InstrumentCommandInputSpec[];
+  outputs: InstrumentCommandOutputSpec[];
+};
+
+type InstrumentCatalogSpec = {
+  id: string;
+  label: string;
+  protocol: string;
+  defaultPort?: number;
+  commands: Record<string, InstrumentCommandSpec>;
+};
+
+type InstrumentScriptStepSpec = {
+  id: string;
+  title: string;
+  device?: string;
+  command?: string;
+  script?: string;
+  waitMs?: number;
+  notes?: string;
+};
+
+type InstrumentScriptSpec = {
+  id: string;
+  title: string;
+  expose?: boolean;
+  notes?: string;
+  steps: InstrumentScriptStepSpec[];
+};
+
+type InstrumentBindingSpec = {
+  id: string;
+  label: string;
+  deviceType: string;
+  protocol: string;
+  defaultPort?: number;
+  notes?: string;
+};
+
+type InstrumentScopeDefinition = {
+  catalogs: Record<string, InstrumentCatalogSpec>;
+  bindings: Record<string, InstrumentBindingSpec>;
+  scripts: Record<string, InstrumentScriptSpec>;
+};
+
+type InstrumentAddressConfig = {
+  host: string;
+  port: string;
+};
+
+type ResolvedInstrumentConfigEntry = {
+  id: string;
+  label: string;
+  deviceType: string;
+  protocol: string;
+  defaultPort: number;
+  notes?: string;
+  usageCount: number;
+  scriptIds: string[];
+};
+
+type InstrumentSessionEntry = {
+  id: string;
+  kind: "command" | "script" | "note";
+  title: string;
+  deviceId?: string;
+  deviceLabel?: string;
+  commandText?: string;
+  responseText?: string;
+  interpretedText?: string;
+  artifact?: ArtifactRef;
+  preview?: {
+    kind: "image" | "svg" | "waveform";
+    src?: string;
+    svg?: string;
+    samples?: number[];
+    channel?: string;
+    sampleCount?: number;
+    intervalSeconds?: number;
+    startTimeSeconds?: number;
+    endTimeSeconds?: number;
+    minVoltage?: number;
+    maxVoltage?: number;
+    metadata?: {
+      voltsPerDiv: number;
+      offsetVolts: number;
+      timePerDivSeconds: number;
+      triggerDelaySeconds: number;
+      sampleRateHz: number;
+      grid: number;
+    };
+    points?: Array<{
+      index: number;
+      rawCode: number;
+      timeSeconds: number;
+      voltage: number;
+    }>;
+    cursors?: Array<{
+      id: string;
+      label: string;
+      color: string;
+      index: number;
+    }>;
+    mathRows?: Array<{
+      id: string;
+      op: string;
+      a: string;
+      b: string;
+    }>;
+    visibleRange?: [number, number];
+    yRange?: [number, number];
+  };
+  startedAt: string;
+  completedAt?: string;
+  ok: boolean;
+  error?: string;
+};
+
+type InstrumentSessionRecord = {
+  id: string;
+  testId: string;
+  testTitle: string;
+  scriptId: string;
+  scriptTitle: string;
+  startedAt: string;
+  completedAt?: string;
+  status: "running" | "completed" | "failed";
+  entries: InstrumentSessionEntry[];
 };
 
 type ProcedureStep = {
@@ -200,6 +357,7 @@ type TestRun = {
   createdBy?: string;
   overviewNotes?: string;
   overviewArtifacts?: OverviewArtifact[];
+  instrumentSessions?: InstrumentSessionRecord[];
   resultsByTestId: Record<string, ResultRecord>;
   excludedTestIds?: string[];
   excludedTestReasons?: Record<string, string>;
@@ -239,6 +397,28 @@ type ReportGenerationOptions = {
   artifactHref?: (context: ReportArtifactContext) => string;
   overviewArtifactHref?: (artifact: ArtifactRef) => string;
   notes?: string[];
+};
+
+type AgentBridgeDefaults = {
+  url?: string;
+};
+
+type BridgeConfig = {
+  url: string;
+};
+
+type TcpCommandResult = {
+  host?: string;
+  port?: number;
+  command?: string;
+  text?: string;
+  data?: string;
+  bytesBase64?: string;
+  bytesLength?: number;
+  durationMs?: number;
+  readMode?: string;
+  timedOut?: boolean;
+  matchedMarker?: string;
 };
 
 type ZipFileContent = string | Uint8Array;
@@ -604,6 +784,151 @@ function normalizeEquipmentRuntime(value: unknown): EquipmentRuntimeSpec[] {
         }];
       })
     : [];
+}
+
+function normalizeInstrumentCommandInputs(value: unknown): InstrumentCommandInputSpec[] {
+  return Array.isArray(value)
+    ? value.map((entry, index) => {
+        const record = toRecord(entry);
+        const options = Array.isArray(record.options) ? record.options.map((item) => String(item)).filter(Boolean) : undefined;
+        return {
+          id: toStringValue(record.id, `input-${index + 1}`),
+          name: toStringValue(record.name, `input${index + 1}`),
+          required: Boolean(record.required ?? true),
+          defaultValue: toStringValue(record.defaultValue ?? record.default_value, "") || undefined,
+          options: options?.length ? options : undefined,
+          description: toStringValue(record.description, "") || undefined,
+        };
+      })
+    : [];
+}
+
+function normalizeInstrumentCommandOutputs(value: unknown): InstrumentCommandOutputSpec[] {
+  return Array.isArray(value)
+    ? value.map((entry, index) => {
+        const record = toRecord(entry);
+        return {
+          id: toStringValue(record.id, `output-${index + 1}`),
+          name: toStringValue(record.name, `output${index + 1}`),
+          selector: toStringValue(record.selector, "") || undefined,
+          description: toStringValue(record.description, "") || undefined,
+        };
+      })
+    : [];
+}
+
+function normalizeInstrumentCatalogs(value: unknown): Record<string, InstrumentCatalogSpec> {
+  return Object.fromEntries(
+    Object.entries(toRecord(value)).map(([id, entry]) => {
+      const record = toRecord(entry);
+      const commands = Object.fromEntries(
+        Object.entries(toRecord(record.commands)).map(([commandId, commandValue]) => {
+          const command = toRecord(commandValue);
+          const mode = toStringValue(command.mode, "scpi");
+          return [commandId, {
+            id: commandId,
+            label: toStringValue(command.label ?? command.title ?? command.name, humanize(commandId)),
+            mode: mode === "script" ? "script" : "scpi",
+            payload: toStringValue(command.payload ?? command.request, ""),
+            parser: toStringValue(command.parser, "") || undefined,
+            notes: toStringValue(command.notes, "") || undefined,
+            inputs: normalizeInstrumentCommandInputs(command.inputs),
+            outputs: normalizeInstrumentCommandOutputs(command.outputs),
+          } satisfies InstrumentCommandSpec];
+        })
+      );
+      return [id, {
+        id,
+        label: toStringValue(record.label ?? record.title ?? record.name, humanize(id)),
+        protocol: toStringValue(record.protocol, "scpi"),
+        defaultPort: Number.isFinite(Number(record.defaultPort ?? record.default_port)) ? Number(record.defaultPort ?? record.default_port) : undefined,
+        commands,
+      } satisfies InstrumentCatalogSpec];
+    })
+  );
+}
+
+function normalizeInstrumentScriptSteps(value: unknown): InstrumentScriptStepSpec[] {
+  return Array.isArray(value)
+    ? value.map((entry, index) => {
+        const record = toRecord(entry);
+        return {
+          id: toStringValue(record.id, `step-${index + 1}`),
+          title: toStringValue(record.title ?? record.label ?? record.name, humanize(toStringValue(record.id, `step-${index + 1}`))),
+          device: toStringValue(record.device ?? record.instrument, "") || undefined,
+          command: toStringValue(record.command ?? record.command_ref, "") || undefined,
+          script: toStringValue(record.script ?? record.script_ref, "") || undefined,
+          waitMs: Number.isFinite(Number(record.waitMs ?? record.wait_ms)) ? Number(record.waitMs ?? record.wait_ms) : undefined,
+          notes: toStringValue(record.notes, "") || undefined,
+        };
+      })
+    : [];
+}
+
+function normalizeInstrumentScripts(value: unknown): Record<string, InstrumentScriptSpec> {
+  return Object.fromEntries(
+    Object.entries(toRecord(value)).map(([id, entry]) => {
+      const record = toRecord(entry);
+      return [id, {
+        id,
+        title: toStringValue(record.title ?? record.label ?? record.name, humanize(id)),
+        expose: Boolean(record.expose ?? record.show_button ?? record.runnable),
+        notes: toStringValue(record.notes, "") || undefined,
+        steps: normalizeInstrumentScriptSteps(record.steps),
+      } satisfies InstrumentScriptSpec];
+    })
+  );
+}
+
+function normalizeInstrumentBindings(value: unknown, catalogs: Record<string, InstrumentCatalogSpec>): Record<string, InstrumentBindingSpec> {
+  return Object.fromEntries(
+    Object.entries(toRecord(value)).map(([id, entry]) => {
+      const record = toRecord(entry);
+      const deviceType = toStringValue(record.deviceType ?? record.device_type ?? record.catalog ?? record.type, "");
+      const catalog = catalogs[deviceType];
+      const protocol = toStringValue(record.protocol, catalog?.protocol ?? "scpi");
+      const defaultPortValue = record.defaultPort ?? record.default_port ?? catalog?.defaultPort;
+      return [id, {
+        id,
+        label: toStringValue(record.label ?? record.title ?? record.name, humanize(id)),
+        deviceType,
+        protocol,
+        defaultPort: Number.isFinite(Number(defaultPortValue)) ? Number(defaultPortValue) : undefined,
+        notes: toStringValue(record.notes, "") || undefined,
+      } satisfies InstrumentBindingSpec];
+    })
+  );
+}
+
+function normalizeInstrumentScope(value: unknown, fallbackCatalogs: Record<string, InstrumentCatalogSpec> = {}): InstrumentScopeDefinition {
+  const record = toRecord(value);
+  const catalogs = {
+    ...fallbackCatalogs,
+    ...normalizeInstrumentCatalogs(record.catalogs ?? record.device_types ?? record.catalog),
+  };
+  return {
+    catalogs,
+    bindings: normalizeInstrumentBindings(record.bindings ?? record.devices ?? record.instruments, catalogs),
+    scripts: normalizeInstrumentScripts(record.scripts),
+  };
+}
+
+function mergeInstrumentScopes(...scopes: InstrumentScopeDefinition[]): InstrumentScopeDefinition {
+  return scopes.reduce<InstrumentScopeDefinition>((current, scope) => ({
+    catalogs: { ...current.catalogs, ...scope.catalogs },
+    bindings: { ...current.bindings, ...scope.bindings },
+    scripts: Object.fromEntries(
+      Array.from(new Set([...Object.keys(current.scripts), ...Object.keys(scope.scripts)])).map((id) => {
+        const previous = current.scripts[id];
+        const next = scope.scripts[id];
+        return [id, next ? {
+          ...previous,
+          ...next,
+          expose: next.expose ?? previous?.expose,
+        } : previous];
+      }).filter((entry): entry is [string, InstrumentScriptSpec] => Boolean(entry[1]))
+    ),
+  }), { catalogs: {}, bindings: {}, scripts: {} });
 }
 
 function normalizeProcedureStep(id: string, value: unknown): ProcedureStep {
@@ -988,12 +1313,17 @@ function parseDefinition(text: string): TestDefinition {
   const parsed = toRecord(parseYaml(text));
   const diagrams = normalizeDiagramDefinitions(parsed.diagrams);
   const program = toRecord(parsed.program);
+  const instruments = mergeInstrumentScopes(
+    normalizeInstrumentScope(parsed.instruments),
+    normalizeInstrumentScope(program.instruments),
+  );
   return {
     program,
     programAssets: normalizePreTestAssets(program.pre_test_assets, diagrams),
     diagrams,
     steps: normalizeProcedureStepDefinitions(parsed.steps),
     procedures: normalizeProcedureDefinitions(parsed.procedures),
+    instruments,
     linkedValues: normalizeLinkedValues(parsed.linked_values),
     inputFields: normalizeFieldDefinitions(parsed.input_fields),
     testDefinedFields: normalizeFieldDefinitions(parsed.test_defined_fields),
@@ -1012,8 +1342,141 @@ function createDefaultRun(currentUser?: string, label = "Run 1"): TestRun {
     createdBy: currentUser,
     overviewNotes: "",
     overviewArtifacts: [],
+    instrumentSessions: [],
     resultsByTestId: {},
   };
+}
+
+function normalizeInstrumentSessionEntry(value: unknown, index: number): InstrumentSessionEntry {
+  const record = toRecord(value);
+  const artifact = toRecord(record.artifact);
+  const preview = toRecord(record.preview);
+  const artifactValue = toStringValue(artifact.id, "")
+    ? {
+        id: toStringValue(artifact.id, `artifact-${index + 1}`),
+        fieldId: toStringValue(artifact.fieldId, "") || undefined,
+        kind: toStringValue(artifact.kind, "supporting") as ArtifactRef["kind"],
+        name: toStringValue(artifact.name, "artifact"),
+        bucket: toStringValue(artifact.bucket, ""),
+        key: toStringValue(artifact.key, ""),
+        contentType: toStringValue(artifact.contentType, "") || undefined,
+        sizeBytes: Number(artifact.sizeBytes) || 0,
+        uploadedAt: toStringValue(artifact.uploadedAt, nowIso()),
+        uploadedBy: toStringValue(artifact.uploadedBy, "") || undefined,
+      } satisfies ArtifactRef
+    : undefined;
+  const kind = toStringValue(record.kind, "note");
+  return {
+    id: toStringValue(record.id, `session-entry-${index + 1}`),
+    kind: kind === "command" || kind === "script" ? kind : "note",
+    title: toStringValue(record.title, `Session Entry ${index + 1}`),
+    deviceId: toStringValue(record.deviceId, "") || undefined,
+    deviceLabel: toStringValue(record.deviceLabel, "") || undefined,
+    commandText: toStringValue(record.commandText, "") || undefined,
+    responseText: toStringValue(record.responseText, "") || undefined,
+    interpretedText: toStringValue(record.interpretedText, "") || undefined,
+    artifact: artifactValue,
+    preview: toStringValue(preview.kind, "")
+      ? {
+          kind: toStringValue(preview.kind, "image") === "svg"
+            ? "svg"
+            : toStringValue(preview.kind, "image") === "waveform"
+              ? "waveform"
+              : "image",
+          src: toStringValue(preview.src, "") || undefined,
+          svg: toStringValue(preview.svg, "") || undefined,
+          samples: Array.isArray(preview.samples)
+            ? preview.samples.map((value) => Number(value)).filter((value) => Number.isFinite(value))
+            : undefined,
+          channel: toStringValue(preview.channel, "") || undefined,
+          sampleCount: Number.isFinite(Number(preview.sampleCount)) ? Number(preview.sampleCount) : undefined,
+          intervalSeconds: Number.isFinite(Number(preview.intervalSeconds)) ? Number(preview.intervalSeconds) : undefined,
+          startTimeSeconds: Number.isFinite(Number(preview.startTimeSeconds)) ? Number(preview.startTimeSeconds) : undefined,
+          endTimeSeconds: Number.isFinite(Number(preview.endTimeSeconds)) ? Number(preview.endTimeSeconds) : undefined,
+          minVoltage: Number.isFinite(Number(preview.minVoltage)) ? Number(preview.minVoltage) : undefined,
+          maxVoltage: Number.isFinite(Number(preview.maxVoltage)) ? Number(preview.maxVoltage) : undefined,
+          metadata: toRecord(preview.metadata) && Number.isFinite(Number(toRecord(preview.metadata).voltsPerDiv))
+            ? {
+                voltsPerDiv: Number(toRecord(preview.metadata).voltsPerDiv),
+                offsetVolts: Number(toRecord(preview.metadata).offsetVolts) || 0,
+                timePerDivSeconds: Number(toRecord(preview.metadata).timePerDivSeconds) || 0,
+                triggerDelaySeconds: Number(toRecord(preview.metadata).triggerDelaySeconds) || 0,
+                sampleRateHz: Number(toRecord(preview.metadata).sampleRateHz) || 0,
+                grid: Number(toRecord(preview.metadata).grid) || 14,
+              }
+            : undefined,
+          points: Array.isArray(preview.points)
+            ? preview.points.flatMap((point) => {
+                const row = toRecord(point);
+                const indexValue = Number(row.index);
+                const rawCodeValue = Number(row.rawCode);
+                const timeValue = Number(row.timeSeconds);
+                const voltageValue = Number(row.voltage);
+                return Number.isFinite(indexValue) && Number.isFinite(rawCodeValue) && Number.isFinite(timeValue) && Number.isFinite(voltageValue)
+                  ? [{ index: indexValue, rawCode: rawCodeValue, timeSeconds: timeValue, voltage: voltageValue }]
+                  : [];
+              })
+            : undefined,
+          cursors: Array.isArray(preview.cursors)
+            ? preview.cursors.flatMap((cursor) => {
+                const row = toRecord(cursor);
+                const indexValue = Number(row.index);
+                return toStringValue(row.id, "") && Number.isFinite(indexValue)
+                  ? [{
+                      id: toStringValue(row.id, ""),
+                      label: toStringValue(row.label, "Cursor"),
+                      color: toStringValue(row.color, "#ef4444") || "#ef4444",
+                      index: indexValue,
+                    }]
+                  : [];
+              })
+            : undefined,
+          mathRows: Array.isArray(preview.mathRows)
+            ? preview.mathRows.flatMap((mathRow) => {
+                const row = toRecord(mathRow);
+                return toStringValue(row.id, "") && toStringValue(row.a, "") && toStringValue(row.b, "")
+                  ? [{
+                      id: toStringValue(row.id, ""),
+                      op: toStringValue(row.op, "dx"),
+                      a: toStringValue(row.a, ""),
+                      b: toStringValue(row.b, ""),
+                    }]
+                  : [];
+              })
+            : undefined,
+          visibleRange: Array.isArray(preview.visibleRange) && preview.visibleRange.length >= 2 && Number.isFinite(Number(preview.visibleRange[0])) && Number.isFinite(Number(preview.visibleRange[1]))
+            ? [Number(preview.visibleRange[0]), Number(preview.visibleRange[1])]
+            : undefined,
+          yRange: Array.isArray(preview.yRange) && preview.yRange.length >= 2 && Number.isFinite(Number(preview.yRange[0])) && Number.isFinite(Number(preview.yRange[1]))
+            ? [Number(preview.yRange[0]), Number(preview.yRange[1])]
+            : undefined,
+        }
+      : undefined,
+    startedAt: toStringValue(record.startedAt, nowIso()),
+    completedAt: toStringValue(record.completedAt, "") || undefined,
+    ok: record.ok !== false,
+    error: toStringValue(record.error, "") || undefined,
+  };
+}
+
+function normalizeInstrumentSessions(value: unknown): InstrumentSessionRecord[] {
+  return Array.isArray(value)
+    ? value.map((entry, index) => {
+        const record = toRecord(entry);
+        const status = toStringValue(record.status, "completed");
+        return {
+          id: toStringValue(record.id, `session-${index + 1}`),
+          testId: toStringValue(record.testId, ""),
+          testTitle: toStringValue(record.testTitle, ""),
+          scriptId: toStringValue(record.scriptId, ""),
+          scriptTitle: toStringValue(record.scriptTitle, ""),
+          startedAt: toStringValue(record.startedAt, nowIso()),
+          completedAt: toStringValue(record.completedAt, "") || undefined,
+          status: status === "running" || status === "failed" ? status : "completed",
+          entries: Array.isArray(record.entries) ? record.entries.map(normalizeInstrumentSessionEntry) : [],
+        } satisfies InstrumentSessionRecord;
+      })
+    : [];
 }
 
 function normalizeOverviewArtifacts(value: unknown): OverviewArtifact[] {
@@ -1085,6 +1548,7 @@ function normalizeWorkspaceState(store: unknown, projectId: string, currentUser?
       ...run,
       overviewNotes: toStringValue(run.overviewNotes, ""),
       overviewArtifacts: normalizeOverviewArtifacts(run.overviewArtifacts),
+      instrumentSessions: normalizeInstrumentSessions(run.instrumentSessions),
       resultsByTestId: Object.fromEntries(
         Object.entries(run.resultsByTestId ?? {}).map(([testId, result]) => [testId, normalizeResultRecord(result)])
       ),
@@ -1173,6 +1637,11 @@ function buildResolvedTests(definition: TestDefinition): ResolvedTest[] {
       const preTestGuidance = toStringValue(test.values.pre_test_guidance ?? group.values.pre_test_guidance, "") || undefined;
       const preTestAssets = normalizePreTestAssets(test.values.pre_test_assets ?? group.values.pre_test_assets, definition.diagrams);
       const equipmentRuntime = normalizeEquipmentRuntime(test.values.equipment_runtime ?? group.values.equipment_runtime);
+      const instrumentScope = mergeInstrumentScopes(
+        definition.instruments,
+        normalizeInstrumentScope(group.values.instruments, definition.instruments.catalogs),
+        normalizeInstrumentScope(test.values.instruments, definition.instruments.catalogs),
+      );
       const procedure = resolveProcedureSteps(definition, test.values.test_steps ?? test.values.procedure ?? group.values.test_steps ?? group.values.procedure);
       const definedValues: ValueMap = {
         test_group_id: group.id,
@@ -1228,6 +1697,7 @@ function buildResolvedTests(definition: TestDefinition): ResolvedTest[] {
         preTestGuidance,
         preTestAssets,
         equipmentRuntime,
+        instrumentScope,
       };
     })
   );
@@ -1394,6 +1864,42 @@ function buttonStyle(kind: "primary" | "ghost" | "danger" = "ghost"): React.CSSP
   return { border: `1px solid ${C.border}`, background: "transparent", color: C.text, borderRadius: 8, padding: "0.55rem 0.85rem", cursor: "pointer", fontWeight: 600, fontFamily: "inherit" };
 }
 
+function safeReadLocalStorage(key: string): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function safeWriteLocalStorage(key: string, value: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (!value) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    // ignore local storage errors
+  }
+}
+
+function readBridgeDefaults(): AgentBridgeDefaults {
+  if (typeof window === "undefined") return {};
+  const defaults = (window as typeof window & { __AgentBridgeDefaults?: AgentBridgeDefaults }).__AgentBridgeDefaults;
+  return defaults && typeof defaults === "object" ? defaults : {};
+}
+
+async function callBridge<T>(bridge: BridgeConfig, method: string, params: Record<string, unknown>): Promise<T> {
+  const response = await fetch(`${bridge.url.replace(/\/$/, "")}/rpc`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ method, params }),
+  });
+  const payload = await response.json() as { ok?: boolean; result?: T; error?: string };
+  if (!response.ok || !payload.ok) throw new Error(payload.error || `Bridge call failed: ${method}`);
+  return payload.result as T;
+}
+
 function cardStyle(): React.CSSProperties {
   return { border: `1px solid ${C.border}`, borderRadius: 16, background: C.panel, padding: "1rem 1.1rem" };
 }
@@ -1428,6 +1934,771 @@ function artifactArchivePath(testId: string, artifact: ArtifactRef, fieldId?: st
 
 function overviewArtifactArchivePath(artifact: ArtifactRef): string {
   return `overview/${safeFileSegment(artifact.id)}-${safeFileSegment(artifact.name)}`;
+}
+
+function buildInstrumentConfigStorageKey(projectId: string, moduleId: string): string {
+  return `auth-shell:test-manager:${projectId}:${moduleId}:instrument-addresses`;
+}
+
+function getDefaultInstrumentPort(binding: InstrumentBindingSpec): number {
+  if (binding.defaultPort && binding.defaultPort > 0) return binding.defaultPort;
+  if (binding.protocol.toLowerCase().includes("scpi")) return 5025;
+  return 0;
+}
+
+function collectInstrumentConfigEntries(definition: TestDefinition | null, resolvedTests: ResolvedTest[]): ResolvedInstrumentConfigEntry[] {
+  if (!definition) return [];
+  const usage = new Map<string, ResolvedInstrumentConfigEntry>(
+    Object.values(definition.instruments.bindings).map((binding) => [binding.id, {
+      id: binding.id,
+      label: binding.label,
+      deviceType: binding.deviceType,
+      protocol: binding.protocol,
+      defaultPort: getDefaultInstrumentPort(binding),
+      notes: binding.notes,
+      usageCount: 0,
+      scriptIds: Object.values(definition.instruments.scripts)
+        .filter((script) => script.steps.some((step) => step.device === binding.id))
+        .map((script) => script.id),
+    } satisfies ResolvedInstrumentConfigEntry] as const)
+  );
+  for (const test of resolvedTests) {
+    for (const binding of Object.values(test.instrumentScope.bindings)) {
+      const existing = usage.get(binding.id);
+      const scriptIds = Object.values(test.instrumentScope.scripts)
+        .filter((script) => script.steps.some((step) => step.device === binding.id))
+        .map((script) => script.id);
+      if (existing) {
+        existing.usageCount += 1;
+        existing.scriptIds = Array.from(new Set([...existing.scriptIds, ...scriptIds]));
+      } else {
+        usage.set(binding.id, {
+          id: binding.id,
+          label: binding.label,
+          deviceType: binding.deviceType,
+          protocol: binding.protocol,
+          defaultPort: getDefaultInstrumentPort(binding),
+          notes: binding.notes,
+          usageCount: 1,
+          scriptIds,
+        });
+      }
+    }
+  }
+  return [...usage.values()].sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function normalizeInstrumentAddressConfig(value: unknown): Record<string, InstrumentAddressConfig> {
+  return Object.fromEntries(
+    Object.entries(toRecord(value)).map(([key, entry]) => {
+      const record = toRecord(entry);
+      return [key, {
+        host: toStringValue(record.host, ""),
+        port: toStringValue(record.port, ""),
+      } satisfies InstrumentAddressConfig];
+    })
+  );
+}
+
+function getTopLevelInstrumentScripts(scope: InstrumentScopeDefinition): InstrumentScriptSpec[] {
+  const explicit = Object.values(scope.scripts).filter((script) => script.expose);
+  if (explicit.length > 0) {
+    return explicit.sort((a, b) => a.title.localeCompare(b.title));
+  }
+  const referenced = new Set<string>();
+  for (const script of Object.values(scope.scripts)) {
+    for (const step of script.steps) {
+      if (step.script) referenced.add(step.script);
+    }
+  }
+  return Object.values(scope.scripts)
+    .filter((script) => !referenced.has(script.id))
+    .sort((a, b) => a.title.localeCompare(b.title));
+}
+
+function getSessionInstrumentScripts(scope: InstrumentScopeDefinition): InstrumentScriptSpec[] {
+  const captureFlow = scope.scripts.scope_fault_capture;
+  if (captureFlow) {
+    const viewScriptId = captureFlow.steps.find((step) => step.script && step.script !== "configure_scope_window" && step.script !== "execute_scope_capture")?.script;
+    const viewScript = viewScriptId ? scope.scripts[viewScriptId] : null;
+    const configureTitle = viewScript?.title
+      ? viewScript.title.replace(/^Set\s+/i, "Configure ").replace(/\s+Viewing Level$/i, " Window")
+      : "Configure Scope Window";
+    return [
+      {
+        id: "__session_configure__",
+        title: configureTitle,
+        steps: [],
+      },
+      {
+        id: "__session_capture__",
+        title: "Arm and Capture",
+        steps: [],
+      },
+    ];
+  }
+  return getTopLevelInstrumentScripts(scope);
+}
+
+function resolveInstrumentExecutionScript(scope: InstrumentScopeDefinition, scriptId: string): InstrumentScriptSpec | null {
+  if (scriptId === "__session_capture__") {
+    return scope.scripts.execute_scope_capture ?? null;
+  }
+  if (scriptId === "__session_configure__") {
+    const captureFlow = scope.scripts.scope_fault_capture;
+    if (!captureFlow) return scope.scripts.configure_scope_window ?? null;
+    const viewScriptId = captureFlow.steps.find((step) => step.script && step.script !== "configure_scope_window" && step.script !== "execute_scope_capture")?.script;
+    const viewScript = viewScriptId ? scope.scripts[viewScriptId] : null;
+    const configureTitle = viewScript?.title
+      ? viewScript.title.replace(/^Set\s+/i, "Configure ").replace(/\s+Viewing Level$/i, " Window")
+      : "Configure Scope Window";
+    return {
+      id: "__session_configure__",
+      title: configureTitle,
+      steps: [
+        ...(scope.scripts.configure_scope_window ? [{
+          id: "configure_scope_window",
+          title: scope.scripts.configure_scope_window.title,
+          script: "configure_scope_window",
+        }] : []),
+        ...(viewScriptId ? [{
+          id: "configure_view_window",
+          title: viewScript?.title ?? "Configure Window",
+          script: viewScriptId,
+        }] : []),
+      ],
+    };
+  }
+  return scope.scripts[scriptId] ?? null;
+}
+
+function getInstrumentSessionArchivePath(session: InstrumentSessionRecord, artifact: ArtifactRef): string {
+  return `instrument-sessions/${safeFileSegment(session.testId)}/${safeFileSegment(session.id)}/${safeFileSegment(artifact.id)}-${safeFileSegment(artifact.name)}`;
+}
+
+function sessionsForTest(run: TestRun, testId: string): InstrumentSessionRecord[] {
+  return (run.instrumentSessions ?? []).filter((session) => session.testId === testId);
+}
+
+function collectReferencedBindingIds(scope: InstrumentScopeDefinition, scriptId: string, visited = new Set<string>()): string[] {
+  if (visited.has(scriptId)) return [];
+  visited.add(scriptId);
+  const script = resolveInstrumentExecutionScript(scope, scriptId);
+  if (!script) return [];
+  const ids = new Set<string>();
+  for (const step of script.steps) {
+    if (step.device) ids.add(step.device);
+    if (step.script) {
+      for (const nested of collectReferencedBindingIds(scope, step.script, visited)) ids.add(nested);
+    }
+  }
+  return [...ids];
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function decodeSiglentWaveformBlock(bytesBase64: string): number[] {
+  const bytes = base64ToBytes(bytesBase64);
+  const hashIndex = bytes.indexOf(35);
+  if (hashIndex < 0 || hashIndex + 1 >= bytes.length) {
+    return Array.from(bytes, (value) => value > 127 ? value - 255 : value);
+  }
+  const digitCount = bytes[hashIndex + 1] - 48;
+  if (digitCount < 1 || digitCount > 9) {
+    return Array.from(bytes, (value) => value > 127 ? value - 255 : value);
+  }
+  const lengthText = new TextDecoder().decode(bytes.slice(hashIndex + 2, hashIndex + 2 + digitCount));
+  const blockLength = Number(lengthText);
+  if (!Number.isFinite(blockLength) || blockLength < 0) {
+    return Array.from(bytes, (value) => value > 127 ? value - 255 : value);
+  }
+  const dataStart = hashIndex + 2 + digitCount;
+  const dataEnd = Math.min(bytes.length, dataStart + blockLength);
+  return Array.from(bytes.slice(dataStart, dataEnd), (value) => value > 127 ? value - 255 : value);
+}
+
+function extractScpiBlockPayload(bytesBase64: string): Uint8Array {
+  const bytes = base64ToBytes(bytesBase64);
+  const hashIndex = bytes.indexOf(35);
+  if (hashIndex < 0 || hashIndex + 1 >= bytes.length) {
+    return bytes;
+  }
+  const digitCount = bytes[hashIndex + 1] - 48;
+  if (digitCount < 1 || digitCount > 9) {
+    return bytes;
+  }
+  const lengthText = new TextDecoder().decode(bytes.slice(hashIndex + 2, hashIndex + 2 + digitCount));
+  const blockLength = Number(lengthText);
+  if (!Number.isFinite(blockLength) || blockLength < 0) {
+    return bytes;
+  }
+  const dataStart = hashIndex + 2 + digitCount;
+  const dataEnd = Math.min(bytes.length, dataStart + blockLength);
+  return bytes.slice(dataStart, dataEnd);
+}
+
+function readInt32LE(bytes: Uint8Array, offset: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(offset, true);
+}
+
+function readFloat32LE(bytes: Uint8Array, offset: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getFloat32(offset, true);
+}
+
+function parseSiglentWaveDescriptor(bytesBase64: string, returnedPointCount: number, fallbackSpanSeconds: number): {
+  waveArrayCount: number;
+  returnedPointCount: number;
+  sourceIntervalSeconds: number;
+  effectiveIntervalSeconds: number;
+  totalSpanSeconds: number;
+} | null {
+  const payload = extractScpiBlockPayload(bytesBase64);
+  const marker = new TextEncoder().encode("WAVEDESC");
+  let start = -1;
+  for (let index = 0; index <= payload.length - marker.length; index += 1) {
+    let matches = true;
+    for (let markerIndex = 0; markerIndex < marker.length; markerIndex += 1) {
+      if (payload[index + markerIndex] !== marker[markerIndex]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      start = index;
+      break;
+    }
+  }
+  if (start < 0 || start + 184 > payload.length) return null;
+  const descriptor = payload.slice(start);
+  const waveArrayCount = readInt32LE(descriptor, 116);
+  const sourceIntervalSeconds = readFloat32LE(descriptor, 176);
+  const safeReturnedCount = Math.max(1, returnedPointCount);
+  const sourcePointCount = waveArrayCount > 0 ? waveArrayCount : safeReturnedCount;
+  const totalSpanSeconds = sourcePointCount > 0 && sourceIntervalSeconds > 0
+    ? sourcePointCount * sourceIntervalSeconds
+    : fallbackSpanSeconds;
+  const effectiveIntervalSeconds = totalSpanSeconds / safeReturnedCount;
+  if (!Number.isFinite(totalSpanSeconds) || totalSpanSeconds <= 0 || !Number.isFinite(effectiveIntervalSeconds) || effectiveIntervalSeconds <= 0) {
+    return null;
+  }
+  return {
+    waveArrayCount: sourcePointCount,
+    returnedPointCount: safeReturnedCount,
+    sourceIntervalSeconds,
+    effectiveIntervalSeconds,
+    totalSpanSeconds,
+  };
+}
+
+function parseScpiNumber(text: string): number {
+  const matches = Array.from(text.matchAll(/(?:^|[\s,])(-?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/g));
+  const match = matches.at(-1);
+  if (!match) {
+    throw new Error(`Unable to parse numeric value from response: ${text}`);
+  }
+  const value = Number(match[1]);
+  const suffix = match[2] ?? "";
+  const multiplier = suffix === "G" ? 1e9
+    : suffix === "M" ? 1e6
+    : suffix === "K" || suffix === "k" ? 1e3
+    : suffix === "m" ? 1e-3
+    : suffix === "u" ? 1e-6
+    : suffix === "n" ? 1e-9
+    : suffix === "p" ? 1e-12
+    : 1;
+  return value * multiplier;
+}
+
+function parseSiglentWaveformChannel(payload: string): string {
+  const match = payload.match(/\b(C[1-4])\s*:/i);
+  return match?.[1]?.toUpperCase() ?? "C1";
+}
+
+function buildSiglentWaveformPreview(args: {
+  channel: string;
+  bytesBase64: string;
+  descriptorBytesBase64?: string;
+  voltsPerDivResponse: string;
+  offsetResponse: string;
+  timeDivResponse: string;
+  triggerDelayResponse: string;
+  sampleRateResponse: string;
+}): NonNullable<InstrumentSessionEntry["preview"]> {
+  const voltsPerDiv = parseScpiNumber(args.voltsPerDivResponse);
+  const offsetVolts = parseScpiNumber(args.offsetResponse);
+  const timePerDivSeconds = parseScpiNumber(args.timeDivResponse);
+  const triggerDelaySeconds = parseScpiNumber(args.triggerDelayResponse);
+  const sampleRateHz = parseScpiNumber(args.sampleRateResponse);
+  const grid = 14;
+  const samples = decodeSiglentWaveformBlock(args.bytesBase64);
+  const fallbackSpanSeconds = timePerDivSeconds * grid;
+  const descriptor = args.descriptorBytesBase64
+    ? parseSiglentWaveDescriptor(args.descriptorBytesBase64, samples.length, fallbackSpanSeconds)
+    : null;
+  const totalSpanSeconds = descriptor?.totalSpanSeconds ?? fallbackSpanSeconds;
+  const intervalSeconds = descriptor?.effectiveIntervalSeconds ?? (totalSpanSeconds / Math.max(1, samples.length));
+  const startTimeSeconds = triggerDelaySeconds - (totalSpanSeconds / 2);
+  const points = samples.map((rawCode, index) => ({
+    index,
+    rawCode,
+    timeSeconds: startTimeSeconds + (index * intervalSeconds),
+    voltage: rawCode * (voltsPerDiv / 25) - offsetVolts,
+  }));
+  const minVoltage = points.length ? points.reduce((min, point) => Math.min(min, point.voltage), Number.POSITIVE_INFINITY) : 0;
+  const maxVoltage = points.length ? points.reduce((max, point) => Math.max(max, point.voltage), Number.NEGATIVE_INFINITY) : 0;
+  return {
+    kind: "waveform",
+    samples: points.map((point) => point.voltage),
+    channel: args.channel,
+    sampleCount: points.length,
+    intervalSeconds,
+    startTimeSeconds,
+    endTimeSeconds: points.length > 0 ? points[points.length - 1]!.timeSeconds : startTimeSeconds,
+    minVoltage,
+    maxVoltage,
+    metadata: {
+      voltsPerDiv,
+      offsetVolts,
+      timePerDivSeconds,
+      triggerDelaySeconds,
+      sampleRateHz,
+      grid,
+    },
+    points,
+  };
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderInstrumentSessionWindowHtml(session: InstrumentSessionRecord): string {
+  const entries = session.entries.length === 0
+    ? `<div class="empty">No command activity recorded yet.</div>`
+    : session.entries.map((entry) => `
+      <section class="entry ${entry.ok ? "ok" : "failed"}">
+        <div class="entry-head">
+          <div>
+            <div class="title">${escapeHtml(entry.title)}</div>
+            <div class="meta">${escapeHtml(entry.deviceLabel ?? "")}${entry.deviceLabel ? " · " : ""}${escapeHtml(formatDate(entry.startedAt))}</div>
+          </div>
+          <div class="status">${entry.ok ? "OK" : "Failed"}</div>
+        </div>
+        ${entry.commandText ? `<pre>${escapeHtml(entry.commandText)}</pre>` : ""}
+        ${entry.interpretedText ? `<div class="interpreted">${escapeHtml(entry.interpretedText)}</div>` : ""}
+        ${entry.responseText && entry.responseText !== entry.interpretedText ? `<pre class="raw">${escapeHtml(entry.responseText)}</pre>` : ""}
+        ${entry.artifact ? `<div class="artifact">Saved artifact: ${escapeHtml(entry.artifact.name)} (${escapeHtml(formatBytes(entry.artifact.sizeBytes))})</div>` : ""}
+        ${entry.error ? `<div class="error">${escapeHtml(entry.error)}</div>` : ""}
+      </section>
+    `).join("");
+  return `<!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>${escapeHtml(session.scriptTitle)}</title>
+      <style>
+        body { margin: 0; font-family: "Segoe UI", "Aptos", sans-serif; background: #08111d; color: #e5edf8; }
+        header { padding: 16px 18px; border-bottom: 1px solid #24354f; background: linear-gradient(135deg, #08111d, #0f2135 55%, #173149); }
+        .eyebrow { font-size: 12px; color: #2dd4bf; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+        h1 { margin: 4px 0 0; font-size: 20px; }
+        .meta { margin-top: 4px; color: #94a3b8; font-size: 13px; }
+        main { padding: 16px 18px 20px; display: grid; gap: 12px; }
+        .entry { border: 1px solid #24354f; border-radius: 14px; background: #101d30; padding: 14px; }
+        .entry.failed { border-color: #f87171; }
+        .entry-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+        .title { font-weight: 700; }
+        .status { font-size: 13px; font-weight: 700; color: #34d399; }
+        .failed .status { color: #f87171; }
+        .interpreted { margin-top: 10px; white-space: pre-wrap; line-height: 1.6; }
+        pre { margin: 10px 0 0; padding: 10px 12px; background: #0a1424; border: 1px solid #24354f; border-radius: 12px; color: #e5edf8; white-space: pre-wrap; overflow-x: auto; }
+        .raw { color: #94a3b8; }
+        .artifact { margin-top: 10px; color: #2dd4bf; font-size: 13px; }
+        .error { margin-top: 10px; color: #f87171; white-space: pre-wrap; font-size: 13px; }
+        .empty { color: #94a3b8; }
+      </style>
+    </head>
+    <body>
+      <header>
+        <div class="eyebrow">Instrument Session</div>
+        <h1>${escapeHtml(session.scriptTitle)}</h1>
+        <div class="meta">${escapeHtml(session.testTitle)} · ${escapeHtml(formatDate(session.startedAt))} · ${escapeHtml(humanize(session.status))}</div>
+      </header>
+      <main>${entries}</main>
+    </body>
+  </html>`;
+}
+
+function renderInstrumentSessionWindowShellHtml(): string {
+  return `<!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Instrument Session</title>
+      <style>
+        html, body { margin: 0; height: 100%; }
+        body { font-family: "Segoe UI", "Aptos", sans-serif; background: #08111d; color: #e5edf8; overflow: hidden; }
+        header { padding: 16px 18px; border-bottom: 1px solid #24354f; background: linear-gradient(135deg, #08111d, #0f2135 55%, #173149); }
+        .eyebrow { font-size: 12px; color: #2dd4bf; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+        h1 { margin: 4px 0 0; font-size: 20px; }
+        .meta { margin-top: 4px; color: #94a3b8; font-size: 13px; }
+        .layout { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 92px); }
+        aside { border-right: 1px solid #24354f; background: #0d1726; padding: 16px; overflow-y: auto; min-height: 0; }
+        main { padding: 16px 18px 20px; display: grid; gap: 12px; align-content: start; overflow-y: auto; min-height: 0; }
+        .sidebar-title { font-size: 12px; color: #2dd4bf; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+        .sidebar-copy { margin-top: 6px; color: #94a3b8; font-size: 13px; line-height: 1.5; }
+        .script-list { margin-top: 14px; display: grid; gap: 8px; }
+        .script-button, .danger-button { width: 100%; text-align: left; border-radius: 12px; padding: 10px 12px; cursor: pointer; font: inherit; }
+        .script-button { border: 1px solid #2dd4bf; background: rgba(45,212,191,0.12); color: #dffcf8; }
+        .danger-button { border: 1px solid #f87171; background: rgba(248,113,113,0.12); color: #fecaca; margin-top: 12px; }
+        .script-button:disabled, .danger-button:disabled { opacity: 0.55; cursor: default; }
+        .entry { border: 1px solid #24354f; border-radius: 14px; background: #101d30; padding: 14px; }
+        .entry.failed { border-color: #f87171; }
+        .entry-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+        .title { font-weight: 700; }
+        .status { font-size: 13px; font-weight: 700; color: #34d399; }
+        .failed .status { color: #f87171; }
+        .interpreted { margin-top: 10px; white-space: pre-wrap; line-height: 1.6; }
+        pre { margin: 10px 0 0; padding: 10px 12px; background: #0a1424; border: 1px solid #24354f; border-radius: 12px; color: #e5edf8; white-space: pre-wrap; overflow-x: auto; }
+        .raw { color: #94a3b8; }
+        .artifact { margin-top: 10px; color: #2dd4bf; font-size: 13px; }
+        .error { margin-top: 10px; color: #f87171; white-space: pre-wrap; font-size: 13px; }
+        .empty { color: #94a3b8; }
+        .preview { margin-top: 12px; border: 1px solid #24354f; border-radius: 12px; background: #ffffff; padding: 10px; overflow: auto; }
+        .preview img, .preview svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+        .wave-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+        .wave-toolbar button { border: 1px solid #24354f; background: #ffffff; color: #0f172a; border-radius: 8px; padding: 6px 10px; cursor: pointer; font: inherit; }
+        .wave-toolbar button.active { border-color: #0f766e; background: rgba(15,118,110,0.12); color: #0f766e; font-weight: 700; }
+        .wave-toolbar span { color: #475569; font-size: 12px; }
+        .wave-chart-shell { display: grid; gap: 10px; }
+        .wave-chart-svg { display: block; width: 100%; height: 360px; background: #ffffff; border-radius: 8px; touch-action: none; user-select: none; }
+        .wave-slider { width: 100%; }
+        .wave-cursor-list, .wave-math-list { display: grid; gap: 8px; }
+        .wave-card { border: 1px solid #dbe7f3; border-radius: 10px; padding: 8px 10px; background: #f8fbff; color: #0f172a; }
+        .wave-card button { border: 1px solid #dc2626; background: transparent; color: #dc2626; border-radius: 8px; padding: 4px 8px; cursor: pointer; font: inherit; }
+      </style>
+    </head>
+    <body>
+      <header>
+        <div class="eyebrow">Instrument Session</div>
+        <h1 id="session-title">Instrument Session</h1>
+        <div class="meta" id="session-meta"></div>
+      </header>
+      <div class="layout">
+        <aside>
+          <div class="sidebar-title">Scripts</div>
+          <div class="sidebar-copy" id="sidebar-copy">Start a session and run the instrument scripts you need for this test.</div>
+          <div class="script-list" id="script-list"></div>
+          <button class="danger-button" id="finish-session" type="button" style="display:none;">Finish Session</button>
+        </aside>
+        <main id="entry-list"></main>
+      </div>
+      <script>
+        function escapeHtml(value) {
+          return String(value ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/\\"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+        }
+        function renderEntry(entry) {
+          let preview = "";
+          if (entry.preview) {
+            if (entry.preview.kind === "svg") {
+              preview = '<div class="preview">' + (entry.preview.svg || "") + '</div>';
+            } else if (entry.preview.kind === "image") {
+              preview = '<div class="preview"><img alt="preview" src="' + escapeHtml(entry.preview.src || "") + '" /></div>';
+            } else if (entry.preview.kind === "waveform") {
+              preview = '<div class="preview"><div class="wave-chart-shell" data-waveform-entry="' + escapeHtml(entry.id) + '"></div></div>';
+            }
+          }
+          return '<section class="entry ' + (entry.ok ? "ok" : "failed") + '">' +
+            '<div class="entry-head"><div><div class="title">' + escapeHtml(entry.title) + '</div><div class="meta">' + escapeHtml(entry.deviceLabel || "") + (entry.deviceLabel ? ' · ' : '') + escapeHtml(entry.startedAtLabel || "") + '</div></div><div class="status">' + (entry.ok ? "OK" : "Failed") + '</div></div>' +
+            (entry.commandText ? '<pre>' + escapeHtml(entry.commandText) + '</pre>' : '') +
+            (entry.interpretedText ? '<div class="interpreted">' + escapeHtml(entry.interpretedText) + '</div>' : '') +
+            preview +
+            (entry.responseText && entry.responseText !== entry.interpretedText ? '<pre class="raw">' + escapeHtml(entry.responseText) + '</pre>' : '') +
+            (entry.artifactLabel ? '<div class="artifact">' + escapeHtml(entry.artifactLabel) + '</div>' : '') +
+            (entry.error ? '<div class="error">' + escapeHtml(entry.error) + '</div>' : '') +
+          '</section>';
+        }
+        function engineeringSample(value) {
+          return typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "0.00";
+        }
+        function renderWaveformChart(host, entry) {
+          const samples = Array.isArray(entry.preview && entry.preview.samples) ? entry.preview.samples.slice() : [];
+          if (samples.length < 2) {
+            host.innerHTML = '<div class="empty">Waveform preview did not contain enough samples.</div>';
+            return;
+          }
+          const stateStore = window.__waveformPreviewState || (window.__waveformPreviewState = {});
+          const state = stateStore[entry.id] || (stateStore[entry.id] = {
+            visibleRange: Array.isArray(entry.preview && entry.preview.visibleRange) && entry.preview.visibleRange.length >= 2
+              ? [Number(entry.preview.visibleRange[0]), Number(entry.preview.visibleRange[1])]
+              : [0, samples.length],
+            yRange: Array.isArray(entry.preview && entry.preview.yRange) && entry.preview.yRange.length >= 2
+              ? [Number(entry.preview.yRange[0]), Number(entry.preview.yRange[1])]
+              : [Math.min.apply(null, samples), Math.max.apply(null, samples)],
+            hoverIndex: null,
+            cursorMode: false,
+            cursors: Array.isArray(entry.preview && entry.preview.cursors) ? entry.preview.cursors.slice() : [],
+            mathRows: Array.isArray(entry.preview && entry.preview.mathRows) ? entry.preview.mathRows.slice() : [],
+          });
+          const cursorColors = ["#ef4444", "#2563eb", "#16a34a", "#d97706", "#7c3aed", "#db2777"];
+          const clampRange = function() {
+            const start = Math.max(0, Math.min(samples.length - 2, Math.floor(state.visibleRange[0])));
+            const end = Math.max(start + 2, Math.min(samples.length, Math.ceil(state.visibleRange[1])));
+            return [start, end];
+          };
+          const render = function() {
+            const range = clampRange();
+            const visible = samples.slice(range[0], range[1]);
+            const sampled = visible.length > 1500 ? visible.filter(function(_, index) { return index % Math.ceil(visible.length / 1500) === 0 || index === visible.length - 1; }) : visible;
+            const yMin = Math.min(state.yRange[0], state.yRange[1]);
+            const yMax = Math.max(state.yRange[0], state.yRange[1]);
+            const ySpan = Math.max(1e-6, yMax - yMin);
+            const xSpan = Math.max(1, range[1] - range[0] - 1);
+            const plotLeft = 64, plotTop = 12, plotWidth = 916, plotHeight = 320, plotRight = plotLeft + plotWidth, plotBottom = plotTop + plotHeight;
+            const points = sampled.map(function(sample, idx) {
+              const sourceIndex = range[0] + Math.round((idx / Math.max(1, sampled.length - 1)) * xSpan);
+              const x = plotLeft + (((sourceIndex - range[0]) / xSpan) * plotWidth);
+              const y = plotBottom - (((sample - yMin) / ySpan) * plotHeight);
+              return (idx === 0 ? "M" : "L") + " " + x.toFixed(2) + " " + y.toFixed(2);
+            }).join(" ");
+            const cursorDetails = state.cursors.map(function(cursor) {
+              const idx = Math.max(0, Math.min(samples.length - 1, Math.round(cursor.index)));
+              return { id: cursor.id, label: cursor.label, color: cursor.color, index: idx, sample: samples[idx] ?? 0 };
+            });
+            const mathRows = state.mathRows.map(function(row) {
+              const a = cursorDetails.find(function(cursor) { return cursor.id === row.a; });
+              const b = cursorDetails.find(function(cursor) { return cursor.id === row.b; });
+              if (!a || !b) return { id: row.id, label: "Select two cursors." };
+              const dx = b.index - a.index;
+              const dy = b.sample - a.sample;
+              const dtSeconds = (entry.preview && typeof entry.preview.intervalSeconds === "number") ? dx * entry.preview.intervalSeconds : null;
+              if (row.op === "dx") return { id: row.id, label: (dtSeconds === null ? dx + " samples" : "Dt " + (dtSeconds * 1e3).toFixed(3) + " ms") + " / Dv " + engineeringSample(dy) + " V" };
+              if (row.op === "dy") return { id: row.id, label: "Dt " + (dtSeconds === null ? (dx + " samples") : ((dtSeconds * 1e3).toFixed(3) + " ms")) + " / Dv " + engineeringSample(dy) + " V" };
+              if (row.op === "abs-dy") return { id: row.id, label: "Dt " + (dtSeconds === null ? (dx + " samples") : ((dtSeconds * 1e3).toFixed(3) + " ms")) + " / |Dv| " + engineeringSample(Math.abs(dy)) + " V" };
+              return { id: row.id, label: "Dt " + (dtSeconds === null ? (dx + " samples") : ((dtSeconds * 1e3).toFixed(3) + " ms")) + " / dV/dt " + (dy / Math.max(dtSeconds === null ? 1 : 1e-12, Math.abs(dtSeconds ?? dx))).toFixed(4) + (dtSeconds === null ? " V/sample" : " V/s") };
+            });
+            host.innerHTML =
+              '<div class="wave-toolbar">' +
+                '<button type="button" data-action="full">Full View</button>' +
+                '<button type="button" data-action="cursor" class="' + (state.cursorMode ? 'active' : '') + '">' + (state.cursorMode ? 'Click Chart To Place Cursor' : 'Add Cursors') + '</button>' +
+                '<button type="button" data-action="math"' + (cursorDetails.length < 2 ? ' disabled' : '') + '>Add Math</button>' +
+                '<span>' + samples.length.toLocaleString() + ' samples / ' + ((entry.preview && typeof entry.preview.intervalSeconds === "number") ? (((range[1] - range[0]) * entry.preview.intervalSeconds * 1e3).toFixed(3) + ' ms visible') : ((range[1] - range[0]) + ' visible')) + '</span>' +
+              '</div>' +
+              '<svg class="wave-chart-svg" viewBox="0 0 1000 360" data-action="chart">' +
+                '<rect x="0" y="0" width="1000" height="360" fill="#ffffff"></rect>' +
+                '<rect x="' + plotLeft + '" y="' + plotTop + '" width="' + plotWidth + '" height="' + plotHeight + '" fill="#ffffff" stroke="#d9e3ef" stroke-width="1"></rect>' +
+                Array.from({ length: 11 }, function(_, index) {
+                  const fraction = index / 10;
+                  const y = plotBottom - (plotHeight * fraction);
+                  const value = yMin + (ySpan * fraction);
+                  return '<line x1="' + plotLeft + '" x2="' + plotRight + '" y1="' + y + '" y2="' + y + '" stroke="#c9d6e4" stroke-width="1"></line>' +
+                    '<text x="6" y="' + Math.max(plotTop + 10, Math.min(plotBottom, y - 4)) + '" fill="#5b6b7f" font-size="11">' + engineeringSample(value) + '</text>';
+                }).join('') +
+                Array.from({ length: 11 }, function(_, index) {
+                  const fraction = index / 10;
+                  const x = plotLeft + (plotWidth * fraction);
+                  const value = (entry.preview && typeof entry.preview.startTimeSeconds === "number" && typeof entry.preview.intervalSeconds === "number")
+                    ? (entry.preview.startTimeSeconds + ((range[0] + (xSpan * fraction)) * entry.preview.intervalSeconds))
+                    : Math.round(range[0] + (xSpan * fraction));
+                  return '<line x1="' + x + '" x2="' + x + '" y1="' + plotTop + '" y2="' + plotBottom + '" stroke="#d4deea" stroke-width="1"></line>' +
+                    '<text x="' + Math.max(plotLeft, Math.min(plotRight - 72, x + 4)) + '" y="352" fill="#5b6b7f" font-size="11">' + (typeof value === "number" && Math.abs(value) < 1 ? (value * 1e3).toFixed(3) + ' ms' : value) + '</text>';
+                }).join('') +
+                '<path d="' + points + '" fill="none" stroke="#0f766e" stroke-width="2"></path>' +
+                cursorDetails.map(function(cursor) {
+                  const x = plotLeft + (((cursor.index - range[0]) / xSpan) * plotWidth);
+                  const y = plotBottom - (((cursor.sample - yMin) / ySpan) * plotHeight);
+                  return '<line x1="' + x + '" x2="' + x + '" y1="' + plotTop + '" y2="' + plotBottom + '" stroke="' + cursor.color + '" stroke-dasharray="8 6" stroke-width="2"></line>' +
+                    '<line x1="' + plotLeft + '" x2="' + plotRight + '" y1="' + y + '" y2="' + y + '" stroke="' + cursor.color + '" stroke-dasharray="8 6" stroke-width="2" opacity="0.9"></line>' +
+                    '<circle cx="' + x + '" cy="' + y + '" r="4.5" fill="' + cursor.color + '"></circle>';
+                }).join('') +
+              '</svg>' +
+              '<input class="wave-slider" type="range" min="0" max="' + Math.max(0, samples.length - (range[1] - range[0])) + '" step="1" value="' + Math.min(Math.max(0, samples.length - (range[1] - range[0])), range[0]) + '" data-action="xslider" />' +
+              (cursorDetails.length ? '<div class="wave-cursor-list">' + cursorDetails.map(function(cursor) {
+                return '<div class="wave-card"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center;"><div><strong>' + cursor.label + '</strong> <span style="color:#475569;font-size:12px;">' + (((entry.preview && typeof entry.preview.startTimeSeconds === "number" && typeof entry.preview.intervalSeconds === "number") ? (((entry.preview.startTimeSeconds + (cursor.index * entry.preview.intervalSeconds)) * 1e3).toFixed(3) + ' ms') : ('index ' + cursor.index)) + ' · ' + engineeringSample(cursor.sample) + ' V') + '</span></div><button type="button" data-remove-cursor="' + cursor.id + '">Remove</button></div></div>';
+              }).join('') + '</div>' : '') +
+              (mathRows.length ? '<div class="wave-math-list">' + mathRows.map(function(row) {
+                return '<div class="wave-card">' + row.label + '</div>';
+              }).join('') + '</div>' : '');
+            const chart = host.querySelector('[data-action="chart"]');
+            const slider = host.querySelector('[data-action="xslider"]');
+            const full = host.querySelector('[data-action="full"]');
+            const cursor = host.querySelector('[data-action="cursor"]');
+            const math = host.querySelector('[data-action="math"]');
+            let dragState = null;
+            full.onclick = function() {
+              state.visibleRange = [0, samples.length];
+              state.yRange = [Math.min.apply(null, samples), Math.max.apply(null, samples)];
+              render();
+            };
+            cursor.onclick = function() {
+              state.cursorMode = !state.cursorMode;
+              render();
+            };
+            if (math) {
+              math.onclick = function() {
+                if (cursorDetails.length < 2) return;
+                state.mathRows.push({ id: 'math-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6), op: 'dx', a: cursorDetails[0].id, b: cursorDetails[1].id });
+                render();
+              };
+            }
+            slider.oninput = function() {
+              const start = Number(slider.value);
+              const span = range[1] - range[0];
+              state.visibleRange = [start, Math.min(samples.length, start + span)];
+              render();
+            };
+            host.querySelectorAll('[data-remove-cursor]').forEach(function(button) {
+              button.onclick = function() {
+                const id = button.getAttribute('data-remove-cursor');
+                state.cursors = state.cursors.filter(function(cursorRow) { return cursorRow.id !== id; });
+                render();
+              };
+            });
+            if (window.opener && window.opener.__testManagerInstrumentSessionApi && window.opener.__testManagerInstrumentSessionApi.updateEntryPreview) {
+              window.opener.__testManagerInstrumentSessionApi.updateEntryPreview(entry.id, {
+                cursors: state.cursors,
+                mathRows: state.mathRows,
+                visibleRange: [state.visibleRange[0], state.visibleRange[1]],
+                yRange: [state.yRange[0], state.yRange[1]],
+              });
+            }
+            const updateIndexFromClientX = function(clientX, bounds) {
+              const plotClientLeft = bounds.left + ((plotLeft / 1000) * bounds.width);
+              const plotClientWidth = (plotWidth / 1000) * bounds.width;
+              const fraction = Math.max(0, Math.min(1, (clientX - plotClientLeft) / Math.max(1, plotClientWidth)));
+              return range[0] + (fraction * xSpan);
+            };
+            chart.onwheel = function(event) {
+              event.preventDefault();
+              const bounds = chart.getBoundingClientRect();
+              const plotClientLeft = bounds.left + ((plotLeft / 1000) * bounds.width);
+              const plotClientWidth = (plotWidth / 1000) * bounds.width;
+              const fraction = Math.max(0, Math.min(1, (event.clientX - plotClientLeft) / Math.max(1, plotClientWidth)));
+              const currentSpan = range[1] - range[0];
+              const nextSpan = Math.max(50, Math.min(samples.length, Math.round(currentSpan * (event.deltaY > 0 ? 1.2 : 0.8))));
+              const center = range[0] + (currentSpan * fraction);
+              let nextStart = center - (nextSpan * fraction);
+              let nextEnd = nextStart + nextSpan;
+              if (nextStart < 0) { nextStart = 0; nextEnd = nextSpan; }
+              if (nextEnd > samples.length) { nextEnd = samples.length; nextStart = Math.max(0, nextEnd - nextSpan); }
+              state.visibleRange = [nextStart, nextEnd];
+              render();
+            };
+            chart.onpointerdown = function(event) {
+              event.preventDefault();
+              const bounds = chart.getBoundingClientRect();
+              const index = updateIndexFromClientX(event.clientX, bounds);
+              if (state.cursorMode) {
+                const color = cursorColors[state.cursors.length % cursorColors.length] || '#ef4444';
+                state.cursors.push({ id: 'cursor-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6), label: 'C' + (state.cursors.length + 1), color: color, index: Math.round(index) });
+                state.cursorMode = false;
+                render();
+                return;
+              }
+              dragState = { startX: event.clientX, startRange: [range[0], range[1]] };
+              chart.setPointerCapture(event.pointerId);
+            };
+            chart.onpointermove = function(event) {
+              if (!dragState) return;
+              const bounds = chart.getBoundingClientRect();
+              const plotClientWidth = (plotWidth / 1000) * bounds.width;
+              const pixelDeltaX = event.clientX - dragState.startX;
+              const pointsPerPixel = (dragState.startRange[1] - dragState.startRange[0]) / Math.max(1, plotClientWidth);
+              const pointDelta = pixelDeltaX * pointsPerPixel;
+              let nextStart = dragState.startRange[0] - pointDelta;
+              let nextEnd = dragState.startRange[1] - pointDelta;
+              const span = nextEnd - nextStart;
+              if (nextStart < 0) { nextStart = 0; nextEnd = span; }
+              if (nextEnd > samples.length) { nextEnd = samples.length; nextStart = Math.max(0, nextEnd - span); }
+              state.visibleRange = [nextStart, nextEnd];
+              render();
+            };
+            chart.onpointerup = function(event) {
+              dragState = null;
+              try { chart.releasePointerCapture(event.pointerId); } catch (_) {}
+            };
+            chart.onpointerleave = function() { dragState = null; };
+          };
+          render();
+        }
+        function hydrateWaveformCharts(entries) {
+          entries.filter(function(entry) { return entry.preview && entry.preview.kind === "waveform"; }).forEach(function(entry) {
+            const host = document.querySelector('[data-waveform-entry="' + CSS.escape(entry.id) + '"]');
+            if (host) renderWaveformChart(host, entry);
+          });
+        }
+        window.__setInstrumentSessionState = function(state) {
+          document.title = state.title || "Instrument Session";
+          document.getElementById("session-title").textContent = state.title || "Instrument Session";
+          document.getElementById("session-meta").textContent = state.meta || "";
+          document.getElementById("sidebar-copy").textContent = state.sidebarCopy || "";
+          const list = document.getElementById("script-list");
+          list.innerHTML = (state.scripts || []).map(function(script) {
+            const disabled = state.readOnly || state.runningScriptId;
+            return '<button class="script-button" type="button" data-script-id="' + escapeHtml(script.id) + '"' + (disabled ? ' disabled' : '') + '>' + escapeHtml(script.title) + '</button>';
+          }).join("") || '<div class="empty">No scripts are available for this session.</div>';
+          Array.from(list.querySelectorAll("[data-script-id]")).forEach(function(node) {
+            node.addEventListener("click", function() {
+              if (window.opener && window.opener.__testManagerInstrumentSessionApi) {
+                window.opener.__testManagerInstrumentSessionApi.runScript(node.getAttribute("data-script-id"));
+              }
+            });
+          });
+          const finish = document.getElementById("finish-session");
+          finish.style.display = state.readOnly ? "none" : "block";
+          finish.disabled = Boolean(state.runningScriptId);
+          finish.onclick = function() {
+            if (window.opener && window.opener.__testManagerInstrumentSessionApi) {
+              window.opener.__testManagerInstrumentSessionApi.finishSession();
+            }
+          };
+          const entries = document.getElementById("entry-list");
+          entries.innerHTML = (state.entries || []).length ? state.entries.map(renderEntry).join("") : '<div class="empty">No command activity recorded yet.</div>';
+          hydrateWaveformCharts(state.entries || []);
+        };
+      </script>
+    </body>
+  </html>`;
+}
+
+function buildInstrumentSessionWindowState(session: InstrumentSessionRecord, scripts: InstrumentScriptSpec[], runningScriptId: string | null, readOnly: boolean) {
+  return {
+    title: session.scriptTitle || "Instrument Session",
+    meta: `${session.testTitle} · ${formatDate(session.startedAt)} · ${humanize(session.status)}`,
+    sidebarCopy: readOnly
+      ? "Saved session view."
+      : "Use the scripts on the left to execute captures and configuration steps for this active session.",
+    scripts: scripts.map((script) => ({ id: script.id, title: script.title })),
+    readOnly,
+    runningScriptId,
+    entries: session.entries.map((entry) => ({
+      id: entry.id,
+      title: entry.title,
+      deviceLabel: entry.deviceLabel ?? "",
+      startedAtLabel: formatDate(entry.startedAt),
+      commandText: entry.commandText ?? "",
+      interpretedText: entry.interpretedText ?? "",
+      responseText: entry.responseText ?? "",
+      artifactLabel: entry.artifact ? `Saved artifact: ${entry.artifact.name} (${formatBytes(entry.artifact.sizeBytes)})` : "",
+      error: entry.error ?? "",
+      ok: entry.ok,
+      preview: entry.preview,
+    })),
+  };
 }
 
 function markdownArtifactLink(label: string, href: string): string {
@@ -1574,6 +2845,14 @@ function generateReportPages(
       summary.push("");
     }
   }
+  if ((run.instrumentSessions?.length ?? 0) > 0) {
+    summary.push("## Instrument Sessions");
+    summary.push("");
+    for (const session of run.instrumentSessions ?? []) {
+      summary.push(`- ${escapeMarkdownCell(session.scriptTitle)} · ${escapeMarkdownCell(session.testId)} · ${escapeMarkdownCell(formatDate(session.startedAt))} · ${escapeMarkdownCell(session.status)}`);
+    }
+    summary.push("");
+  }
   if (definition.programAssets.length > 0) {
     summary.push("## Program Overview");
     summary.push("");
@@ -1611,6 +2890,41 @@ function generateReportPages(
       detail.push("");
       detail.push(test.preTestGuidance.trim());
       detail.push("");
+    }
+    const testSessions = sessionsForTest(run, test.id);
+    if (testSessions.length > 0) {
+      detail.push("## Instrument Sessions");
+      detail.push("");
+      for (const session of testSessions) {
+        detail.push(`### ${escapeMarkdownCell(session.scriptTitle)}`);
+        detail.push("");
+        detail.push(`- Started: ${escapeMarkdownCell(formatDate(session.startedAt))}`);
+        detail.push(`- Status: ${escapeMarkdownCell(session.status)}`);
+        detail.push(`- Entries: ${session.entries.length}`);
+        detail.push("");
+        for (const entry of session.entries) {
+          detail.push(`#### ${escapeMarkdownCell(entry.title)}`);
+          detail.push("");
+          if (entry.commandText) {
+            detail.push("```text");
+            detail.push(entry.commandText);
+            detail.push("```");
+            detail.push("");
+          }
+          if (isMeaningful(entry.interpretedText)) {
+            detail.push(entry.interpretedText?.trim() ?? "");
+            detail.push("");
+          }
+          if (entry.artifact) {
+            detail.push(`- Artifact: ${markdownArtifactLink(entry.artifact.name, artifactHref({ test, fieldId: null, artifact: entry.artifact }))}`);
+            detail.push("");
+          }
+          if (entry.error) {
+            detail.push(`- Error: ${escapeMarkdownCell(entry.error)}`);
+            detail.push("");
+          }
+        }
+      }
     }
     if (test.preTestAssets.length > 0) {
       detail.push("## Diagrams and Pre-Test Assets");
@@ -2010,6 +3324,207 @@ function EquipmentRuntimePanel({ specs }: { specs: EquipmentRuntimeSpec[] }) {
   );
 }
 
+function InstrumentScopePanel({
+  scope,
+  configs,
+}: {
+  scope: InstrumentScopeDefinition;
+  configs: Record<string, InstrumentAddressConfig>;
+}) {
+  const bindings = Object.values(scope.bindings);
+  const scripts = Object.values(scope.scripts);
+  if (bindings.length === 0 && scripts.length === 0) return null;
+  return (
+    <section style={cardStyle()}>
+      <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Spec Instruments</div>
+      {bindings.length > 0 ? (
+        <div style={{ marginTop: "0.85rem", display: "grid", gap: "0.8rem" }}>
+          {bindings.map((binding) => {
+            const config = configs[binding.id];
+            return (
+              <div key={binding.id} style={{ border: `1px solid ${C.border}`, borderRadius: 14, background: C.panel2, padding: "0.85rem" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
+                  <div>
+                    <div style={{ fontWeight: 700 }}>{binding.label}</div>
+                    <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.8rem" }}>{binding.deviceType || "Unknown device type"} · {binding.protocol.toUpperCase()}</div>
+                  </div>
+                  <div style={{ color: config?.host ? C.ok : C.warning, fontSize: "0.8rem", fontWeight: 700 }}>
+                    {config?.host ? `${config.host}:${config.port || String(getDefaultInstrumentPort(binding))}` : "Address not configured"}
+                  </div>
+                </div>
+                {binding.notes ? <div style={{ marginTop: "0.45rem", color: C.text, fontSize: "0.84rem", lineHeight: 1.55 }}>{binding.notes}</div> : null}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+      {scripts.length > 0 ? (
+        <div style={{ marginTop: "0.9rem", color: C.muted, fontSize: "0.84rem", lineHeight: 1.6 }}>
+          Scripts available: {scripts.map((script) => script.title).join(", ")}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function InstrumentSessionModal({
+  session,
+  onClose,
+}: {
+  session: InstrumentSessionRecord | null;
+  onClose: () => void;
+}) {
+  if (!session) return null;
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(3, 7, 18, 0.72)", display: "flex", alignItems: "center", justifyContent: "center", padding: "1.25rem", zIndex: 50 }}
+    >
+      <div
+        onClick={(event) => event.stopPropagation()}
+        style={{ width: "min(980px, 100%)", maxHeight: "88vh", overflow: "auto", border: `1px solid ${C.border}`, borderRadius: 18, background: C.panel, boxShadow: "0 20px 50px rgba(0,0,0,0.35)" }}
+      >
+        <header style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, background: C.header, display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem" }}>
+          <div>
+            <div style={{ fontSize: "0.74rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Instrument Session</div>
+            <div style={{ marginTop: "0.18rem", color: C.text, fontSize: "1.02rem", fontWeight: 700 }}>{session.scriptTitle}</div>
+            <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.82rem" }}>{session.testTitle} · {formatDate(session.startedAt)} · {humanize(session.status)}</div>
+          </div>
+          <button onClick={onClose} style={buttonStyle()}>Close</button>
+        </header>
+        <div style={{ padding: "1rem 1.1rem 1.15rem", display: "grid", gap: "0.8rem" }}>
+          {session.entries.length === 0 ? (
+            <div style={{ color: C.muted }}>No command activity recorded yet.</div>
+          ) : session.entries.map((entry) => (
+            <section key={entry.id} style={{ border: `1px solid ${entry.ok ? C.border : C.danger}`, borderRadius: 14, background: C.panel2, padding: "0.9rem" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontWeight: 700 }}>{entry.title}</div>
+                  <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.8rem" }}>{entry.deviceLabel ? `${entry.deviceLabel} · ` : ""}{formatDate(entry.startedAt)}</div>
+                </div>
+                <div style={{ color: entry.ok ? C.ok : C.danger, fontWeight: 700, fontSize: "0.8rem" }}>{entry.ok ? "OK" : "Failed"}</div>
+              </div>
+              {entry.commandText ? (
+                <pre style={{ margin: "0.65rem 0 0", padding: "0.7rem 0.8rem", background: C.input, border: `1px solid ${C.border}`, borderRadius: 12, color: C.text, fontSize: "0.82rem", whiteSpace: "pre-wrap", overflowX: "auto" }}>{entry.commandText}</pre>
+              ) : null}
+              {entry.interpretedText ? (
+                <div style={{ marginTop: "0.65rem", color: C.text, fontSize: "0.84rem", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{entry.interpretedText}</div>
+              ) : null}
+              {entry.responseText && entry.responseText !== entry.interpretedText ? (
+                <pre style={{ margin: "0.65rem 0 0", padding: "0.7rem 0.8rem", background: C.input, border: `1px solid ${C.border}`, borderRadius: 12, color: C.muted, fontSize: "0.8rem", whiteSpace: "pre-wrap", overflowX: "auto" }}>{entry.responseText}</pre>
+              ) : null}
+              {entry.artifact ? (
+                <div style={{ marginTop: "0.6rem", color: C.accent, fontSize: "0.82rem" }}>Saved artifact: {entry.artifact.name} ({formatBytes(entry.artifact.sizeBytes)})</div>
+              ) : null}
+              {entry.error ? (
+                <div style={{ marginTop: "0.6rem", color: C.danger, fontSize: "0.82rem", whiteSpace: "pre-wrap" }}>{entry.error}</div>
+              ) : null}
+            </section>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InstrumentConfigDialog({
+  open,
+  onClose,
+  entries,
+  configs,
+  onChange,
+}: {
+  open: boolean;
+  onClose: () => void;
+  entries: ResolvedInstrumentConfigEntry[];
+  configs: Record<string, InstrumentAddressConfig>;
+  onChange: (id: string, patch: Partial<InstrumentAddressConfig>) => void;
+}) {
+  if (!open) return null;
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(3, 7, 18, 0.72)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "1.25rem",
+        zIndex: 40,
+      }}
+    >
+      <div
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          width: "min(980px, 100%)",
+          maxHeight: "88vh",
+          overflow: "auto",
+          border: `1px solid ${C.border}`,
+          borderRadius: 18,
+          background: C.panel,
+          boxShadow: "0 20px 50px rgba(0,0,0,0.35)",
+        }}
+      >
+        <header style={{ padding: "1rem 1.1rem", borderBottom: `1px solid ${C.border}`, background: C.header, display: "flex", alignItems: "center", justifyContent: "space-between", gap: "1rem" }}>
+          <div>
+            <div style={{ fontSize: "0.74rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Instruments</div>
+            <div style={{ marginTop: "0.2rem", color: C.text, fontSize: "1.05rem", fontWeight: 700 }}>Local bench configuration</div>
+            <div style={{ marginTop: "0.2rem", color: C.muted, fontSize: "0.84rem" }}>Instrument roles and device types come from the loaded YAML. Only the local address and port are stored here.</div>
+          </div>
+          <button onClick={onClose} style={buttonStyle()}>Close</button>
+        </header>
+        <div style={{ padding: "1rem 1.1rem 1.15rem", display: "grid", gap: "0.9rem" }}>
+          {entries.length === 0 ? (
+            <div style={{ ...cardStyle(), color: C.muted }}>
+              No instruments were declared in the loaded spec yet.
+            </div>
+          ) : entries.map((entry) => {
+            const config = configs[entry.id] ?? { host: "", port: entry.defaultPort ? String(entry.defaultPort) : "" };
+            return (
+              <section key={entry.id} style={{ border: `1px solid ${C.border}`, borderRadius: 16, background: C.panel2, padding: "0.95rem 1rem" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.2fr) minmax(280px, 1fr)", gap: "1rem", alignItems: "start" }}>
+                  <div>
+                    <div style={{ fontSize: "1rem", fontWeight: 700 }}>{entry.label}</div>
+                    <div style={{ marginTop: "0.22rem", color: C.muted, fontSize: "0.82rem" }}>
+                      {entry.deviceType || "Unknown device type"} · {entry.protocol.toUpperCase()} · used in {entry.usageCount} test{entry.usageCount === 1 ? "" : "s"}
+                    </div>
+                    {entry.notes ? <div style={{ marginTop: "0.5rem", color: C.text, fontSize: "0.84rem", lineHeight: 1.55 }}>{entry.notes}</div> : null}
+                    {entry.scriptIds.length > 0 ? (
+                      <div style={{ marginTop: "0.55rem", color: C.muted, fontSize: "0.8rem" }}>
+                        Scripts: {entry.scriptIds.join(", ")}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div style={{ display: "grid", gap: "0.75rem", gridTemplateColumns: "minmax(0, 1fr) 120px" }}>
+                    <label style={labelStyle()}>
+                      IP Address / Host
+                      <DraftTextInput
+                        value={config.host}
+                        onCommit={(nextValue) => onChange(entry.id, { host: nextValue.trim() })}
+                        placeholder="192.168.0.148"
+                      />
+                    </label>
+                    <label style={labelStyle()}>
+                      Port
+                      <DraftTextInput
+                        value={config.port}
+                        onCommit={(nextValue) => onChange(entry.id, { port: nextValue.trim() })}
+                        placeholder={entry.defaultPort ? String(entry.defaultPort) : ""}
+                      />
+                    </label>
+                  </div>
+                </div>
+              </section>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function TestManager(props: ModuleProps) {
   return (
     <TestManagerBoundary>
@@ -2035,20 +3550,65 @@ function TestManagerInner({ config }: ModuleProps) {
   const [error, setError] = useState("");
   const [reportDialogOpen, setReportDialogOpen] = useState(false);
   const [printReportOpen, setPrintReportOpen] = useState(false);
+  const [instrumentDialogOpen, setInstrumentDialogOpen] = useState(false);
+  const [activeInstrumentSession, setActiveInstrumentSession] = useState<InstrumentSessionRecord | null>(null);
+  const [selectedInstrumentSessionId, setSelectedInstrumentSessionId] = useState<string | null>(null);
+  const [runningInstrumentScriptId, setRunningInstrumentScriptId] = useState<string | null>(null);
   const [reportArtifactLinks, setReportArtifactLinks] = useState<Record<string, string>>({});
   const [overviewDragActive, setOverviewDragActive] = useState(false);
   const [pendingOverviewImages, setPendingOverviewImages] = useState<Array<{ id: string; file: File; caption: string }>>([]);
+  const instrumentStorageKey = useMemo(() => buildInstrumentConfigStorageKey(storage.projectId, config.id), [config.id, storage.projectId]);
+  const [instrumentConfigs, setInstrumentConfigs] = useState<Record<string, InstrumentAddressConfig>>({});
+  const instrumentSessionWindowRef = useRef<Window | null>(null);
+  const [instrumentSessionWindowRequestKey, setInstrumentSessionWindowRequestKey] = useState(0);
 
   const resolvedTests = useMemo(() => definition ? buildResolvedTests(definition) : [], [definition]);
+  const instrumentEntries = useMemo(() => collectInstrumentConfigEntries(definition, resolvedTests), [definition, resolvedTests]);
   const testsById = useMemo(() => new Map(resolvedTests.map((test) => [test.id, test])), [resolvedTests]);
   const scalarInputFields = useMemo(() => (definition?.inputFields ?? []).filter((field) => !isArtifactField(field) && field.id !== "operator_notes"), [definition]);
   const artifactInputFields = useMemo(() => (definition?.inputFields ?? []).filter(isArtifactField), [definition]);
   const operatorNotesField = useMemo(() => (definition?.inputFields ?? []).find((field) => field.id === "operator_notes"), [definition]);
+  const activeRun = workspace ? getActiveRun(workspace) : null;
+  const selectedPersistedSession = useMemo(
+    () => activeRun && selectedInstrumentSessionId ? (activeRun.instrumentSessions ?? []).find((session) => session.id === selectedInstrumentSessionId) ?? null : null,
+    [activeRun, selectedInstrumentSessionId],
+  );
+  const visibleInstrumentSession = activeInstrumentSession ?? selectedPersistedSession;
+  const isInstrumentSessionReadOnly = Boolean(!activeInstrumentSession && selectedPersistedSession);
 
   useEffect(() => {
     if (!selectedTestId && resolvedTests[0]) setSelectedTestId(resolvedTests[0].id);
     if (selectedTestId && !testsById.has(selectedTestId) && resolvedTests[0]) setSelectedTestId(resolvedTests[0].id);
   }, [resolvedTests, selectedTestId, testsById]);
+
+  useEffect(() => {
+    let parsed: unknown = null;
+    const raw = safeReadLocalStorage(instrumentStorageKey);
+    if (raw) {
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        parsed = null;
+      }
+    }
+    const stored = normalizeInstrumentAddressConfig(parsed);
+    setInstrumentConfigs(stored);
+  }, [instrumentStorageKey]);
+
+  const updateInstrumentConfig = useCallback((id: string, patch: Partial<InstrumentAddressConfig>) => {
+    setInstrumentConfigs((current) => {
+      const next = {
+        ...current,
+        [id]: {
+          host: patch.host ?? current[id]?.host ?? "",
+          port: patch.port ?? current[id]?.port ?? "",
+        },
+      };
+      safeWriteLocalStorage(instrumentStorageKey, JSON.stringify(next));
+      return next;
+    });
+    setMessage("Instrument addresses saved locally");
+  }, [instrumentStorageKey]);
 
   const loadAll = useCallback(async () => {
     setLoading(true);
@@ -2108,9 +3668,18 @@ function TestManagerInner({ config }: ModuleProps) {
     void persistWorkspace(mutate(workspace), successMessage);
   }, [persistWorkspace, workspace]);
 
-  const activeRun = workspace ? getActiveRun(workspace) : null;
   const selectedTest = selectedTestId ? testsById.get(selectedTestId) ?? null : null;
   const selectedResult = selectedTest && activeRun ? ensureResult(activeRun, selectedTest, user?.email) : null;
+  const bridge = useMemo<BridgeConfig | null>(() => {
+    const defaults = readBridgeDefaults();
+    const url = defaults.url?.trim() || "http://127.0.0.1:4317";
+    return url ? { url } : null;
+  }, []);
+  const topLevelInstrumentScripts = useMemo(() => selectedTest ? getSessionInstrumentScripts(selectedTest.instrumentScope) : [], [selectedTest]);
+  const savedInstrumentSessions = useMemo(
+    () => activeRun && selectedTest ? sessionsForTest(activeRun, selectedTest.id) : [],
+    [activeRun, selectedTest],
+  );
   const activeExcludedIds = useMemo(() => new Set(activeRun?.excludedTestIds ?? []), [activeRun]);
   const includedTests = useMemo(() => resolvedTests.filter((test) => !activeExcludedIds.has(test.id)), [resolvedTests, activeExcludedIds]);
   const staleTestIds = useMemo(() => {
@@ -2197,6 +3766,424 @@ function TestManagerInner({ config }: ModuleProps) {
       };
     }, "Exclusion reason updated");
   }, [activeRun, updateWorkspace, workspace]);
+
+  const saveInstrumentSession = useCallback((session: InstrumentSessionRecord) => {
+    if (!activeRun) return;
+    updateWorkspace((current) => ({
+      ...current,
+      runs: current.runs.map((run) => run.id !== activeRun.id ? run : {
+        ...run,
+        instrumentSessions: [session, ...(run.instrumentSessions ?? []).filter((candidate) => candidate.id !== session.id)],
+        updatedAt: nowIso(),
+      }),
+    }), "Instrument session saved");
+  }, [activeRun, updateWorkspace]);
+
+  const startInstrumentSession = useCallback(() => {
+    if (!selectedTest) return;
+    const session: InstrumentSessionRecord = {
+      id: makeId("instrument-session"),
+      testId: selectedTest.id,
+      testTitle: selectedTest.title,
+      scriptId: "",
+      scriptTitle: `${selectedTest.title} Session`,
+      startedAt: nowIso(),
+      status: "running",
+      entries: [],
+    };
+    setSelectedInstrumentSessionId(null);
+    setActiveInstrumentSession(session);
+  }, [selectedTest]);
+
+  const finishInstrumentSession = useCallback(() => {
+    if (!activeInstrumentSession) return;
+    const completed: InstrumentSessionRecord = {
+      ...activeInstrumentSession,
+      status: activeInstrumentSession.status === "failed" ? "failed" : "completed",
+      completedAt: nowIso(),
+    };
+    saveInstrumentSession(completed);
+    setSelectedInstrumentSessionId(null);
+    setActiveInstrumentSession(null);
+    if (instrumentSessionWindowRef.current && !instrumentSessionWindowRef.current.closed) {
+      instrumentSessionWindowRef.current.close();
+    }
+    instrumentSessionWindowRef.current = null;
+  }, [activeInstrumentSession, saveInstrumentSession]);
+
+  const deleteInstrumentSession = useCallback((sessionId: string) => {
+    if (!activeRun) return;
+    updateWorkspace((current) => ({
+      ...current,
+      runs: current.runs.map((run) => run.id !== activeRun.id ? run : {
+        ...run,
+        instrumentSessions: (run.instrumentSessions ?? []).filter((session) => session.id !== sessionId),
+        updatedAt: nowIso(),
+      }),
+    }), "Instrument session deleted");
+    if (selectedInstrumentSessionId === sessionId) {
+      setSelectedInstrumentSessionId(null);
+      setActiveInstrumentSession(null);
+      if (instrumentSessionWindowRef.current && !instrumentSessionWindowRef.current.closed) {
+        instrumentSessionWindowRef.current.close();
+      }
+      instrumentSessionWindowRef.current = null;
+    }
+  }, [activeRun, selectedInstrumentSessionId, updateWorkspace]);
+
+  const executeInstrumentScript = useCallback(async (scriptId: string) => {
+    if (!selectedTest || !activeRun || !bridge) return;
+    const rootScript = resolveInstrumentExecutionScript(selectedTest.instrumentScope, scriptId);
+    if (!rootScript) {
+      setError(`Unknown instrument script: ${scriptId}`);
+      return;
+    }
+    const missingBindingLabels = collectReferencedBindingIds(selectedTest.instrumentScope, scriptId)
+      .map((bindingId) => selectedTest.instrumentScope.bindings[bindingId])
+      .filter((binding): binding is InstrumentBindingSpec => Boolean(binding))
+      .filter((binding) => !instrumentConfigs[binding.id]?.host?.trim())
+      .map((binding) => binding.label);
+    if (missingBindingLabels.length > 0) {
+      setError(`Set local instrument addresses before running this script: ${missingBindingLabels.join(", ")}`);
+      setInstrumentDialogOpen(true);
+      return;
+    }
+    setRunningInstrumentScriptId(scriptId);
+    setError("");
+    setMessage("");
+    let session: InstrumentSessionRecord = activeInstrumentSession ?? {
+      id: makeId("instrument-session"),
+      testId: selectedTest.id,
+      testTitle: selectedTest.title,
+      scriptId: "",
+      scriptTitle: `${selectedTest.title} Session`,
+      startedAt: nowIso(),
+      status: "running",
+      entries: [],
+    };
+    setActiveInstrumentSession(session);
+    setSelectedInstrumentSessionId(null);
+
+    const appendEntry = (entry: InstrumentSessionEntry) => {
+      session = { ...session, entries: [...session.entries, entry] };
+      setActiveInstrumentSession(session);
+    };
+
+    const uploadSessionArtifact = async (name: string, bytes: Uint8Array, contentType: string): Promise<ArtifactRef> => {
+      const s3 = await getS3Client(storage.bucket);
+      const key = `${storage.basePrefix}/runs/${activeRun.id}/instrument-sessions/${session.id}/${makeId("artifact")}-${name.replace(/[^a-zA-Z0-9._-]+/g, "-")}`;
+      await s3.send(new PutObjectCommand({
+        Bucket: storage.bucket,
+        Key: key,
+        Body: bytes,
+        ContentType: contentType,
+        CacheControl: "no-store",
+      }));
+      return {
+        id: makeId("artifact"),
+        kind: "supporting",
+        name,
+        bucket: storage.bucket,
+        key,
+        contentType,
+        sizeBytes: bytes.byteLength,
+        uploadedAt: nowIso(),
+        uploadedBy: user?.email,
+      };
+    };
+
+    const executeCommandStep = async (scriptTitle: string, step: InstrumentScriptStepSpec) => {
+      const startedAt = nowIso();
+      const binding = step.device ? selectedTest.instrumentScope.bindings[step.device] : undefined;
+      if (!binding) throw new Error(`Instrument binding "${step.device ?? "<missing>"}" is not defined.`);
+      const catalog = selectedTest.instrumentScope.catalogs[binding.deviceType];
+      if (!catalog) throw new Error(`Instrument catalog "${binding.deviceType}" is not defined.`);
+      if (!step.command) throw new Error(`Step "${step.title}" does not define a command.`);
+      const command = catalog.commands[step.command];
+      if (!command) throw new Error(`Command "${step.command}" is not defined for ${binding.deviceType}.`);
+      const config = instrumentConfigs[binding.id];
+      const host = config?.host?.trim();
+      const port = Number(config?.port || binding.defaultPort || catalog.defaultPort || 5025);
+      if (!host) throw new Error(`No local address is configured for "${binding.label}".`);
+      const payload = command.payload;
+      const readMode = command.mode === "scpi" && (command.parser === "binary" || command.parser === "siglent-waveform" || payload.includes("?"))
+        ? "until-timeout"
+        : "none";
+      const result = await callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
+        host,
+        port,
+        command: payload,
+        parser: "text",
+        timeoutMs: command.parser === "binary" || command.parser === "siglent-waveform" ? 15000 : 5000,
+        readMode,
+        quietMs: command.parser === "binary" || command.parser === "siglent-waveform" ? 500 : 250,
+        sendDelayMs: 100,
+      });
+      let interpretedText = result.text?.trim() || (command.parser === "none" ? "Command completed." : "");
+      let artifact: ArtifactRef | undefined;
+      let preview: InstrumentSessionEntry["preview"] | undefined;
+      if (result.bytesBase64 && result.bytesLength && result.bytesLength > 0 && (command.parser === "binary" || command.parser === "siglent-waveform")) {
+        const binary = base64ToBytes(result.bytesBase64);
+        const extension = command.parser === "binary" ? "bmp" : "bin";
+        const contentType = command.parser === "binary" ? "image/bmp" : "application/octet-stream";
+        artifact = await uploadSessionArtifact(`${safeFileSegment(scriptTitle)}-${safeFileSegment(step.title)}.${extension}`, binary, contentType);
+        if (command.parser === "binary") {
+          preview = { kind: "image", src: `data:${contentType};base64,${result.bytesBase64}` };
+        } else {
+          const channel = parseSiglentWaveformChannel(payload);
+          const readText = async (query: string) => {
+            const response = await callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
+              host,
+              port,
+              command: query,
+              parser: "text",
+              timeoutMs: 5000,
+              readMode: "until-timeout",
+              quietMs: 250,
+              sendDelayMs: 100,
+            });
+            return response.text?.trim() || "";
+          };
+          const [voltsPerDivResponse, offsetResponse, timeDivResponse, triggerDelayResponse, sampleRateResponse] = await Promise.all([
+            readText(`${channel}:VDIV?`),
+            readText(`${channel}:OFST?`),
+            readText("TDIV?"),
+            readText("TRDL?"),
+            readText("SARA?"),
+          ]);
+          const sourcePointCount = Math.max(1, Math.round(parseScpiNumber(timeDivResponse) * 14 * parseScpiNumber(sampleRateResponse)));
+          const computedSparsing = Math.max(1, Math.floor((sourcePointCount - 1) / Math.max(1, SIGLENT_WAVEFORM_POINT_LIMIT - 1)));
+          const sparsingCandidates = Array.from(new Set([
+            Math.max(1, computedSparsing - 1),
+            computedSparsing,
+            Math.max(1, computedSparsing + 1),
+            1,
+          ]));
+          let waveformResult = result;
+          let descriptorResult: TcpCommandResult | null = null;
+          let lastWaveformError: Error | null = null;
+          for (const sparsing of sparsingCandidates) {
+            const waveformSetup = `WFSU SP,${sparsing},NP,${SIGLENT_WAVEFORM_POINT_LIMIT},FP,0`;
+            await callBridge<unknown>(bridge, "execute_tcp_command", {
+              host,
+              port,
+              command: waveformSetup,
+              parser: "text",
+              readMode: "none",
+              timeoutMs: 1500,
+              sendDelayMs: 100,
+            });
+            const [descriptorAttempt, waveformAttempt] = await Promise.all([
+              callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
+                host,
+                port,
+                command: `${channel}:WF? DESC`,
+                parser: "text",
+                readMode: "until-timeout",
+                timeoutMs: 8000,
+                quietMs: 1500,
+                sendDelayMs: 100,
+                encoding: "base64",
+              }),
+              callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
+                host,
+                port,
+                command: payload,
+                parser: "text",
+                readMode: "until-timeout",
+                timeoutMs: 15000,
+                quietMs: 1500,
+                sendDelayMs: 100,
+                encoding: "base64",
+              }),
+            ]);
+            try {
+              buildSiglentWaveformPreview({
+                channel,
+                bytesBase64: waveformAttempt.bytesBase64 ?? "",
+                descriptorBytesBase64: descriptorAttempt.bytesBase64,
+                voltsPerDivResponse,
+                offsetResponse,
+                timeDivResponse,
+                triggerDelayResponse,
+                sampleRateResponse,
+              });
+              waveformResult = waveformAttempt;
+              descriptorResult = descriptorAttempt;
+              lastWaveformError = null;
+              break;
+            } catch (error) {
+              lastWaveformError = error instanceof Error ? error : new Error(String(error));
+            }
+          }
+          if (lastWaveformError) throw lastWaveformError;
+          preview = buildSiglentWaveformPreview({
+            channel,
+            bytesBase64: waveformResult.bytesBase64 ?? "",
+            descriptorBytesBase64: descriptorResult?.bytesBase64,
+            voltsPerDivResponse,
+            offsetResponse,
+            timeDivResponse,
+            triggerDelayResponse,
+            sampleRateResponse,
+          });
+        }
+        interpretedText = command.parser === "binary"
+          ? `Captured binary artifact ${artifact.name} (${formatBytes(artifact.sizeBytes)}).`
+          : [
+            `Captured waveform artifact ${artifact.name} (${formatBytes(artifact.sizeBytes)}).`,
+            preview?.kind === "waveform" && preview.channel ? `Channel: ${preview.channel}` : "",
+            preview?.kind === "waveform" && typeof preview.startTimeSeconds === "number" && typeof preview.endTimeSeconds === "number"
+              ? `Window: ${preview.startTimeSeconds.toFixed(6)} s to ${preview.endTimeSeconds.toFixed(6)} s`
+              : "",
+            preview?.kind === "waveform" && typeof preview.minVoltage === "number" && typeof preview.maxVoltage === "number"
+              ? `Range: ${preview.minVoltage.toFixed(3)} V to ${preview.maxVoltage.toFixed(3)} V`
+              : "",
+          ].filter(Boolean).join("\n");
+      }
+      appendEntry({
+        id: makeId("session-entry"),
+        kind: "command",
+        title: step.title,
+        deviceId: binding.id,
+        deviceLabel: binding.label,
+        commandText: payload,
+        responseText: command.parser === "binary" || command.parser === "siglent-waveform"
+          ? undefined
+          : result.text?.trim() || undefined,
+        interpretedText,
+        artifact,
+        preview,
+        startedAt,
+        completedAt: nowIso(),
+        ok: true,
+      });
+    };
+
+    const executeNestedScript = async (nestedScriptId: string, nestedTitle?: string): Promise<void> => {
+      const nested = resolveInstrumentExecutionScript(selectedTest.instrumentScope, nestedScriptId);
+      if (!nested) throw new Error(`Nested script "${nestedScriptId}" is not defined.`);
+      appendEntry({
+        id: makeId("session-entry"),
+        kind: "script",
+        title: nestedTitle || nested.title,
+        interpretedText: `Running script: ${nested.title}`,
+        startedAt: nowIso(),
+        completedAt: nowIso(),
+        ok: true,
+      });
+      for (const step of nested.steps) {
+        if (step.script) {
+          await executeNestedScript(step.script, step.title);
+        } else if (typeof step.waitMs === "number" && step.waitMs > 0) {
+          appendEntry({
+            id: makeId("session-entry"),
+            kind: "note",
+            title: step.title,
+            interpretedText: `Wait ${step.waitMs} ms`,
+            startedAt: nowIso(),
+            completedAt: nowIso(),
+            ok: true,
+          });
+          await new Promise((resolve) => window.setTimeout(resolve, step.waitMs));
+        } else {
+          await executeCommandStep(nested.title, step);
+        }
+      }
+    };
+
+    try {
+      await executeNestedScript(scriptId, rootScript.title);
+      session = { ...session, status: "running" };
+      setActiveInstrumentSession(session);
+    } catch (executionError: unknown) {
+      const messageText = executionError instanceof Error ? executionError.message : String(executionError);
+      appendEntry({
+        id: makeId("session-entry"),
+        kind: "note",
+        title: "Execution failed",
+        interpretedText: messageText,
+        startedAt: nowIso(),
+        completedAt: nowIso(),
+        ok: false,
+        error: messageText,
+      });
+      session = { ...session, status: "failed", completedAt: nowIso() };
+      setError(messageText);
+      setActiveInstrumentSession(session);
+    } finally {
+      setRunningInstrumentScriptId(null);
+    }
+  }, [activeInstrumentSession, activeRun, bridge, getS3Client, instrumentConfigs, selectedTest, storage.basePrefix, storage.bucket, user?.email]);
+
+  useEffect(() => {
+    if (!visibleInstrumentSession) {
+      if (instrumentSessionWindowRef.current && !instrumentSessionWindowRef.current.closed) {
+        instrumentSessionWindowRef.current.close();
+      }
+      instrumentSessionWindowRef.current = null;
+      return;
+    }
+    let popup = instrumentSessionWindowRef.current;
+    if (!popup || popup.closed) {
+      popup = window.open("", "test-manager-instrument-session", "width=1200,height=860");
+      instrumentSessionWindowRef.current = popup;
+    }
+    if (!popup) return;
+    if (!(popup as Window & { __setInstrumentSessionState?: (state: unknown) => void }).__setInstrumentSessionState) {
+      popup.document.open();
+      popup.document.write(renderInstrumentSessionWindowShellHtml());
+      popup.document.close();
+    }
+    const nextState = buildInstrumentSessionWindowState(
+      visibleInstrumentSession,
+      topLevelInstrumentScripts,
+      runningInstrumentScriptId,
+      isInstrumentSessionReadOnly,
+    );
+    (popup as Window & { __setInstrumentSessionState?: (state: unknown) => void }).__setInstrumentSessionState?.(nextState);
+  }, [instrumentSessionWindowRequestKey, isInstrumentSessionReadOnly, runningInstrumentScriptId, topLevelInstrumentScripts, visibleInstrumentSession]);
+
+  useEffect(() => {
+    const host = window as Window & {
+      __testManagerInstrumentSessionApi?: {
+        runScript: (scriptId: string | null) => void;
+        finishSession: () => void;
+        updateEntryPreview: (entryId: string, previewState: Record<string, unknown>) => void;
+      };
+    };
+    host.__testManagerInstrumentSessionApi = {
+      runScript: (scriptId) => {
+        if (!scriptId) return;
+        void executeInstrumentScript(scriptId);
+      },
+      finishSession: () => finishInstrumentSession(),
+      updateEntryPreview: (entryId, previewState) => {
+        setActiveInstrumentSession((current) => {
+          if (!current) return current;
+          let changed = false;
+          const entries = current.entries.map((entry) => {
+            if (entry.id !== entryId || entry.preview?.kind !== "waveform") return entry;
+            changed = true;
+            return {
+              ...entry,
+              preview: {
+                ...entry.preview,
+                cursors: Array.isArray(previewState.cursors) ? previewState.cursors as NonNullable<InstrumentSessionEntry["preview"]>["cursors"] : entry.preview.cursors,
+                mathRows: Array.isArray(previewState.mathRows) ? previewState.mathRows as NonNullable<InstrumentSessionEntry["preview"]>["mathRows"] : entry.preview.mathRows,
+                visibleRange: Array.isArray(previewState.visibleRange) ? previewState.visibleRange as [number, number] : entry.preview.visibleRange,
+                yRange: Array.isArray(previewState.yRange) ? previewState.yRange as [number, number] : entry.preview.yRange,
+              },
+            };
+          });
+          return changed ? { ...current, entries } : current;
+        });
+      },
+    };
+    return () => {
+      delete host.__testManagerInstrumentSessionApi;
+    };
+  }, [executeInstrumentScript, finishInstrumentSession]);
 
   const queueOverviewImages = useCallback((files: FileList | null) => {
     if (!files?.length) return;
@@ -2467,6 +4454,11 @@ function TestManagerInner({ config }: ModuleProps) {
       }
       for (const artifact of result.supportingArtifacts) deduped.set(artifact.id, artifact);
     }
+    for (const session of activeRun.instrumentSessions ?? []) {
+      for (const entry of session.entries) {
+        if (entry.artifact) deduped.set(entry.artifact.id, entry.artifact);
+      }
+    }
     return [...deduped.values()];
   }, [activeRun, includedTests, user?.email]);
 
@@ -2580,6 +4572,25 @@ function TestManagerInner({ config }: ModuleProps) {
         });
       }
     }
+    for (const session of activeRun.instrumentSessions ?? []) {
+      for (const entry of session.entries) {
+        if (!entry.artifact) continue;
+        const archivePath = getInstrumentSessionArchivePath(session, entry.artifact);
+        const bytes = await readOptionalBytes(s3, entry.artifact.bucket, entry.artifact.key);
+        if (bytes) files[archivePath] = bytes;
+        manifest.push({
+          testId: session.testId,
+          fieldId: null,
+          kind: entry.artifact.kind,
+          name: entry.artifact.name,
+          archivePath,
+          bucket: entry.artifact.bucket,
+          key: entry.artifact.key,
+          contentType: entry.artifact.contentType ?? null,
+          sizeBytes: entry.artifact.sizeBytes,
+        });
+      }
+    }
 
     files["evidence/manifest.json"] = JSON.stringify(manifest, null, 2);
     return files;
@@ -2645,6 +4656,7 @@ function TestManagerInner({ config }: ModuleProps) {
           <button onClick={() => setReportDialogOpen(true)} style={buttonStyle()} disabled={!reportPages}>Generate Report</button>
           <button onClick={createRun} style={buttonStyle()}>New Run</button>
           <button onClick={() => void loadAll()} style={buttonStyle()}>Reload</button>
+          <button onClick={() => setInstrumentDialogOpen(true)} style={buttonStyle()} disabled={!definition}>Instruments</button>
           <input
             ref={importRef}
             type="file"
@@ -2701,6 +4713,14 @@ function TestManagerInner({ config }: ModuleProps) {
           {error || (saving ? "Saving..." : message)}
         </div>
       )}
+
+      <InstrumentConfigDialog
+        open={instrumentDialogOpen}
+        onClose={() => setInstrumentDialogOpen(false)}
+        entries={instrumentEntries}
+        configs={instrumentConfigs}
+        onChange={updateInstrumentConfig}
+      />
 
       <main style={{ minHeight: 0, display: "grid", gridTemplateColumns: section === "run" ? "360px 1fr" : "1fr", gap: "1px", background: C.border, overflow: "hidden" }}>
         {section === "run" ? (
@@ -2976,11 +4996,132 @@ function TestManagerInner({ config }: ModuleProps) {
                     </section>
                   ) : null}
 
+                  {(topLevelInstrumentScripts.length > 0 || savedInstrumentSessions.length > 0) ? (
+                    <section style={cardStyle()}>
+                      <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Instrument Sessions</div>
+                      <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.82rem" }}>
+                        Start a session to work with this test's instrument scripts in a separate window, or reopen a saved session to review its results.
+                      </div>
+                      <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.55rem", flexWrap: "wrap" }}>
+                        {activeInstrumentSession ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveInstrumentSession({ ...activeInstrumentSession });
+                                setInstrumentSessionWindowRequestKey((value) => value + 1);
+                              }}
+                              style={buttonStyle("primary")}
+                            >
+                              Open Active Session
+                            </button>
+                            <button type="button" onClick={finishInstrumentSession} disabled={Boolean(runningInstrumentScriptId)} style={buttonStyle("danger")}>
+                              Finish Session
+                            </button>
+                          </>
+                        ) : (
+                          <button type="button" onClick={startInstrumentSession} style={buttonStyle("primary")}>
+                            Start New Session
+                          </button>
+                        )}
+                      </div>
+                      {activeInstrumentSession ? (
+                        <div style={{ marginTop: "0.55rem", color: C.accent, fontSize: "0.82rem" }}>
+                          Active session: {activeInstrumentSession.entries.length} entries recorded.
+                        </div>
+                      ) : null}
+                      {false && topLevelInstrumentScripts.length > 0 ? (
+                        <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.55rem", flexWrap: "wrap" }}>
+                          {topLevelInstrumentScripts.map((script) => (
+                            <button
+                              key={script.id}
+                              type="button"
+                              onClick={() => void executeInstrumentScript(script.id)}
+                              disabled={Boolean(runningInstrumentScriptId)}
+                              style={buttonStyle(script.id === runningInstrumentScriptId ? "primary" : "ghost")}
+                            >
+                              {script.title}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+                      {runningInstrumentScriptId ? (
+                        <div style={{ marginTop: "0.55rem", color: C.accent, fontSize: "0.82rem" }}>Running script session...</div>
+                      ) : null}
+                      <div style={{ marginTop: "0.9rem", display: "grid", gap: "0.55rem" }}>
+                        {savedInstrumentSessions.length === 0 ? (
+                          <div style={{ color: C.muted, fontSize: "0.84rem" }}>No saved instrument sessions for this test yet.</div>
+                        ) : savedInstrumentSessions.map((session) => (
+                          <div key={session.id} style={{ border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.75rem 0.85rem", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem", flexWrap: "wrap" }}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActiveInstrumentSession(null);
+                                setSelectedInstrumentSessionId(session.id);
+                                setInstrumentSessionWindowRequestKey((value) => value + 1);
+                              }}
+                              style={{ ...buttonStyle("ghost"), padding: 0, border: "none", background: "transparent", textAlign: "left", fontWeight: 700 }}
+                            >
+                              {session.scriptTitle}
+                              <span style={{ display: "block", marginTop: "0.22rem", color: C.muted, fontSize: "0.8rem", fontWeight: 500 }}>
+                                {formatDate(session.startedAt)} · {humanize(session.status)} · {session.entries.length} entries
+                              </span>
+                            </button>
+                            <button type="button" onClick={() => deleteInstrumentSession(session.id)} style={{ ...buttonStyle("danger"), padding: "0.35rem 0.55rem" }}>x</button>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  ) : null}
+
                   <section style={cardStyle()}>
-                    <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Runtime Inputs</div>
-                    {selectedTest.equipmentRuntime.length > 0 ? (
-                      <div style={{ marginTop: "0.85rem" }}>
-                        <EquipmentRuntimePanel specs={selectedTest.equipmentRuntime} />
+                      {false ? (
+                        <div style={{ marginBottom: "1rem" }}>
+                          <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Instrument Sessions</div>
+                          <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.55rem", flexWrap: "wrap" }}>
+                            {topLevelInstrumentScripts.map((script) => (
+                              <button
+                                key={script.id}
+                                type="button"
+                                onClick={() => void executeInstrumentScript(script.id)}
+                                disabled={Boolean(runningInstrumentScriptId)}
+                                style={buttonStyle(script.id === runningInstrumentScriptId ? "primary" : "ghost")}
+                              >
+                                {script.title}
+                              </button>
+                            ))}
+                          </div>
+                          {runningInstrumentScriptId ? (
+                            <div style={{ marginTop: "0.55rem", color: C.accent, fontSize: "0.82rem" }}>Running script session...</div>
+                          ) : null}
+                          <div style={{ marginTop: "0.9rem", display: "grid", gap: "0.55rem" }}>
+                            {savedInstrumentSessions.length === 0 ? (
+                              <div style={{ color: C.muted, fontSize: "0.84rem" }}>No saved instrument sessions for this test yet.</div>
+                            ) : savedInstrumentSessions.map((session) => (
+                              <div key={session.id} style={{ border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.75rem 0.85rem", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem", flexWrap: "wrap" }}>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setActiveInstrumentSession(null);
+                                    setSelectedInstrumentSessionId(session.id);
+                                  }}
+                                  style={{ ...buttonStyle("ghost"), padding: 0, border: "none", background: "transparent", textAlign: "left", fontWeight: 700 }}
+                                >
+                                  {session.scriptTitle}
+                                  <span style={{ display: "block", marginTop: "0.22rem", color: C.muted, fontSize: "0.8rem", fontWeight: 500 }}>
+                                    {formatDate(session.startedAt)} · {humanize(session.status)} · {session.entries.length} entries
+                                  </span>
+                                </button>
+                                <button type="button" onClick={() => deleteInstrumentSession(session.id)} style={{ ...buttonStyle("danger"), padding: "0.35rem 0.55rem" }}>x</button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      <div style={{ fontSize: "0.78rem", color: C.accent, textTransform: "uppercase", letterSpacing: "0.08em", fontWeight: 700 }}>Runtime Inputs</div>
+                      {selectedTest.equipmentRuntime.length > 0 ? (
+                        <div style={{ marginTop: "0.85rem" }}>
+                          <EquipmentRuntimePanel specs={selectedTest.equipmentRuntime} />
                       </div>
                     ) : null}
                     <div style={{ marginTop: "0.85rem", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "0.9rem" }}>
@@ -3385,6 +5526,28 @@ export async function onExport(ctx: ExportContext): Promise<void> {
           key: artifact.key,
           contentType: artifact.contentType ?? null,
           sizeBytes: artifact.sizeBytes,
+        });
+      }
+    }
+    for (const session of activeRun.instrumentSessions ?? []) {
+      for (const entry of session.entries) {
+        if (!entry.artifact) continue;
+        const archivePath = getInstrumentSessionArchivePath(session, entry.artifact);
+        const exportPath = `${ctx.projectPrefix}${ctx.config.id}/export/${archivePath}`;
+        const bytes = await readOptionalBytes(ctx.s3Client as S3Client, entry.artifact.bucket, entry.artifact.key);
+        if (bytes) {
+          await writeBytes(ctx.s3Client as S3Client, storage.bucket, exportPath, bytes, entry.artifact.contentType || "application/octet-stream");
+        }
+        manifest.push({
+          testId: session.testId,
+          fieldId: null,
+          kind: entry.artifact.kind,
+          name: entry.artifact.name,
+          archivePath,
+          bucket: entry.artifact.bucket,
+          key: entry.artifact.key,
+          contentType: entry.artifact.contentType ?? null,
+          sizeBytes: entry.artifact.sizeBytes,
         });
       }
     }
