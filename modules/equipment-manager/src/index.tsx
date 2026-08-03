@@ -19,6 +19,7 @@ type CommandInputDef = {
   name: string;
   required: boolean;
   defaultValue?: string;
+  options?: string[];
   description?: string;
 };
 
@@ -291,11 +292,16 @@ function toNumberValue(value: unknown, fallback: number): number {
 
 function normalizeCommandInputDef(value: unknown, index: number): CommandInputDef {
   const record = toRecord(value);
+  const rawOptions = record.options ?? record.values;
+  const options = Array.isArray(rawOptions)
+    ? rawOptions.map((option) => toStringValue(option, "").trim()).filter(Boolean)
+    : [];
   return {
     id: toStringValue(record.id, `input-${index + 1}`),
     name: toStringValue(record.name, `input${index + 1}`),
     required: Boolean(record.required ?? true),
     defaultValue: toStringValue(record.defaultValue ?? record.default_value, "") || undefined,
+    options: options.length ? options : undefined,
     description: toStringValue(record.description, "") || undefined,
   };
 }
@@ -805,9 +811,9 @@ function createDefaultState(): EquipmentManagerState {
           parser: "none",
           timeoutMs: 3000,
           artifactMode: "none",
-          notes: "Validated on the live SDS1202X-E with AUTO and NORM. SINGLE should be armed with ARM.",
+          notes: "Validated on the live SDS1202X-E with AUTO and NORM. SINGLE should be armed with ARM. Rising/falling edge selection is trigger slope, not TRMD trigger mode.",
           inputDefs: [
-            { id: makeId("input"), name: "mode", required: true, defaultValue: "AUTO", description: "Trigger mode such as AUTO or NORM." },
+            { id: makeId("input"), name: "mode", required: true, defaultValue: "AUTO", options: ["AUTO", "NORM", "SINGLE"], description: "TRMD acquisition trigger mode. Edge direction is configured separately as trigger slope." },
           ],
           outputDefs: [],
         },
@@ -1556,6 +1562,26 @@ function getCommandInputValues(command: EquipmentCommand): Record<string, string
     values[def.name] = command.testValues?.[def.name] ?? def.defaultValue ?? "";
   }
   return values;
+}
+
+function commandInputValueControl(args: {
+  inputDef: CommandInputDef;
+  value: string;
+  onChange: (value: string) => void;
+  onBlur?: () => void;
+}) {
+  const options = args.inputDef.options ?? [];
+  if (options.length) {
+    const valueIsKnown = !args.value || options.includes(args.value);
+    return (
+      <select value={valueIsKnown ? args.value : ""} onChange={(event) => args.onChange(event.target.value)} onBlur={args.onBlur} style={inputStyle()}>
+        {!args.inputDef.required ? <option value="">Optional</option> : null}
+        {!valueIsKnown ? <option value="">{args.value}</option> : null}
+        {options.map((option) => <option key={`${args.inputDef.id}-${option}`} value={option}>{option}</option>)}
+      </select>
+    );
+  }
+  return <input value={args.value} onChange={(event) => args.onChange(event.target.value)} onBlur={args.onBlur} style={inputStyle()} />;
 }
 
 function summarizeExecutionValue(value: unknown): unknown {
@@ -3300,7 +3326,7 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                 <div style={{ marginTop: "0.75rem", display: "grid", gap: "0.65rem" }}>
                                   {selectedCommand.inputDefs.length ? selectedCommand.inputDefs.map((inputDef) => (
                                     <div key={inputDef.id} style={{ border: `1px solid ${C.border}`, borderRadius: 10, padding: "0.7rem", background: C.panel }}>
-                                      <div style={{ display: "grid", gridTemplateColumns: "minmax(140px, 1fr) 110px minmax(140px, 1fr) auto", gap: "0.6rem", alignItems: "end" }}>
+                                      <div style={{ display: "grid", gridTemplateColumns: "minmax(140px, 1fr) 110px minmax(140px, 1fr) minmax(160px, 1fr) auto", gap: "0.6rem", alignItems: "end" }}>
                                         <label style={labelStyle()}>
                                           Name
                                           <input value={inputDef.name} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, inputDefs: command.inputDefs.map((entry) => entry.id === inputDef.id ? { ...entry, name: event.target.value } : entry) })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
@@ -3318,7 +3344,28 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                         </label>
                                         <label style={labelStyle()}>
                                           Default
-                                          <input value={inputDef.defaultValue ?? ""} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, inputDefs: command.inputDefs.map((entry) => entry.id === inputDef.id ? { ...entry, defaultValue: event.target.value || undefined } : entry) })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                          {commandInputValueControl({
+                                            inputDef,
+                                            value: inputDef.defaultValue ?? "",
+                                            onChange: (value) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, inputDefs: command.inputDefs.map((entry) => entry.id === inputDef.id ? { ...entry, defaultValue: value || undefined } : entry) }))),
+                                            onBlur: () => void persistState(state, "Command updated"),
+                                          })}
+                                        </label>
+                                        <label style={labelStyle()}>
+                                          Options
+                                          <input
+                                            value={(inputDef.options ?? []).join(", ")}
+                                            placeholder="AUTO, NORM, SINGLE"
+                                            onChange={(event) => {
+                                              const options = event.target.value.split(",").map((option) => option.trim()).filter(Boolean);
+                                              setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({
+                                                ...command,
+                                                inputDefs: command.inputDefs.map((entry) => entry.id === inputDef.id ? { ...entry, options: options.length ? options : undefined } : entry),
+                                              })));
+                                            }}
+                                            onBlur={() => void persistState(state, "Command updated")}
+                                            style={inputStyle()}
+                                          />
                                         </label>
                                         <button
                                           onClick={() => {
@@ -3344,7 +3391,12 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                   {selectedCommand.inputDefs.map((inputDef) => (
                                     <label key={`try-${inputDef.id}`} style={labelStyle()}>
                                       {inputDef.name}
-                                      <input value={selectedCommand.testValues?.[inputDef.name] ?? ""} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, testValues: { ...(command.testValues ?? {}), [inputDef.name]: event.target.value } })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                      {commandInputValueControl({
+                                        inputDef,
+                                        value: selectedCommand.testValues?.[inputDef.name] ?? "",
+                                        onChange: (value) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, testValues: { ...(command.testValues ?? {}), [inputDef.name]: value } }))),
+                                        onBlur: () => void persistState(state, "Command updated"),
+                                      })}
                                     </label>
                                   ))}
                                 </div>
@@ -3420,7 +3472,12 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                   {selectedCommand.inputDefs.map((inputDef) => (
                                     <label key={`try-bottom-${inputDef.id}`} style={labelStyle()}>
                                       {inputDef.name}
-                                      <input value={selectedCommand.testValues?.[inputDef.name] ?? ""} onChange={(event) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, testValues: { ...(command.testValues ?? {}), [inputDef.name]: event.target.value } })))} onBlur={() => void persistState(state, "Command updated")} style={inputStyle()} />
+                                      {commandInputValueControl({
+                                        inputDef,
+                                        value: selectedCommand.testValues?.[inputDef.name] ?? "",
+                                        onChange: (value) => setState((current) => cloneStateWithCommand(current, selectedDevice.id, selectedCommand.id, (command) => ({ ...command, testValues: { ...(command.testValues ?? {}), [inputDef.name]: value } }))),
+                                        onBlur: () => void persistState(state, "Command updated"),
+                                      })}
                                     </label>
                                   ))}
                                 </div>
@@ -3867,12 +3924,17 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                           ) : (
                                             <label style={labelStyle()}>
                                               Literal Value
-                                              <input value={binding?.literalValue ?? inputDef.defaultValue ?? ""} onChange={(event) => setState((current) => cloneStateWithScript(current, selectedScript.id, (script) => ({
-                                                ...script,
-                                                steps: script.steps.map((step) => step.id === selectedStep.id
-                                                  ? upsertStepInputBinding(step, { id: binding?.id ?? makeId("binding"), inputName: inputDef.name, source: "literal", literalValue: event.target.value })
-                                                  : step),
-                                              })))} onBlur={() => void persistState(state, "Step updated")} style={inputStyle()} />
+                                              {commandInputValueControl({
+                                                inputDef,
+                                                value: binding?.literalValue ?? inputDef.defaultValue ?? "",
+                                                onChange: (value) => setState((current) => cloneStateWithScript(current, selectedScript.id, (script) => ({
+                                                  ...script,
+                                                  steps: script.steps.map((step) => step.id === selectedStep.id
+                                                    ? upsertStepInputBinding(step, { id: binding?.id ?? makeId("binding"), inputName: inputDef.name, source: "literal", literalValue: value })
+                                                    : step),
+                                                }))),
+                                                onBlur: () => void persistState(state, "Step updated"),
+                                              })}
                                             </label>
                                           )}
                                         </div>
