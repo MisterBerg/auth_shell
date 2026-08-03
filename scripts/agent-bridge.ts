@@ -24,7 +24,6 @@ type RpcFailure = {
 
 const PORT = Number(process.env["AGENT_BRIDGE_PORT"] ?? "4317");
 const HOST = "127.0.0.1";
-const TOKEN = process.env["AGENT_BRIDGE_TOKEN"] ?? "";
 let workspaceRoot = process.env["AGENT_BRIDGE_WORKSPACE_ROOT"]?.trim()
   ? resolve(process.env["AGENT_BRIDGE_WORKSPACE_ROOT"]!)
   : null;
@@ -190,14 +189,13 @@ createServer(async (req, res) => {
           name: "Jeffspace local agent bridge",
           protocolVersion: PROTOCOL_VERSION,
           capabilities: CAPABILITIES,
-          requiresPairingToken: Boolean(TOKEN),
+          requiresPairingToken: false,
         },
       } satisfies RpcSuccess);
       return;
     }
 
     if (req.method === "POST" && req.url === "/rpc") {
-      validateToken(req);
       const body = (await readJson(req)) as RpcRequest;
       const result = await runRpc(body);
       sendJson(res, 200, { ok: true, result } satisfies RpcSuccess);
@@ -312,14 +310,6 @@ function isAllowedOrigin(origin: string): boolean {
     /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(origin) ||
     /^https:\/\/[a-z0-9-]+\.cloudfront\.net$/i.test(origin)
   );
-}
-
-function validateToken(req: IncomingMessage): void {
-  if (!TOKEN) return;
-  const auth = req.headers.authorization ?? "";
-  if (auth !== `Bearer ${TOKEN}`) {
-    throw new Error("Unauthorized.");
-  }
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {

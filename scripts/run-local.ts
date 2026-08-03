@@ -16,7 +16,6 @@ import { execFileSync, execSync, spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import { createRequire } from "module";
 import { join, resolve } from "path";
-import { randomBytes } from "crypto";
 
 const ROOT = resolve(process.cwd());
 const SHELL_DIR = join(ROOT, "apps", "shell");
@@ -38,13 +37,11 @@ function main() {
   runTsx("scripts/seed-local.ts", [`--developer=${developer}`]);
   runTsx("scripts/update-locals.ts");
 
-  const agentBridgeToken = randomBytes(24).toString("hex");
   const bridgeChild = spawn(process.execPath, [TSX_CLI, "scripts/agent-bridge.ts"], {
     cwd: ROOT,
     stdio: "inherit",
     env: {
       ...process.env,
-      AGENT_BRIDGE_TOKEN: agentBridgeToken,
       AGENT_BRIDGE_ALLOWED_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173",
     },
   });
@@ -58,7 +55,6 @@ function main() {
     env: {
       ...process.env,
       VITE_AGENT_BRIDGE_URL: `http://127.0.0.1:${BRIDGE_PORT}`,
-      VITE_AGENT_BRIDGE_TOKEN: agentBridgeToken,
     },
   });
 

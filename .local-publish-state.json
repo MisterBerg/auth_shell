@@ -18,6 +18,6 @@
     "modules/serial-display": "adac340154209797b5c4fe7c84cf6bffe8a7f81e7cf574d08873c593e1fa36c3",
     "modules/shell-core": "671d93c5dc40471d18ccfa799f4986bbc9eb6bcd1b7fae47a976756cc56a71ae",
     "modules/agent-chat": "4dcbf066644182e4d37c51a94de272a689eb3b720c0328df6b14a66f060d613c",
-    "modules/equipment-manager": "7d3a712574c8ffb6df4e3d6feec21d6c226915f1c161ba3811d68044380eb645"
+    "modules/equipment-manager": "b9faf80d6535afa30a4bb99b7bb9e4e7e17cb870f8c8df7ae74141b7b82513b9"
   }
 }

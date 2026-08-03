@@ -14,7 +14,7 @@ win["__ReactDOM"] = ReactDOM;
 win["__ReactDOMClient"] = ReactDOMClient;
 win["__AgentBridgeDefaults"] = {
   url: import.meta.env.VITE_AGENT_BRIDGE_URL ?? "",
-  token: import.meta.env.VITE_AGENT_BRIDGE_TOKEN ?? "",
+  token: "",
   installBaseUrl: import.meta.env.VITE_AGENT_RUNTIME_INSTALL_BASE_URL ?? "",
 };
 win["__JeffspaceLocalS3"] = {

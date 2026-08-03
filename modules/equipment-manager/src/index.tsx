@@ -521,7 +521,8 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
           };
         }
         return command;
-      }).map((command) => ({
+      }).filter((command) => command.name.trim().toLowerCase() !== "set trigger slope")
+      .map((command) => ({
         ...command,
         categoryPath: command.categoryPath ?? inferKnownCommandCategory(command.name),
       }))
@@ -632,6 +633,8 @@ function createDefaultState(): EquipmentManagerState {
   const triggerModeCommandId = makeId("command");
   const triggerLevelCommandId = makeId("command");
   const triggerSourceCommandId = makeId("command");
+  const triggerSlopeCommandId = makeId("command");
+  const setTriggerSlopeCommandId = makeId("command");
   const setTriggerModeCommandId = makeId("command");
   const setTriggerLevelCommandId = makeId("command");
   const runScopeCommandId = makeId("command");
@@ -800,6 +803,39 @@ function createDefaultState(): EquipmentManagerState {
           saveAs: "trigger-source.txt",
           inputDefs: [],
           outputDefs: [{ id: makeId("output"), name: "triggerSourceText", source: "json-path", selector: "text" }],
+        },
+        {
+          id: triggerSlopeCommandId,
+          name: "Read Trigger Slope",
+          categoryPath: "Trigger / Read",
+          builtIn: true,
+          mode: "scpi",
+          payload: "{{channel}}:TRSL?",
+          parser: "text",
+          timeoutMs: 3000,
+          artifactMode: "text",
+          saveAs: "trigger-slope.txt",
+          inputDefs: [
+            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", options: ["C1", "C2"], description: "Trigger source channel." },
+          ],
+          outputDefs: [{ id: makeId("output"), name: "triggerSlopeText", source: "json-path", selector: "text" }],
+        },
+        {
+          id: setTriggerSlopeCommandId,
+          name: "Set Trigger Slope",
+          categoryPath: "Trigger / Control",
+          builtIn: true,
+          mode: "scpi",
+          payload: "{{channel}}:TRSL {{slope}}",
+          parser: "none",
+          timeoutMs: 3000,
+          artifactMode: "none",
+          notes: "Uses the documented SDS1000X-E TRIG_SLOPE command. Example from Siglent programming guide: C2:TRSL NEG.",
+          inputDefs: [
+            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", options: ["C1", "C2"], description: "Trigger source channel." },
+            { id: makeId("input"), name: "slope", required: true, defaultValue: "NEG", options: ["NEG", "POS", "WINDOW"], description: "Trigger slope." },
+          ],
+          outputDefs: [],
         },
         {
           id: setTriggerModeCommandId,
