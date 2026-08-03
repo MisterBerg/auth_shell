@@ -2,13 +2,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import type { ExportContext, ModuleProps } from "module-core";
 import { useAwsS3Client, useUserProfile } from "module-core";
+import {
+  createKnownKeysightPreset as createKnownKeysightPresetExternal,
+  createKnownSiglentPreset as createKnownSiglentPresetExternal,
+  createSiglentDefaultState,
+} from "./instruments/scopePresets.ts";
+import {
+  executeKeysightWaveformCommand as executeKeysightWaveformCommandExternal,
+  executeSiglentWaveformCommand as executeSiglentWaveformCommandExternal,
+} from "./instruments/scopeWaveforms.ts";
 
 type TabId = "devices" | "scripts" | "contract";
 type ValueMap = Record<string, unknown>;
 
 type EquipmentTransport = "serial" | "tcp-scpi" | "http-rest" | "visa" | "can" | "custom";
 type CommandMode = "scpi" | "http" | "raw" | "custom";
-type ParserMode = "text" | "json" | "number" | "csv" | "binary" | "none" | "siglent-waveform";
+type ParserMode = "text" | "json" | "number" | "csv" | "binary" | "none" | "siglent-waveform" | "keysight-waveform";
 type ArtifactMode = "none" | "text" | "json" | "csv" | "image" | "binary";
 type ScriptStepType = "command" | "wait" | "capture" | "note";
 type CommandOutputSource = "json-path" | "regex";
@@ -165,7 +174,7 @@ type SiglentWaveformPoint = {
 };
 
 type SiglentWaveformResult = {
-  kind: "siglent-waveform";
+  kind: "siglent-waveform" | "keysight-waveform";
   channel: string;
   sampleCount: number;
   intervalSeconds: number;
@@ -258,11 +267,9 @@ const C = {
 
 const TRANSPORTS: EquipmentTransport[] = ["serial", "tcp-scpi", "http-rest", "visa", "can", "custom"];
 const COMMAND_MODES: CommandMode[] = ["scpi", "http", "raw", "custom"];
-const PARSER_MODES: ParserMode[] = ["text", "json", "number", "csv", "binary", "none", "siglent-waveform"];
+const PARSER_MODES: ParserMode[] = ["text", "json", "number", "csv", "binary", "none", "siglent-waveform", "keysight-waveform"];
 const ARTIFACT_MODES: ArtifactMode[] = ["none", "text", "json", "csv", "image", "binary"];
 const STEP_TYPES: ScriptStepType[] = ["command", "wait", "capture", "note"];
-const SIGLENT_WAVEFORM_SETUP = "WFSU SP,1,NP,20000,FP,0";
-const SIGLENT_WAVEFORM_POINT_LIMIT = 20000;
 const WAVEFORM_CURSOR_COLORS = ["#ef4444", "#2563eb", "#16a34a", "#d97706", "#7c3aed", "#db2777"];
 
 function dirname(path: string): string {
@@ -443,7 +450,9 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
   const transport = toStringValue(record.transport, "custom");
   const name = toStringValue(record.name, `Device ${index + 1}`);
   const commands = Array.isArray(record.commands) ? record.commands.map(normalizeCommand) : [];
-  const upgradedCommands = /siglent\s+sds1202x-e/i.test(name)
+  const isSiglent = /siglent\s+sds1202x-e/i.test(name);
+  const isKeysight = /keysight\s+msox4054a/i.test(name);
+  const upgradedCommands = isSiglent
     ? commands.map((command) => {
         const commandName = command.name.trim().toLowerCase();
         if (command.name === "Capture Screenshot" && command.payload.trim() === ":DISPlay:DATA? PNG, COLor") {
@@ -527,7 +536,7 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
         categoryPath: command.categoryPath ?? inferKnownCommandCategory(command.name),
       }))
     : commands;
-  const mergedCommands = /siglent\s+sds1202x-e/i.test(name)
+  const mergedCommands = isSiglent
     ? (() => {
         const presetCommands = createKnownSiglentPreset(undefined, toStringValue(record.address, "")).device.commands;
         const existingByName = new Map(upgradedCommands.map((command) => [command.name.trim().toLowerCase(), command] as const));
@@ -540,6 +549,22 @@ function normalizeDevice(value: unknown, index: number): EquipmentDevice {
         }
         return merged;
       })()
+    : isKeysight
+      ? (() => {
+          const presetCommands = createKnownKeysightPreset(undefined, toStringValue(record.address, "")).device.commands;
+          const existingByName = new Map(upgradedCommands.map((command) => [command.name.trim().toLowerCase(), command] as const));
+          const merged = [...upgradedCommands];
+          for (const presetCommand of presetCommands) {
+            const key = presetCommand.name.trim().toLowerCase();
+            if (!existingByName.has(key)) {
+              merged.push(presetCommand);
+            }
+          }
+          return merged.map((command) => ({
+            ...command,
+            categoryPath: command.categoryPath ?? inferKnownCommandCategory(command.name),
+          }));
+        })()
     : upgradedCommands;
   return {
     id: toStringValue(record.id, `device-${index + 1}`),
@@ -623,426 +648,15 @@ function repairBuiltInScripts(state: EquipmentManagerState): EquipmentManagerSta
 }
 
 function createDefaultState(): EquipmentManagerState {
-  const demoDeviceId = makeId("device");
-  const identifyCommandId = makeId("command");
-  const channelScaleCommandId = makeId("command");
-  const channelOffsetCommandId = makeId("command");
-  const timebaseCommandId = makeId("command");
-  const sampleRateCommandId = makeId("command");
-  const triggerDelayCommandId = makeId("command");
-  const triggerModeCommandId = makeId("command");
-  const triggerLevelCommandId = makeId("command");
-  const triggerSourceCommandId = makeId("command");
-  const triggerSlopeCommandId = makeId("command");
-  const setTriggerSlopeCommandId = makeId("command");
-  const setTriggerModeCommandId = makeId("command");
-  const setTriggerLevelCommandId = makeId("command");
-  const runScopeCommandId = makeId("command");
-  const stopScopeCommandId = makeId("command");
-  const armSingleCommandId = makeId("command");
-  const setTimebaseCommandId = makeId("command");
-  const setChannelScaleCommandId = makeId("command");
-  const setChannelOffsetCommandId = makeId("command");
-  const captureCommandId = makeId("command");
-  const waveformCommandId = makeId("command");
-  const identifyStepId = makeId("step");
-  const channelScaleStepId = makeId("step");
-  const channelOffsetStepId = makeId("step");
-  const timebaseStepId = makeId("step");
-  const sampleRateStepId = makeId("step");
-  const triggerDelayStepId = makeId("step");
-  const triggerModeStepId = makeId("step");
-  const triggerSourceStepId = makeId("step");
-  const triggerLevelStepId = makeId("step");
-  const captureScreenStepId = makeId("step");
-  const captureWaveformStepId = makeId("step");
-  return {
-    version: 1,
-    devices: [{
-      id: demoDeviceId,
-      name: "Siglent SDS1202X-E",
-      transport: "tcp-scpi",
-      address: "192.168.0.148:5025",
-      capabilities: ["connect", "execute_command", "capture_artifact", "read_data"],
-      notes: "Verified on the local network through the bridge. SCPI over TCP responds on port 5025; interactive prompt is also available on 5024.",
-      commands: [
-        {
-          id: identifyCommandId,
-          name: "Identify",
-          categoryPath: "Instrument / Identity",
-          builtIn: true,
-          mode: "scpi",
-          payload: "*IDN?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "identity.txt",
-          inputDefs: [],
-          outputDefs: [],
-        },
-        {
-          id: channelScaleCommandId,
-          name: "Read CH1 Scale",
-          categoryPath: "Channel / CH1",
-          builtIn: true,
-          mode: "scpi",
-          payload: "C1:VDIV?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "ch1-scale.txt",
-          inputDefs: [],
-          outputDefs: [
-            { id: makeId("output"), name: "voltsPerDivText", source: "json-path", selector: "text" },
-            { id: makeId("output"), name: "voltsPerDiv", source: "regex", selector: SCPI_VALUE_REGEX, captureGroup: 1 },
-          ],
-        },
-        {
-          id: channelOffsetCommandId,
-          name: "Read CH1 Offset",
-          categoryPath: "Channel / CH1",
-          builtIn: true,
-          mode: "scpi",
-          payload: "C1:OFST?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "ch1-offset.txt",
-          inputDefs: [],
-          outputDefs: [
-            { id: makeId("output"), name: "offsetVoltsText", source: "json-path", selector: "text" },
-            { id: makeId("output"), name: "offsetVolts", source: "regex", selector: SCPI_VALUE_REGEX, captureGroup: 1 },
-          ],
-        },
-        {
-          id: timebaseCommandId,
-          name: "Read Timebase",
-          categoryPath: "Acquire / Timing",
-          builtIn: true,
-          mode: "scpi",
-          payload: "TDIV?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "timebase.txt",
-          inputDefs: [],
-          outputDefs: [
-            { id: makeId("output"), name: "timeDivText", source: "json-path", selector: "text" },
-            { id: makeId("output"), name: "timePerDivSeconds", source: "regex", selector: SCPI_VALUE_REGEX, captureGroup: 1 },
-          ],
-        },
-        {
-          id: sampleRateCommandId,
-          name: "Read Sample Rate",
-          categoryPath: "Acquire / Timing",
-          builtIn: true,
-          mode: "scpi",
-          payload: "SARA?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "sample-rate.txt",
-          inputDefs: [],
-          outputDefs: [{ id: makeId("output"), name: "sampleRateText", source: "json-path", selector: "text" }],
-        },
-        {
-          id: triggerDelayCommandId,
-          name: "Read Trigger Delay",
-          categoryPath: "Trigger / Read",
-          builtIn: true,
-          mode: "scpi",
-          payload: "TRDL?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "trigger-delay.txt",
-          inputDefs: [],
-          outputDefs: [
-            { id: makeId("output"), name: "triggerDelayText", source: "json-path", selector: "text" },
-            { id: makeId("output"), name: "triggerDelaySeconds", source: "regex", selector: SCPI_VALUE_REGEX, captureGroup: 1 },
-          ],
-        },
-        {
-          id: triggerModeCommandId,
-          name: "Read Trigger Mode",
-          categoryPath: "Trigger / Read",
-          builtIn: true,
-          mode: "scpi",
-          payload: "TRMD?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "trigger-mode.txt",
-          inputDefs: [],
-          outputDefs: [{ id: makeId("output"), name: "triggerMode", source: "json-path", selector: "text" }],
-        },
-        {
-          id: triggerLevelCommandId,
-          name: "Read Trigger Level",
-          categoryPath: "Trigger / Read",
-          builtIn: true,
-          mode: "scpi",
-          payload: "C1:TRLV?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "trigger-level.txt",
-          inputDefs: [],
-          outputDefs: [{ id: makeId("output"), name: "triggerLevelText", source: "json-path", selector: "text" }],
-        },
-        {
-          id: triggerSourceCommandId,
-          name: "Read Trigger Source",
-          categoryPath: "Trigger / Read",
-          builtIn: true,
-          mode: "scpi",
-          payload: "TRSE?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "trigger-source.txt",
-          inputDefs: [],
-          outputDefs: [{ id: makeId("output"), name: "triggerSourceText", source: "json-path", selector: "text" }],
-        },
-        {
-          id: triggerSlopeCommandId,
-          name: "Read Trigger Slope",
-          categoryPath: "Trigger / Read",
-          builtIn: true,
-          mode: "scpi",
-          payload: "{{channel}}:TRSL?",
-          parser: "text",
-          timeoutMs: 3000,
-          artifactMode: "text",
-          saveAs: "trigger-slope.txt",
-          inputDefs: [
-            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", options: ["C1", "C2"], description: "Trigger source channel." },
-          ],
-          outputDefs: [{ id: makeId("output"), name: "triggerSlopeText", source: "json-path", selector: "text" }],
-        },
-        {
-          id: setTriggerSlopeCommandId,
-          name: "Set Trigger Slope",
-          categoryPath: "Trigger / Control",
-          builtIn: true,
-          mode: "scpi",
-          payload: "{{channel}}:TRSL {{slope}}",
-          parser: "none",
-          timeoutMs: 3000,
-          artifactMode: "none",
-          notes: "Uses the documented SDS1000X-E TRIG_SLOPE command. Example from Siglent programming guide: C2:TRSL NEG.",
-          inputDefs: [
-            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", options: ["C1", "C2"], description: "Trigger source channel." },
-            { id: makeId("input"), name: "slope", required: true, defaultValue: "NEG", options: ["NEG", "POS", "WINDOW"], description: "Trigger slope." },
-          ],
-          outputDefs: [],
-        },
-        {
-          id: setTriggerModeCommandId,
-          name: "Set Trigger Mode",
-          categoryPath: "Trigger / Control",
-          builtIn: true,
-          mode: "scpi",
-          payload: "TRMD {{mode}}",
-          parser: "none",
-          timeoutMs: 3000,
-          artifactMode: "none",
-          notes: "Validated on the live SDS1202X-E with AUTO and NORM. SINGLE should be armed with ARM. Rising/falling edge selection is trigger slope, not TRMD trigger mode.",
-          inputDefs: [
-            { id: makeId("input"), name: "mode", required: true, defaultValue: "AUTO", options: ["AUTO", "NORM", "SINGLE"], description: "TRMD acquisition trigger mode. Edge direction is configured separately as trigger slope." },
-          ],
-          outputDefs: [],
-        },
-        {
-          id: setTriggerLevelCommandId,
-          name: "Set Trigger Level",
-          categoryPath: "Trigger / Control",
-          builtIn: true,
-          mode: "scpi",
-          payload: "{{channel}}:TRLV {{levelVolts}}V",
-          parser: "none",
-          timeoutMs: 3000,
-          artifactMode: "none",
-          notes: "Validated on the live SDS1202X-E.",
-          inputDefs: [
-            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel, such as C1." },
-            { id: makeId("input"), name: "levelVolts", required: true, defaultValue: "1.00", description: "Trigger level in volts." },
-          ],
-          outputDefs: [],
-        },
-        {
-          id: runScopeCommandId,
-          name: "Run Scope",
-          categoryPath: "Acquire / Control",
-          builtIn: true,
-          mode: "scpi",
-          payload: "RUN",
-          parser: "none",
-          timeoutMs: 3000,
-          artifactMode: "none",
-          notes: "Validated on the live SDS1202X-E.",
-          inputDefs: [],
-          outputDefs: [],
-        },
-        {
-          id: stopScopeCommandId,
-          name: "Stop Scope",
-          categoryPath: "Acquire / Control",
-          builtIn: true,
-          mode: "scpi",
-          payload: "STOP",
-          parser: "none",
-          timeoutMs: 3000,
-          artifactMode: "none",
-          notes: "Validated on the live SDS1202X-E.",
-          inputDefs: [],
-          outputDefs: [],
-        },
-        {
-          id: armSingleCommandId,
-          name: "Arm Single",
-          categoryPath: "Acquire / Control",
-          builtIn: true,
-          mode: "scpi",
-          payload: "ARM",
-          parser: "none",
-          timeoutMs: 3000,
-          artifactMode: "none",
-          notes: "Validated on the live SDS1202X-E; places trigger mode into SINGLE.",
-          inputDefs: [],
-          outputDefs: [],
-        },
-        {
-          id: setTimebaseCommandId,
-          name: "Set Timebase",
-          categoryPath: "Acquire / Timing",
-          builtIn: true,
-          mode: "scpi",
-          payload: "TDIV {{timePerDivSeconds}}S",
-          parser: "none",
-          timeoutMs: 3000,
-          artifactMode: "none",
-          notes: "Validated on the live SDS1202X-E.",
-          inputDefs: [
-            { id: makeId("input"), name: "timePerDivSeconds", required: true, defaultValue: "5.00E-04", description: "Time per division in seconds." },
-          ],
-          outputDefs: [],
-        },
-        {
-          id: setChannelScaleCommandId,
-          name: "Set Channel Scale",
-          categoryPath: "Channel / CH1",
-          builtIn: true,
-          mode: "scpi",
-          payload: "{{channel}}:VDIV {{voltsPerDiv}}V",
-          parser: "none",
-          timeoutMs: 3000,
-          artifactMode: "none",
-          notes: "Validated on the live SDS1202X-E.",
-          inputDefs: [
-            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel, such as C1." },
-            { id: makeId("input"), name: "voltsPerDiv", required: true, defaultValue: "5.00E-01", description: "Volts per division." },
-          ],
-          outputDefs: [],
-        },
-        {
-          id: setChannelOffsetCommandId,
-          name: "Set Channel Offset",
-          categoryPath: "Channel / CH1",
-          builtIn: true,
-          mode: "scpi",
-          payload: "{{channel}}:OFST {{offsetVolts}}V",
-          parser: "none",
-          timeoutMs: 3000,
-          artifactMode: "none",
-          notes: "Validated on the live SDS1202X-E.",
-          inputDefs: [
-            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel, such as C1." },
-            { id: makeId("input"), name: "offsetVolts", required: true, defaultValue: "-1.50E+00", description: "Channel offset in volts." },
-          ],
-          outputDefs: [],
-        },
-        {
-          id: captureCommandId,
-          name: "Capture Screenshot",
-          categoryPath: "Acquire / Capture",
-          builtIn: true,
-          mode: "scpi",
-          payload: "SCDP",
-          parser: "binary",
-          timeoutMs: 15000,
-          artifactMode: "image",
-          saveAs: "scope-screen.bmp",
-          notes: "Returns a bitmap screenshot from the instrument over SCPI.",
-          inputDefs: [],
-          outputDefs: [],
-        },
-        {
-          id: waveformCommandId,
-          name: "Capture Waveform",
-          categoryPath: "Acquire / Waveform",
-          builtIn: true,
-          mode: "scpi",
-          payload: "{{channel}}:WF? DAT2",
-          parser: "siglent-waveform",
-          timeoutMs: 15000,
-          artifactMode: "csv",
-          saveAs: "ch1-waveform.csv",
-          notes: "Fetches up to 20,000 waveform samples plus scaling metadata, then renders an interactive waveform chart.",
-          inputDefs: [
-            { id: makeId("input"), name: "channel", required: true, defaultValue: "C1", description: "Scope channel to capture, such as C1." },
-          ],
-          outputDefs: [
-            { id: makeId("output"), name: "sampleRateHz", source: "json-path", selector: "metadata.sampleRateHz" },
-            { id: makeId("output"), name: "timePerDivSeconds", source: "json-path", selector: "metadata.timePerDivSeconds" },
-            { id: makeId("output"), name: "voltsPerDiv", source: "json-path", selector: "metadata.voltsPerDiv" },
-            { id: makeId("output"), name: "triggerDelaySeconds", source: "json-path", selector: "metadata.triggerDelaySeconds" },
-            { id: makeId("output"), name: "offsetVolts", source: "json-path", selector: "metadata.offsetVolts" },
-            { id: makeId("output"), name: "windowStartSeconds", source: "json-path", selector: "startTimeSeconds" },
-            { id: makeId("output"), name: "windowEndSeconds", source: "json-path", selector: "endTimeSeconds" },
-            { id: makeId("output"), name: "minVoltage", source: "json-path", selector: "minVoltage" },
-            { id: makeId("output"), name: "maxVoltage", source: "json-path", selector: "maxVoltage" },
-          ],
-        },
-      ],
-    }],
-      scripts: [{
-      id: makeId("script"),
-      name: "Scope Window Snapshot",
-      builtIn: true,
-      deviceId: demoDeviceId,
-      description: "Collect the key scope settings needed to reproduce the currently displayed waveform window, then capture both screenshot and waveform data.",
-      steps: [
-        { id: identifyStepId, type: "command", title: "Identify instrument", commandId: identifyCommandId, saveAs: "identity.txt", notes: "Built-in scope identity query.", inputBindings: [] },
-        { id: channelScaleStepId, type: "command", title: "Read CH1 scale", commandId: channelScaleCommandId, saveAs: "ch1-scale.txt", inputBindings: [] },
-        { id: channelOffsetStepId, type: "command", title: "Read CH1 offset", commandId: channelOffsetCommandId, saveAs: "ch1-offset.txt", inputBindings: [] },
-        { id: timebaseStepId, type: "command", title: "Read timebase", commandId: timebaseCommandId, saveAs: "timebase.txt", inputBindings: [] },
-        { id: sampleRateStepId, type: "command", title: "Read sample rate", commandId: sampleRateCommandId, saveAs: "sample-rate.txt", inputBindings: [] },
-        { id: triggerDelayStepId, type: "command", title: "Read trigger delay", commandId: triggerDelayCommandId, saveAs: "trigger-delay.txt", inputBindings: [] },
-        { id: triggerModeStepId, type: "command", title: "Read trigger mode", commandId: triggerModeCommandId, saveAs: "trigger-mode.txt", inputBindings: [] },
-        { id: triggerSourceStepId, type: "command", title: "Read trigger source", commandId: triggerSourceCommandId, saveAs: "trigger-source.txt", inputBindings: [] },
-        { id: triggerLevelStepId, type: "command", title: "Read trigger level", commandId: triggerLevelCommandId, saveAs: "trigger-level.txt", inputBindings: [] },
-        { id: captureScreenStepId, type: "capture", title: "Capture scope screen", commandId: captureCommandId, saveAs: "scope-screen.bmp", inputBindings: [] },
-        {
-          id: captureWaveformStepId,
-          type: "capture",
-          title: "Capture waveform",
-          commandId: waveformCommandId,
-          saveAs: "ch1-waveform.csv",
-          inputBindings: [
-            { id: makeId("binding"), inputName: "channel", source: "literal", literalValue: "C1" },
-          ],
-        },
-      ],
-    }],
-  };
+  return createSiglentDefaultState({ makeId, scpiValueRegex: SCPI_VALUE_REGEX }) as EquipmentManagerState;
 }
 
 function createKnownSiglentPreset(targetDeviceId?: string, targetAddress?: string): { device: EquipmentDevice; scripts: EquipmentScript[] } {
-  const base = createDefaultState();
-  const device = { ...base.devices[0]!, id: targetDeviceId ?? base.devices[0]!.id, address: targetAddress ?? base.devices[0]!.address };
-  const scripts = base.scripts.map((script) => ({ ...script, deviceId: device.id }));
-  return { device, scripts };
+  return createKnownSiglentPresetExternal({ baseState: createDefaultState(), targetDeviceId, targetAddress }) as { device: EquipmentDevice; scripts: EquipmentScript[] };
+}
+
+function createKnownKeysightPreset(targetDeviceId?: string, targetAddress?: string): { device: EquipmentDevice; scripts: EquipmentScript[] } {
+  return createKnownKeysightPresetExternal({ makeId, scpiValueRegex: SCPI_VALUE_REGEX, targetDeviceId, targetAddress }) as { device: EquipmentDevice; scripts: EquipmentScript[] };
 }
 
 function dedupeById<T extends { id: string }>(items: T[]): T[] {
@@ -1186,15 +800,6 @@ function parseDeviceAddress(address: string): { host: string; port: number } | n
   return { host: trimmed, port: 5025 };
 }
 
-function base64ToBytes(value: string): Uint8Array {
-  const decoded = window.atob(value);
-  const bytes = new Uint8Array(decoded.length);
-  for (let index = 0; index < decoded.length; index += 1) {
-    bytes[index] = decoded.charCodeAt(index);
-  }
-  return bytes;
-}
-
 function parseScpiNumber(text: string): number {
   const matches = Array.from(text.matchAll(/(?:^|[\s,])(-?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/g));
   const match = matches.at(-1);
@@ -1212,187 +817,6 @@ function parseScpiNumber(text: string): number {
     : suffix === "p" ? 1e-12
     : 1;
   return value * multiplier;
-}
-
-function parseSiglentWaveformChannel(payload: string): string {
-  const match = payload.match(/\b(C[1-4])\s*:/i);
-  return match?.[1]?.toUpperCase() ?? "C1";
-}
-
-function decodeSiglentWaveformBlock(bytesBase64: string): number[] {
-  const bytes = base64ToBytes(bytesBase64);
-  const hashIndex = bytes.indexOf(35);
-  if (hashIndex < 0 || hashIndex + 1 >= bytes.length) {
-    const printableCount = bytes.reduce((count, value) => (value >= 32 && value <= 126 ? count + 1 : count), 0);
-    const printableRatio = bytes.length > 0 ? printableCount / bytes.length : 1;
-    if (bytes.length >= 256 && printableRatio < 0.6) {
-      const samples: number[] = [];
-      for (const value of bytes) {
-        samples.push(value > 127 ? value - 255 : value);
-      }
-      return samples;
-    }
-    const prefix = new TextDecoder().decode(bytes.slice(0, Math.min(bytes.length, 32)));
-    throw new Error(`Waveform response did not contain a SCPI binary block. Prefix: ${JSON.stringify(prefix)}`);
-  }
-  const digitCount = bytes[hashIndex + 1] - 48;
-  if (digitCount < 1 || digitCount > 9) {
-    throw new Error("Waveform response contained an invalid binary-block length header.");
-  }
-  const lengthText = new TextDecoder().decode(bytes.slice(hashIndex + 2, hashIndex + 2 + digitCount));
-  const blockLength = Number(lengthText);
-  if (!Number.isFinite(blockLength) || blockLength < 0) {
-    throw new Error("Waveform response contained an invalid binary-block length value.");
-  }
-  const dataStart = hashIndex + 2 + digitCount;
-  const dataEnd = dataStart + blockLength;
-  if (dataEnd > bytes.length) {
-    throw new Error("Waveform response ended before the advertised binary block length.");
-  }
-  const samples: number[] = [];
-  for (const value of bytes.slice(dataStart, dataEnd)) {
-    // Siglent's SDS1000X-E programming guide describes converting values above 127 by subtracting 255.
-    samples.push(value > 127 ? value - 255 : value);
-  }
-  return samples;
-}
-
-function extractScpiBlockPayload(bytesBase64: string): Uint8Array {
-  const bytes = base64ToBytes(bytesBase64);
-  const hashIndex = bytes.indexOf(35);
-  if (hashIndex < 0 || hashIndex + 1 >= bytes.length) {
-    return bytes;
-  }
-  const digitCount = bytes[hashIndex + 1] - 48;
-  if (digitCount < 1 || digitCount > 9) {
-    return bytes;
-  }
-  const lengthText = new TextDecoder().decode(bytes.slice(hashIndex + 2, hashIndex + 2 + digitCount));
-  const blockLength = Number(lengthText);
-  if (!Number.isFinite(blockLength) || blockLength < 0) {
-    return bytes;
-  }
-  const dataStart = hashIndex + 2 + digitCount;
-  const dataEnd = Math.min(bytes.length, dataStart + blockLength);
-  return bytes.slice(dataStart, dataEnd);
-}
-
-function readInt16LE(bytes: Uint8Array, offset: number): number {
-  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt16(offset, true);
-}
-
-function readInt32LE(bytes: Uint8Array, offset: number): number {
-  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(offset, true);
-}
-
-function readFloat32LE(bytes: Uint8Array, offset: number): number {
-  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getFloat32(offset, true);
-}
-
-function parseSiglentWaveDescriptor(bytesBase64: string, returnedPointCount: number, fallbackSpanSeconds: number): SiglentWaveDescriptor | null {
-  const payload = extractScpiBlockPayload(bytesBase64);
-  const marker = new TextEncoder().encode("WAVEDESC");
-  let start = -1;
-  for (let index = 0; index <= payload.length - marker.length; index += 1) {
-    let matches = true;
-    for (let markerIndex = 0; markerIndex < marker.length; markerIndex += 1) {
-      if (payload[index + markerIndex] !== marker[markerIndex]) {
-        matches = false;
-        break;
-      }
-    }
-    if (matches) {
-      start = index;
-      break;
-    }
-  }
-  if (start < 0 || start + 184 > payload.length) return null;
-  const descriptor = payload.slice(start);
-  const waveArrayCount = readInt32LE(descriptor, 116);
-  const sourceIntervalSeconds = readFloat32LE(descriptor, 176);
-  const safeReturnedCount = Math.max(1, returnedPointCount);
-  const sourcePointCount = waveArrayCount > 0 ? waveArrayCount : safeReturnedCount;
-  const totalSpanSeconds = sourcePointCount > 0 && sourceIntervalSeconds > 0
-    ? sourcePointCount * sourceIntervalSeconds
-    : fallbackSpanSeconds;
-  const effectiveIntervalSeconds = totalSpanSeconds / safeReturnedCount;
-  if (!Number.isFinite(totalSpanSeconds) || totalSpanSeconds <= 0 || !Number.isFinite(effectiveIntervalSeconds) || effectiveIntervalSeconds <= 0) {
-    return null;
-  }
-  return {
-    waveArrayCount: sourcePointCount,
-    returnedPointCount: safeReturnedCount,
-    sourceIntervalSeconds,
-    effectiveIntervalSeconds,
-    totalSpanSeconds,
-  };
-}
-
-function buildSiglentWaveformResult(args: {
-  channel: string;
-  waveform: TcpCommandResult;
-  descriptor?: TcpCommandResult;
-  voltsPerDivResponse: string;
-  offsetResponse: string;
-  timeDivResponse: string;
-  triggerDelayResponse: string;
-  sampleRateResponse: string;
-}): SiglentWaveformResult {
-  const voltsPerDiv = parseScpiNumber(args.voltsPerDivResponse);
-  const offsetVolts = parseScpiNumber(args.offsetResponse);
-  const timePerDivSeconds = parseScpiNumber(args.timeDivResponse);
-  const triggerDelaySeconds = parseScpiNumber(args.triggerDelayResponse);
-  const sampleRateHz = parseScpiNumber(args.sampleRateResponse);
-  const grid = 14;
-  const codes = decodeSiglentWaveformBlock(args.waveform.bytesBase64 ?? "");
-  const fallbackSpanSeconds = timePerDivSeconds * grid;
-  const descriptor = args.descriptor?.bytesBase64
-    ? parseSiglentWaveDescriptor(args.descriptor.bytesBase64, codes.length, fallbackSpanSeconds)
-    : null;
-  const intervalSeconds = descriptor?.effectiveIntervalSeconds ?? (fallbackSpanSeconds / Math.max(1, codes.length));
-  const totalSpanSeconds = descriptor?.totalSpanSeconds ?? fallbackSpanSeconds;
-  const startTimeSeconds = triggerDelaySeconds - (totalSpanSeconds / 2);
-  const points = codes.map((rawCode, index) => ({
-    index,
-    rawCode,
-    timeSeconds: startTimeSeconds + (index * intervalSeconds),
-    voltage: rawCode * (voltsPerDiv / 25) - offsetVolts,
-  }));
-  const minVoltage = points.length ? points.reduce((min, point) => Math.min(min, point.voltage), Number.POSITIVE_INFINITY) : 0;
-  const maxVoltage = points.length ? points.reduce((max, point) => Math.max(max, point.voltage), Number.NEGATIVE_INFINITY) : 0;
-  return {
-    kind: "siglent-waveform",
-    channel: args.channel,
-    sampleCount: points.length,
-    intervalSeconds,
-    startTimeSeconds,
-    endTimeSeconds: points.length > 0 ? points[points.length - 1]!.timeSeconds : startTimeSeconds,
-    minVoltage,
-    maxVoltage,
-    metadata: {
-      voltsPerDiv,
-      offsetVolts,
-      timePerDivSeconds,
-      triggerDelaySeconds,
-      sampleRateHz,
-      grid,
-    },
-    transport: {
-      waveformBytes: args.waveform.bytesLength ?? 0,
-      descriptorBytes: args.descriptor?.bytesLength ?? 0,
-      setupCommand: SIGLENT_WAVEFORM_SETUP,
-      setupReadMode: "none",
-      queries: {
-        voltsPerDiv: args.voltsPerDivResponse,
-        offset: args.offsetResponse,
-        timeDiv: args.timeDivResponse,
-        triggerDelay: args.triggerDelayResponse,
-        sampleRate: args.sampleRateResponse,
-      },
-      descriptor: descriptor ?? undefined,
-    },
-    points,
-  };
 }
 
 async function callBridge<T>(bridge: BridgeConfig, method: string, params: Record<string, unknown> = {}): Promise<T> {
@@ -1665,7 +1089,8 @@ function isTcpCommandResult(value: unknown): value is TcpCommandResult {
 
 function isSiglentWaveformResult(value: unknown): value is SiglentWaveformResult {
   if (!value || typeof value !== "object") return false;
-  return (value as { kind?: string }).kind === "siglent-waveform";
+  const kind = (value as { kind?: string }).kind;
+  return kind === "siglent-waveform" || kind === "keysight-waveform";
 }
 
 function guessImageMimeTypeFromName(name?: string): string {
@@ -2573,6 +1998,13 @@ export default function EquipmentManager({ config }: ModuleProps) {
       createScripts: (device) => createKnownSiglentPreset(device.id, device.address).scripts,
     },
     {
+      id: "keysight-msox4054a",
+      name: "Keysight MSOX4054A",
+      description: "InfiniiVision 4000 X-Series SCPI over LAN with screenshot and waveform capture presets.",
+      create: () => normalizeDevice(createKnownKeysightPreset().device, 0),
+      createScripts: (device) => createKnownKeysightPreset(device.id, device.address).scripts,
+    },
+    {
       id: "blank",
       name: "Blank Device",
       description: "Start from an empty profile for an unsupported or custom instrument.",
@@ -2675,99 +2107,28 @@ export default function EquipmentManager({ config }: ModuleProps) {
 
   const executeSiglentWaveformCommand = useCallback(async (target: { host: string; port: number }, command: EquipmentCommand, inputValues?: Record<string, unknown>): Promise<SiglentWaveformResult> => {
     if (!activeBridge) throw new Error("Bridge URL is required before executing device commands.");
-    const waveformPayload = applyTemplate(command.payload, {
-      ...(inputValues ?? {}),
-      channel: String(inputValues?.["channel"] ?? parseSiglentWaveformChannel(command.payload)),
-    });
-    const channel = parseSiglentWaveformChannel(waveformPayload);
-    const [voltsPerDivResponse, offsetResponse, timeDivResponse, triggerDelayResponse, sampleRateResponse] = await Promise.all([
-      fetchTcpText(activeBridge, target, `${channel}:VDIV?`),
-      fetchTcpText(activeBridge, target, `${channel}:OFST?`),
-      fetchTcpText(activeBridge, target, "TDIV?"),
-      fetchTcpText(activeBridge, target, "TRDL?"),
-      fetchTcpText(activeBridge, target, "SARA?"),
-    ]);
-    const sourcePointCount = Math.max(1, Math.round(parseScpiNumber(timeDivResponse) * 14 * parseScpiNumber(sampleRateResponse)));
-    const computedSparsing = Math.max(1, Math.floor((sourcePointCount - 1) / Math.max(1, SIGLENT_WAVEFORM_POINT_LIMIT - 1)));
-    const sparsingCandidates = Array.from(new Set([
-      Math.max(1, computedSparsing - 1),
-      computedSparsing,
-      Math.max(1, computedSparsing + 1),
-      1,
-    ]));
-    let result: SiglentWaveformResult | null = null;
-    let waveformSetup = `WFSU SP,${computedSparsing},NP,${SIGLENT_WAVEFORM_POINT_LIMIT},FP,0`;
-    let lastWaveformError: Error | null = null;
-    for (const sparsing of sparsingCandidates) {
-      waveformSetup = `WFSU SP,${sparsing},NP,${SIGLENT_WAVEFORM_POINT_LIMIT},FP,0`;
-      await callBridge<unknown>(activeBridge, "execute_tcp_command", {
-        host: target.host,
-        port: target.port,
-        command: waveformSetup,
-        readMode: "none",
-        timeoutMs: 1500,
-      });
+    return executeSiglentWaveformCommandExternal({
+      activeBridge,
+      target,
+      command,
+      inputValues,
+      applyTemplate,
+      fetchTcpText,
+      callBridge,
+      parseOptionalNumber,
+    }) as Promise<SiglentWaveformResult>;
+  }, [activeBridge]);
 
-      const [descriptor, waveform] = await Promise.all([
-        callBridge<TcpCommandResult>(activeBridge, "execute_tcp_command", {
-          host: target.host,
-          port: target.port,
-          command: `${channel}:WF? DESC`,
-          readMode: "until-timeout",
-          timeoutMs: 8000,
-          quietMs: 1500,
-          encoding: "base64",
-        }),
-        callBridge<TcpCommandResult>(activeBridge, "execute_tcp_command", {
-          host: target.host,
-          port: target.port,
-          command: waveformPayload,
-          readMode: "until-timeout",
-          timeoutMs: command.timeoutMs || 15000,
-          quietMs: 1500,
-          encoding: "base64",
-        }),
-      ]);
-      try {
-        result = buildSiglentWaveformResult({
-          channel,
-          waveform,
-          descriptor,
-          voltsPerDivResponse,
-          offsetResponse,
-          timeDivResponse,
-          triggerDelayResponse,
-          sampleRateResponse,
-        });
-        break;
-      } catch (error) {
-        lastWaveformError = error instanceof Error ? error : new Error(String(error));
-      }
-    }
-    if (!result) {
-      throw lastWaveformError ?? new Error("Unable to capture a valid waveform block from the scope.");
-    }
-    const centerTimeSeconds = parseOptionalNumber(inputValues?.["centerTimeSeconds"]);
-    const timePerDivSeconds = parseOptionalNumber(inputValues?.["timePerDivSeconds"]);
-    const centerVolts = parseOptionalNumber(inputValues?.["centerVolts"]);
-    const scopeOffsetVolts = parseOptionalNumber(inputValues?.["scopeOffsetVolts"]);
-    const voltsPerDiv = parseOptionalNumber(inputValues?.["voltsPerDiv"]);
-    const horizontalHalfSpan = typeof timePerDivSeconds === "number" ? (timePerDivSeconds * result.metadata.grid / 2) : undefined;
-    const verticalHalfSpan = typeof voltsPerDiv === "number" ? (voltsPerDiv * result.metadata.grid / 2) : undefined;
-    const resolvedCenterVolts = typeof centerVolts === "number"
-      ? centerVolts
-      : (typeof scopeOffsetVolts === "number" ? -scopeOffsetVolts : undefined);
-    const preferredViewport = {
-      xMinSeconds: typeof centerTimeSeconds === "number" && typeof horizontalHalfSpan === "number" ? centerTimeSeconds - horizontalHalfSpan : undefined,
-      xMaxSeconds: typeof centerTimeSeconds === "number" && typeof horizontalHalfSpan === "number" ? centerTimeSeconds + horizontalHalfSpan : undefined,
-      yMinVolts: typeof resolvedCenterVolts === "number" && typeof verticalHalfSpan === "number" ? resolvedCenterVolts - verticalHalfSpan : undefined,
-      yMaxVolts: typeof resolvedCenterVolts === "number" && typeof verticalHalfSpan === "number" ? resolvedCenterVolts + verticalHalfSpan : undefined,
-    };
-    if (Object.values(preferredViewport).some((value) => typeof value === "number")) {
-      result.preferredViewport = preferredViewport;
-    }
-    result.transport.setupCommand = waveformSetup;
-    return result;
+  const executeKeysightWaveformCommand = useCallback(async (target: { host: string; port: number }, command: EquipmentCommand, inputValues?: Record<string, unknown>): Promise<SiglentWaveformResult> => {
+    if (!activeBridge) throw new Error("Bridge URL is required before executing device commands.");
+    return executeKeysightWaveformCommandExternal({
+      activeBridge,
+      target,
+      command,
+      inputValues,
+      fetchTcpText,
+      callBridge,
+    }) as Promise<SiglentWaveformResult>;
   }, [activeBridge]);
 
   const runDeviceCommand = useCallback(async (device: EquipmentDevice, command: EquipmentCommand) => {
@@ -2791,7 +2152,9 @@ export default function EquipmentManager({ config }: ModuleProps) {
       const payload = applyTemplate(command.payload, inputValues);
       const output = command.parser === "siglent-waveform"
         ? await executeSiglentWaveformCommand(target, command, inputValues)
-        : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, command, payload));
+        : command.parser === "keysight-waveform"
+          ? await executeKeysightWaveformCommand(target, command, inputValues)
+          : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, command, payload));
       const result: ExecutionResult = {
         scope: "command",
         title: `${device.name} · ${command.name}`,
@@ -2958,7 +2321,9 @@ export default function EquipmentManager({ config }: ModuleProps) {
         };
         const output = resolvedCommand.parser === "siglent-waveform"
           ? await executeSiglentWaveformCommand(target, resolvedCommand, resolvedInputs)
-          : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, resolvedCommand, payload));
+          : resolvedCommand.parser === "keysight-waveform"
+            ? await executeKeysightWaveformCommand(target, resolvedCommand, resolvedInputs)
+            : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, resolvedCommand, payload));
         const outputs = extractCommandOutputs(resolvedCommand, output);
         stepOutputContext.set(step.id, outputs);
         stepResults.push({

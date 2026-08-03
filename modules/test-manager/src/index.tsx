@@ -1,5 +1,5 @@
 import React, { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { parse as parseYaml } from "yaml";
 import ReactMarkdown from "react-markdown";
@@ -1771,6 +1771,80 @@ function ensureResult(run: TestRun, test: ResolvedTest, userEmail?: string): Res
   };
 }
 
+function pruneResultArtifacts(result: ResultRecord, validArtifactFieldIds: Set<string>): ResultRecord {
+  let changed = false;
+  const typedArtifacts = Object.fromEntries(
+    Object.entries(result.typedArtifacts)
+      .filter(([fieldId]) => validArtifactFieldIds.has(fieldId))
+      .map(([fieldId, artifacts]) => {
+        const normalized = (artifacts ?? []).filter((artifact) => artifact && typeof artifact.id === "string" && artifact.id.trim());
+        if (normalized.length !== artifacts.length) changed = true;
+        return [fieldId, normalized];
+      })
+      .filter(([, artifacts]) => artifacts.length > 0),
+  );
+  if (Object.keys(typedArtifacts).length !== Object.keys(result.typedArtifacts).length) changed = true;
+  if (!changed) return result;
+  return {
+    ...result,
+    typedArtifacts,
+  };
+}
+
+function pruneRunArtifacts(run: TestRun, definition: TestDefinition, testsById: Map<string, ResolvedTest>, userEmail?: string): TestRun {
+  const validArtifactFieldIds = new Set(definition.inputFields.filter(isArtifactField).map((field) => field.id));
+  let changed = false;
+  const resultsByTestId = Object.fromEntries(
+    Object.entries(run.resultsByTestId).map(([testId, stored]) => {
+      const test = testsById.get(testId);
+      const result = test ? ensureResult({ ...run, resultsByTestId: { [testId]: stored } }, test, userEmail) : stored;
+      const pruned = pruneResultArtifacts(result, validArtifactFieldIds);
+      if (pruned !== stored) changed = true;
+      return [testId, pruned];
+    }),
+  );
+  if (!changed) return run;
+  return {
+    ...run,
+    resultsByTestId,
+    updatedAt: nowIso(),
+  };
+}
+
+function pruneWorkspaceArtifacts(workspace: WorkspaceState, definition: TestDefinition, testsById: Map<string, ResolvedTest>, userEmail?: string): WorkspaceState {
+  let changed = false;
+  const runs = workspace.runs.map((run) => {
+    const pruned = pruneRunArtifacts(run, definition, testsById, userEmail);
+    if (pruned !== run) changed = true;
+    return pruned;
+  });
+  return changed ? { ...workspace, runs } : workspace;
+}
+
+async function clearS3Prefix(s3: S3Client, bucket: string, prefix: string): Promise<void> {
+  let continuationToken: string | undefined;
+  do {
+    const listed = await s3.send(new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: prefix,
+      ContinuationToken: continuationToken,
+    }));
+    const objects = (listed.Contents ?? [])
+      .map((item) => item.Key)
+      .filter((key): key is string => Boolean(key));
+    if (objects.length > 0) {
+      await s3.send(new DeleteObjectsCommand({
+        Bucket: bucket,
+        Delete: {
+          Objects: objects.map((Key) => ({ Key })),
+          Quiet: true,
+        },
+      }));
+    }
+    continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+  } while (continuationToken);
+}
+
 function getLinkedValueLabel(definition: TestDefinition, field: FieldDefinition, value: unknown): string | undefined {
   if (!isMeaningful(value)) return undefined;
   const setName = field.linkedValueSet;
@@ -1934,6 +2008,142 @@ function artifactArchivePath(testId: string, artifact: ArtifactRef, fieldId?: st
 
 function overviewArtifactArchivePath(artifact: ArtifactRef): string {
   return `overview/${safeFileSegment(artifact.id)}-${safeFileSegment(artifact.name)}`;
+}
+
+function instrumentSessionPreviewAssetPath(session: InstrumentSessionRecord, entry: InstrumentSessionEntry, suffix: "chart.svg" | "waveform.csv"): string {
+  return `instrument-sessions/${safeFileSegment(session.testId)}/${safeFileSegment(session.id)}/${safeFileSegment(entry.id)}-${suffix}`;
+}
+
+function buildWaveformPreviewCsv(preview: NonNullable<InstrumentSessionEntry["preview"]>): string {
+  const points = preview.points ?? [];
+  const lines = ["index,time_seconds,voltage,raw_code"];
+  for (const point of points) {
+    lines.push(`${point.index},${point.timeSeconds},${point.voltage},${point.rawCode}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function buildWaveformPreviewSvg(preview: NonNullable<InstrumentSessionEntry["preview"]>, title: string): string {
+  const points = preview.points ?? [];
+  if (points.length === 0) {
+    return `<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520"><rect width="1200" height="520" fill="#ffffff"/><text x="60" y="80" font-family="Segoe UI, Arial, sans-serif" font-size="24" fill="#0f172a">${escapeHtml(title)}</text><text x="60" y="130" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#64748b">No waveform points available.</text></svg>`;
+  }
+  const width = 1200;
+  const cursorCount = (preview.cursors ?? []).length;
+  const mathCount = (preview.mathRows ?? []).length;
+  const footerRows = Math.max(cursorCount, mathCount, 1);
+  const footerHeight = 52 + (footerRows * 28);
+  const height = 440 + footerHeight;
+  const left = 90;
+  const right = 36;
+  const top = 56;
+  const bottom = 54 + footerHeight;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const visibleRange = preview.visibleRange ?? [0, points.length - 1];
+  const startIndex = Math.max(0, Math.min(points.length - 1, visibleRange[0] ?? 0));
+  const endIndex = Math.max(startIndex + 1, Math.min(points.length - 1, visibleRange[1] ?? (points.length - 1)));
+  const visiblePoints = points.slice(startIndex, endIndex + 1);
+  const xMin = visiblePoints[0]!.timeSeconds;
+  const xMax = visiblePoints[visiblePoints.length - 1]!.timeSeconds;
+  const yRange = preview.yRange;
+  const derivedYMin = visiblePoints.reduce((min, point) => Math.min(min, point.voltage), Number.POSITIVE_INFINITY);
+  const derivedYMax = visiblePoints.reduce((max, point) => Math.max(max, point.voltage), Number.NEGATIVE_INFINITY);
+  const yMin = yRange?.[0] ?? derivedYMin;
+  const yMax = yRange?.[1] ?? derivedYMax;
+  const safeXSpan = Math.max(1e-12, xMax - xMin);
+  const safeYSpan = Math.max(1e-9, yMax - yMin);
+  const toX = (timeSeconds: number) => left + ((timeSeconds - xMin) / safeXSpan) * plotWidth;
+  const toY = (voltage: number) => top + ((yMax - voltage) / safeYSpan) * plotHeight;
+  const path = visiblePoints.map((point, index) => `${index === 0 ? "M" : "L"}${toX(point.timeSeconds).toFixed(2)},${toY(point.voltage).toFixed(2)}`).join(" ");
+  const verticalGrid = Array.from({ length: 11 }, (_, index) => {
+    const x = left + (index / 10) * plotWidth;
+    const time = xMin + (index / 10) * safeXSpan;
+    return {
+      line: `<line x1="${x.toFixed(2)}" y1="${top}" x2="${x.toFixed(2)}" y2="${top + plotHeight}" stroke="#dbe7f3" stroke-width="1"/>`,
+      label: `<text x="${x.toFixed(2)}" y="${top + plotHeight + 26}" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#475569">${escapeHtml(time.toExponential(3))}</text>`,
+    };
+  });
+  const horizontalGrid = Array.from({ length: 11 }, (_, index) => {
+    const y = top + (index / 10) * plotHeight;
+    const volts = yMax - (index / 10) * safeYSpan;
+    return {
+      line: `<line x1="${left}" y1="${y.toFixed(2)}" x2="${left + plotWidth}" y2="${y.toFixed(2)}" stroke="#dbe7f3" stroke-width="1"/>`,
+      label: `<text x="${left - 12}" y="${(y + 4).toFixed(2)}" text-anchor="end" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#475569">${escapeHtml(volts.toFixed(3))}</text>`,
+    };
+  });
+  const cursorDetails = (preview.cursors ?? []).flatMap((cursor) => {
+    const point = points[cursor.index];
+    if (!point) return [];
+    const x = toX(point.timeSeconds);
+    const y = toY(point.voltage);
+    return [{
+      ...cursor,
+      point,
+      x,
+      y,
+      timeLabel: `${(point.timeSeconds * 1e3).toFixed(3)} ms`,
+      voltageLabel: `${point.voltage.toFixed(3)} V`,
+      lineSvg: [
+        `<line x1="${x.toFixed(2)}" y1="${top}" x2="${x.toFixed(2)}" y2="${top + plotHeight}" stroke="${cursor.color}" stroke-width="1.5" stroke-dasharray="6 4"/>`,
+        `<line x1="${left}" y1="${y.toFixed(2)}" x2="${left + plotWidth}" y2="${y.toFixed(2)}" stroke="${cursor.color}" stroke-width="1.5" stroke-dasharray="6 4"/>`,
+        `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="4" fill="${cursor.color}"/>`,
+      ].join(""),
+    }];
+  });
+  const cursorLines = cursorDetails.map((cursor) => cursor.lineSvg).join("");
+  const cursorCallouts = cursorDetails.map((cursor) =>
+    `<text x="${Math.min(width - 180, cursor.x + 8).toFixed(2)}" y="${Math.max(top + 14, cursor.y - 8).toFixed(2)}" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="${cursor.color}">${escapeHtml(cursor.label)}</text>`
+  ).join("");
+  const mathDetails = (preview.mathRows ?? []).flatMap((row) => {
+    const a = cursorDetails.find((cursor) => cursor.id === row.a);
+    const b = cursorDetails.find((cursor) => cursor.id === row.b);
+    if (!a || !b) return [];
+    const dx = b.point.timeSeconds - a.point.timeSeconds;
+    const dy = b.point.voltage - a.point.voltage;
+    const slope = dy / Math.max(1e-12, Math.abs(dx));
+    let label = "";
+    if (row.op === "dx") label = `Dt ${(dx * 1e3).toFixed(3)} ms / Dv ${dy.toFixed(3)} V`;
+    else if (row.op === "dy") label = `Dt ${(dx * 1e3).toFixed(3)} ms / Dv ${dy.toFixed(3)} V`;
+    else if (row.op === "abs-dy") label = `Dt ${(dx * 1e3).toFixed(3)} ms / |Dv| ${Math.abs(dy).toFixed(3)} V`;
+    else label = `Dt ${(dx * 1e3).toFixed(3)} ms / dV/dt ${slope.toFixed(4)} V/s`;
+    return [{ ...row, label }];
+  });
+  const footerBaseY = top + plotHeight + 44;
+  const cursorCards = cursorDetails.map((cursor, index) => {
+    const cardY = footerBaseY + (index * 28);
+    return [
+      `<rect x="${left}" y="${cardY}" width="420" height="22" rx="8" fill="#f8fbff" stroke="#dbe7f3"/>`,
+      `<text x="${left + 12}" y="${cardY + 15}" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="${cursor.color}">${escapeHtml(cursor.label)}</text>`,
+      `<text x="${left + 58}" y="${cardY + 15}" font-family="Segoe UI, Arial, sans-serif" font-size="12" fill="#0f172a">${escapeHtml(cursor.timeLabel)} · ${escapeHtml(cursor.voltageLabel)}</text>`,
+    ].join("");
+  }).join("");
+  const mathCards = mathDetails.map((row, index) => {
+    const cardY = footerBaseY + (index * 28);
+    return [
+      `<rect x="${left + 450}" y="${cardY}" width="620" height="22" rx="8" fill="#f8fbff" stroke="#dbe7f3"/>`,
+      `<text x="${left + 462}" y="${cardY + 15}" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="700" fill="#0f172a">${escapeHtml(row.label)}</text>`,
+    ].join("");
+  }).join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <rect width="${width}" height="${height}" fill="#ffffff"/>
+  <text x="${left}" y="28" font-family="Segoe UI, Arial, sans-serif" font-size="24" fill="#0f172a">${escapeHtml(title)}</text>
+  <text x="${left}" y="46" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#475569">${escapeHtml(preview.channel ?? "waveform")} · ${escapeHtml(String(preview.sampleCount ?? visiblePoints.length))} samples</text>
+  <rect x="${left}" y="${top}" width="${plotWidth}" height="${plotHeight}" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2"/>
+  ${verticalGrid.map((entry) => entry.line).join("")}
+  ${horizontalGrid.map((entry) => entry.line).join("")}
+  <path d="${path}" fill="none" stroke="#2563eb" stroke-width="2"/>
+  ${cursorLines}
+  ${cursorCallouts}
+  ${verticalGrid.map((entry) => entry.label).join("")}
+  ${horizontalGrid.map((entry) => entry.label).join("")}
+  <text x="${left + (plotWidth / 2)}" y="${top + plotHeight + 42}" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#0f172a">Time (s)</text>
+  <text x="22" y="${top + (plotHeight / 2)}" text-anchor="middle" transform="rotate(-90 22 ${top + (plotHeight / 2)})" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#0f172a">Voltage (V)</text>
+  <line x1="${left}" y1="${top + plotHeight + 50}" x2="${left + plotWidth}" y2="${top + plotHeight + 50}" stroke="#dbe7f3" stroke-width="1"/>
+  ${cursorCards}
+  ${mathCards}
+</svg>`;
 }
 
 function buildInstrumentConfigStorageKey(projectId: string, moduleId: string): string {
@@ -2929,6 +3139,17 @@ function generateReportPages(
             detail.push(`- Artifact: ${markdownArtifactLink(entry.artifact.name, artifactHref({ test, fieldId: null, artifact: entry.artifact }))}`);
             detail.push("");
           }
+          if (entry.preview?.kind === "waveform") {
+            const chartPath = instrumentSessionPreviewAssetPath(session, entry, "chart.svg");
+            const csvPath = instrumentSessionPreviewAssetPath(session, entry, "waveform.csv");
+            assets[chartPath] = { content: buildWaveformPreviewSvg(entry.preview, `${session.scriptTitle} - ${entry.title}`), contentType: "image/svg+xml" };
+            assets[csvPath] = { content: buildWaveformPreviewCsv(entry.preview), contentType: "text/csv;charset=utf-8" };
+            detail.push(`- Chart: [${escapeMarkdownCell(entry.title)} chart](../${chartPath})`);
+            detail.push(`- Waveform CSV: [${escapeMarkdownCell(entry.title)} data](../${csvPath})`);
+            detail.push("");
+            detail.push(`![${escapeMarkdownCell(entry.title)} chart](../${chartPath})`);
+            detail.push("");
+          }
           if (entry.error) {
             detail.push(`- Error: ${escapeMarkdownCell(entry.error)}`);
             detail.push("");
@@ -3706,6 +3927,13 @@ function TestManagerInner({ config }: ModuleProps) {
   );
   const activeExcludedIds = useMemo(() => new Set(activeRun?.excludedTestIds ?? []), [activeRun]);
   const includedTests = useMemo(() => resolvedTests.filter((test) => !activeExcludedIds.has(test.id)), [resolvedTests, activeExcludedIds]);
+
+  useEffect(() => {
+    if (!definition || !workspace || loading) return;
+    const pruned = pruneWorkspaceArtifacts(workspace, definition, testsById, user?.email);
+    if (pruned === workspace) return;
+    void persistWorkspace(pruned, "Removed stale artifact references");
+  }, [definition, loading, persistWorkspace, testsById, user?.email, workspace]);
   const staleTestIds = useMemo(() => {
     const stale = new Set<string>();
     if (!activeRun) return stale;
@@ -4528,7 +4756,8 @@ function TestManagerInner({ config }: ModuleProps) {
 
   const buildReportFiles = useCallback(async (): Promise<Record<string, ZipFileContent> | null> => {
     if (!definition || !activeRun) return null;
-    const zipPages = generateReportPages(definition, activeRun, includedTests, {
+    const exportRun = pruneRunArtifacts(activeRun, definition, testsById, user?.email);
+    const zipPages = generateReportPages(definition, exportRun, includedTests, {
       artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
       overviewArtifactHref: (artifact) => overviewArtifactArchivePath(artifact),
     });
@@ -4542,7 +4771,7 @@ function TestManagerInner({ config }: ModuleProps) {
 
     const manifest: Array<Record<string, string | number | null>> = [];
     const s3 = await getS3Client(storage.bucket);
-    for (const entry of activeRun.overviewArtifacts ?? []) {
+    for (const entry of exportRun.overviewArtifacts ?? []) {
       const archivePath = overviewArtifactArchivePath(entry.artifact);
       const bytes = await readOptionalBytes(s3, entry.artifact.bucket, entry.artifact.key);
       if (bytes) files[archivePath] = bytes;
@@ -4560,7 +4789,7 @@ function TestManagerInner({ config }: ModuleProps) {
       });
     }
     for (const test of includedTests) {
-      const result = ensureResult(activeRun, test, user?.email);
+      const result = ensureResult(exportRun, test, user?.email);
       for (const [fieldId, artifacts] of Object.entries(result.typedArtifacts)) {
         for (const artifact of artifacts) {
           const archivePath = artifactArchivePath(test.id, artifact, fieldId);
@@ -4596,7 +4825,7 @@ function TestManagerInner({ config }: ModuleProps) {
         });
       }
     }
-    for (const session of activeRun.instrumentSessions ?? []) {
+    for (const session of exportRun.instrumentSessions ?? []) {
       for (const entry of session.entries) {
         if (!entry.artifact) continue;
         const archivePath = getInstrumentSessionArchivePath(session, entry.artifact);
@@ -5463,38 +5692,49 @@ function TestManagerInner({ config }: ModuleProps) {
 
 export async function onExport(ctx: ExportContext): Promise<void> {
   const storage = getStorageInfo(ctx.config);
+  const exportPrefix = `${ctx.projectPrefix}${ctx.config.id}/export/`;
   const [definitionText, workspaceText] = await Promise.all([
     readOptionalText(ctx.s3Client as S3Client, storage.bucket, storage.definitionKey),
     readOptionalText(ctx.s3Client as S3Client, storage.bucket, storage.resultsKey),
   ]);
 
+  await clearS3Prefix(ctx.s3Client as S3Client, storage.bucket, exportPrefix);
+
   if (definitionText) {
-    await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/definition.yaml`, definitionText, "text/yaml;charset=utf-8");
+    await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}definition.yaml`, definitionText, "text/yaml;charset=utf-8");
   }
   if (workspaceText) {
-    await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/workspace.json`, workspaceText, "application/json");
+    await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}workspace.json`, workspaceText, "application/json");
   }
 
   if (definitionText && workspaceText) {
     const definition = parseDefinition(definitionText);
-    const workspace = normalizeWorkspaceState(JSON.parse(workspaceText), storage.projectId);
+    const normalizedWorkspace = normalizeWorkspaceState(JSON.parse(workspaceText), storage.projectId);
+    const allTests = buildResolvedTests(definition);
+    const testsById = new Map(allTests.map((test) => [test.id, test] as const));
+    const workspace = pruneWorkspaceArtifacts(normalizedWorkspace, definition, testsById);
+    if (workspace !== normalizedWorkspace) {
+      await writeText(ctx.s3Client as S3Client, storage.bucket, storage.resultsKey, JSON.stringify(workspace, null, 2), "application/json");
+      await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}workspace.json`, JSON.stringify(workspace, null, 2), "application/json");
+    }
     const activeRun = getActiveRun(workspace);
-    const tests = buildResolvedTests(definition);
+    const excludedIds = new Set(activeRun.excludedTestIds ?? []);
+    const tests = allTests.filter((test) => !excludedIds.has(test.id));
     const pages = generateReportPages(definition, activeRun, tests, {
       artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
       overviewArtifactHref: (artifact) => overviewArtifactArchivePath(artifact),
     });
-    await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/report.md`, pages.summary, "text/markdown;charset=utf-8");
+    await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}report.md`, pages.summary, "text/markdown;charset=utf-8");
     for (const [testId, detail] of Object.entries(pages.details)) {
-      await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/tests/${testId}.md`, detail, "text/markdown;charset=utf-8");
+      await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}tests/${testId}.md`, detail, "text/markdown;charset=utf-8");
     }
     for (const [path, asset] of Object.entries(pages.assets)) {
-      await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/${path}`, asset.content, asset.contentType);
+      await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}${path}`, asset.content, asset.contentType);
     }
 
     const manifest: Array<Record<string, string | number | null>> = [];
     for (const entry of activeRun.overviewArtifacts ?? []) {
-      const exportPath = `${ctx.projectPrefix}${ctx.config.id}/export/${overviewArtifactArchivePath(entry.artifact)}`;
+      const exportPath = `${exportPrefix}${overviewArtifactArchivePath(entry.artifact)}`;
       const bytes = await readOptionalBytes(ctx.s3Client as S3Client, entry.artifact.bucket, entry.artifact.key);
       if (bytes) {
         await writeBytes(ctx.s3Client as S3Client, storage.bucket, exportPath, bytes, entry.artifact.contentType || "application/octet-stream");
@@ -5516,7 +5756,7 @@ export async function onExport(ctx: ExportContext): Promise<void> {
       const result = ensureResult(activeRun, test);
       for (const [fieldId, artifacts] of Object.entries(result.typedArtifacts)) {
         for (const artifact of artifacts) {
-          const exportPath = `${ctx.projectPrefix}${ctx.config.id}/export/${artifactArchivePath(test.id, artifact, fieldId)}`;
+          const exportPath = `${exportPrefix}${artifactArchivePath(test.id, artifact, fieldId)}`;
           const bytes = await readOptionalBytes(ctx.s3Client as S3Client, artifact.bucket, artifact.key);
           if (bytes) {
             await writeBytes(ctx.s3Client as S3Client, storage.bucket, exportPath, bytes, artifact.contentType || "application/octet-stream");
@@ -5535,7 +5775,7 @@ export async function onExport(ctx: ExportContext): Promise<void> {
         }
       }
       for (const artifact of result.supportingArtifacts) {
-        const exportPath = `${ctx.projectPrefix}${ctx.config.id}/export/${artifactArchivePath(test.id, artifact, null)}`;
+        const exportPath = `${exportPrefix}${artifactArchivePath(test.id, artifact, null)}`;
         const bytes = await readOptionalBytes(ctx.s3Client as S3Client, artifact.bucket, artifact.key);
         if (bytes) {
           await writeBytes(ctx.s3Client as S3Client, storage.bucket, exportPath, bytes, artifact.contentType || "application/octet-stream");
@@ -5557,7 +5797,7 @@ export async function onExport(ctx: ExportContext): Promise<void> {
       for (const entry of session.entries) {
         if (!entry.artifact) continue;
         const archivePath = getInstrumentSessionArchivePath(session, entry.artifact);
-        const exportPath = `${ctx.projectPrefix}${ctx.config.id}/export/${archivePath}`;
+        const exportPath = `${exportPrefix}${archivePath}`;
         const bytes = await readOptionalBytes(ctx.s3Client as S3Client, entry.artifact.bucket, entry.artifact.key);
         if (bytes) {
           await writeBytes(ctx.s3Client as S3Client, storage.bucket, exportPath, bytes, entry.artifact.contentType || "application/octet-stream");
@@ -5575,6 +5815,6 @@ export async function onExport(ctx: ExportContext): Promise<void> {
         });
       }
     }
-    await writeText(ctx.s3Client as S3Client, storage.bucket, `${ctx.projectPrefix}${ctx.config.id}/export/evidence/manifest.json`, JSON.stringify(manifest, null, 2), "application/json");
+    await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}evidence/manifest.json`, JSON.stringify(manifest, null, 2), "application/json");
   }
 }
