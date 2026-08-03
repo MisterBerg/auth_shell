@@ -2462,17 +2462,24 @@ function renderInstrumentSessionWindowShellHtml(): string {
           };
           const render = function() {
             const range = clampRange();
-            const visible = samples.slice(range[0], range[1]);
-            const sampled = visible.length > 1500 ? visible.filter(function(_, index) { return index % Math.ceil(visible.length / 1500) === 0 || index === visible.length - 1; }) : visible;
+            const sliceStart = Math.max(0, Math.floor(range[0]));
+            const sliceEnd = Math.min(samples.length, Math.ceil(range[1]));
+            const visible = samples.slice(sliceStart, sliceEnd);
+            const visibleWithIndex = visible.map(function(sample, index) {
+              return { sample: sample, sourceIndex: sliceStart + index };
+            });
+            const sampled = visibleWithIndex.length > 1500
+              ? visibleWithIndex.filter(function(_, index) { return index % Math.ceil(visibleWithIndex.length / 1500) === 0 || index === visibleWithIndex.length - 1; })
+              : visibleWithIndex;
             const yMin = Math.min(state.yRange[0], state.yRange[1]);
             const yMax = Math.max(state.yRange[0], state.yRange[1]);
             const ySpan = Math.max(1e-6, yMax - yMin);
             const xSpan = Math.max(1, range[1] - range[0] - 1);
             const plotLeft = 64, plotTop = 12, plotWidth = 916, plotHeight = 320, plotRight = plotLeft + plotWidth, plotBottom = plotTop + plotHeight;
-            const points = sampled.map(function(sample, idx) {
-              const sourceIndex = range[0] + Math.round((idx / Math.max(1, sampled.length - 1)) * xSpan);
+            const points = sampled.map(function(point, idx) {
+              const sourceIndex = point.sourceIndex;
               const x = plotLeft + (((sourceIndex - range[0]) / xSpan) * plotWidth);
-              const y = plotBottom - (((sample - yMin) / ySpan) * plotHeight);
+              const y = plotBottom - (((point.sample - yMin) / ySpan) * plotHeight);
               return (idx === 0 ? "M" : "L") + " " + x.toFixed(2) + " " + y.toFixed(2);
             }).join(" ");
             const cursorDetails = state.cursors.map(function(cursor) {
@@ -2526,7 +2533,7 @@ function renderInstrumentSessionWindowShellHtml(): string {
                     '<circle cx="' + x + '" cy="' + y + '" r="4.5" fill="' + cursor.color + '"></circle>';
                 }).join('') +
               '</svg>' +
-              '<input class="wave-slider" type="range" min="0" max="' + Math.max(0, samples.length - (range[1] - range[0])) + '" step="1" value="' + Math.min(Math.max(0, samples.length - (range[1] - range[0])), range[0]) + '" data-action="xslider" />' +
+              '<input class="wave-slider" type="range" min="0" max="' + Math.max(0, samples.length - (range[1] - range[0])) + '" step="0.01" value="' + Math.min(Math.max(0, samples.length - (range[1] - range[0])), range[0]) + '" data-action="xslider" />' +
               (cursorDetails.length ? '<div class="wave-cursor-list">' + cursorDetails.map(function(cursor) {
                 return '<div class="wave-card"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center;"><div><strong>' + cursor.label + '</strong> <span style="color:#475569;font-size:12px;">' + (((entry.preview && typeof entry.preview.startTimeSeconds === "number" && typeof entry.preview.intervalSeconds === "number") ? (((entry.preview.startTimeSeconds + (cursor.index * entry.preview.intervalSeconds)) * 1e3).toFixed(3) + ' ms') : ('index ' + cursor.index)) + ' · ' + engineeringSample(cursor.sample) + ' V') + '</span></div><button type="button" data-remove-cursor="' + cursor.id + '">Remove</button></div></div>';
               }).join('') + '</div>' : '') +
@@ -2610,28 +2617,31 @@ function renderInstrumentSessionWindowShellHtml(): string {
                 return;
               }
               dragState = { startX: event.clientX, startRange: [range[0], range[1]] };
-              chart.setPointerCapture(event.pointerId);
+              const moveHandler = function(moveEvent) {
+                if (!dragState) return;
+                const latestChart = host.querySelector('[data-action="chart"]');
+                if (!latestChart) return;
+                const latestBounds = latestChart.getBoundingClientRect();
+                const latestPlotClientWidth = (plotWidth / 1000) * latestBounds.width;
+                const pixelDeltaX = moveEvent.clientX - dragState.startX;
+                const pointsPerPixel = ((dragState.startRange[1] - dragState.startRange[0]) / Math.max(1, latestPlotClientWidth)) * 0.01;
+                const pointDelta = pixelDeltaX * pointsPerPixel;
+                let nextStart = dragState.startRange[0] - pointDelta;
+                let nextEnd = dragState.startRange[1] - pointDelta;
+                const span = nextEnd - nextStart;
+                if (nextStart < 0) { nextStart = 0; nextEnd = span; }
+                if (nextEnd > samples.length) { nextEnd = samples.length; nextStart = Math.max(0, nextEnd - span); }
+                state.visibleRange = [nextStart, nextEnd];
+                render();
+              };
+              const upHandler = function() {
+                dragState = null;
+                window.removeEventListener('pointermove', moveHandler);
+                window.removeEventListener('pointerup', upHandler);
+              };
+              window.addEventListener('pointermove', moveHandler);
+              window.addEventListener('pointerup', upHandler);
             };
-            chart.onpointermove = function(event) {
-              if (!dragState) return;
-              const bounds = chart.getBoundingClientRect();
-              const plotClientWidth = (plotWidth / 1000) * bounds.width;
-              const pixelDeltaX = event.clientX - dragState.startX;
-              const pointsPerPixel = (dragState.startRange[1] - dragState.startRange[0]) / Math.max(1, plotClientWidth);
-              const pointDelta = pixelDeltaX * pointsPerPixel;
-              let nextStart = dragState.startRange[0] - pointDelta;
-              let nextEnd = dragState.startRange[1] - pointDelta;
-              const span = nextEnd - nextStart;
-              if (nextStart < 0) { nextStart = 0; nextEnd = span; }
-              if (nextEnd > samples.length) { nextEnd = samples.length; nextStart = Math.max(0, nextEnd - span); }
-              state.visibleRange = [nextStart, nextEnd];
-              render();
-            };
-            chart.onpointerup = function(event) {
-              dragState = null;
-              try { chart.releasePointerCapture(event.pointerId); } catch (_) {}
-            };
-            chart.onpointerleave = function() { dragState = null; };
           };
           render();
         }
@@ -3570,8 +3580,10 @@ function TestManagerInner({ config }: ModuleProps) {
   const operatorNotesField = useMemo(() => (definition?.inputFields ?? []).find((field) => field.id === "operator_notes"), [definition]);
   const activeRun = workspace ? getActiveRun(workspace) : null;
   const selectedPersistedSession = useMemo(
-    () => activeRun && selectedInstrumentSessionId ? (activeRun.instrumentSessions ?? []).find((session) => session.id === selectedInstrumentSessionId) ?? null : null,
-    [activeRun, selectedInstrumentSessionId],
+    () => activeRun && selectedInstrumentSessionId && selectedTestId
+      ? (activeRun.instrumentSessions ?? []).find((session) => session.id === selectedInstrumentSessionId && session.testId === selectedTestId) ?? null
+      : null,
+    [activeRun, selectedInstrumentSessionId, selectedTestId],
   );
   const visibleInstrumentSession = activeInstrumentSession ?? selectedPersistedSession;
   const isInstrumentSessionReadOnly = Boolean(!activeInstrumentSession && selectedPersistedSession);
@@ -3580,6 +3592,18 @@ function TestManagerInner({ config }: ModuleProps) {
     if (!selectedTestId && resolvedTests[0]) setSelectedTestId(resolvedTests[0].id);
     if (selectedTestId && !testsById.has(selectedTestId) && resolvedTests[0]) setSelectedTestId(resolvedTests[0].id);
   }, [resolvedTests, selectedTestId, testsById]);
+
+  useEffect(() => {
+    if (activeInstrumentSession) return;
+    if (!selectedInstrumentSessionId || !selectedTestId) return;
+    const matchingSession = (activeRun?.instrumentSessions ?? []).find((session) => session.id === selectedInstrumentSessionId);
+    if (!matchingSession || matchingSession.testId === selectedTestId) return;
+    setSelectedInstrumentSessionId(null);
+    if (instrumentSessionWindowRef.current && !instrumentSessionWindowRef.current.closed) {
+      instrumentSessionWindowRef.current.close();
+    }
+    instrumentSessionWindowRef.current = null;
+  }, [activeInstrumentSession, activeRun, selectedInstrumentSessionId, selectedTestId]);
 
   useEffect(() => {
     let parsed: unknown = null;
