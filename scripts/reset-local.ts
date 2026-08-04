@@ -7,7 +7,7 @@
 
 import { execFileSync, execSync, spawn } from "child_process";
 import { createRequire } from "module";
-import { readFileSync, existsSync } from "fs";
+import { mkdirSync, readFileSync, existsSync, writeFileSync } from "fs";
 import { resolve, join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -21,6 +21,7 @@ const MINIO_HEALTH = "http://localhost:9000/minio/health/live";
 const DYNAMODB_SHELL = "http://localhost:8000/shell/";
 const MODULES_BUCKET = "hep-dev-modules";
 const DEV_PORT = 5173;
+const AGENT_BRIDGE_PORT = 4317;
 
 type ComposeCommand = {
   command: string;
@@ -78,6 +79,104 @@ function runShell(command: string) {
 
 function runTsx(scriptPath: string, scriptArgs: string[] = []) {
   run(process.execPath, [TSX_CLI, scriptPath, ...scriptArgs]);
+}
+
+function plistEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function installAgentRuntimeForCurrentOs() {
+  if (process.platform === "darwin") {
+    installMacosDevAgentRuntime();
+    return;
+  }
+
+  if (process.platform === "win32") {
+    runTsx("scripts/manage-agent-runtime.ts", ["install"]);
+    return;
+  }
+
+  console.log(`  Agent runtime install is not implemented for ${process.platform}; skipping.`);
+}
+
+function installMacosDevAgentRuntime() {
+  const home = process.env["HOME"];
+  if (!home) throw new Error("HOME is required to install the macOS dev agent runtime.");
+
+  const uid = execSync("id -u", { encoding: "utf-8" }).trim();
+  const appHome = join(home, "Library", "Application Support", "Jeffspace Agent Runtime");
+  const runtimeDir = join(appHome, "dev");
+  const launchAgentsDir = join(home, "Library", "LaunchAgents");
+  const logDir = join(home, "Library", "Logs", "Jeffspace Agent Runtime");
+  const bridgeBundlePath = join(runtimeDir, "agent-bridge-current.cjs");
+  const plistPath = join(launchAgentsDir, "com.jeffspace.agent-runtime.dev.plist");
+  const esbuild = require.resolve("esbuild/bin/esbuild");
+
+  mkdirSync(runtimeDir, { recursive: true });
+  mkdirSync(launchAgentsDir, { recursive: true });
+  mkdirSync(logDir, { recursive: true });
+
+  console.log("  Building current bridge bundle...");
+  run(esbuild, [
+    "scripts/agent-bridge.ts",
+    "--bundle",
+    "--platform=node",
+    "--format=cjs",
+    "--target=node20",
+    `--outfile=${bridgeBundlePath}`,
+  ]);
+
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jeffspace.agent-runtime.dev</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${plistEscape(process.execPath)}</string>
+    <string>${plistEscape(bridgeBundlePath)}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_BRIDGE_STATE_ROOT</key>
+    <string>${plistEscape(join(appHome, "state"))}</string>
+    <key>AGENT_BRIDGE_BROWSE_ROOT</key>
+    <string>${plistEscape(home)}</string>
+    <key>AGENT_BRIDGE_WORKSPACE_ROOT</key>
+    <string>${plistEscape(ROOT)}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${plistEscape(join(logDir, "dev-runtime.out.log"))}</string>
+  <key>StandardErrorPath</key>
+  <string>${plistEscape(join(logDir, "dev-runtime.err.log"))}</string>
+</dict>
+</plist>
+`;
+  writeFileSync(plistPath, plist, "utf-8");
+
+  console.log("  Restarting current bridge LaunchAgent...");
+  try {
+    execSync(`launchctl bootout gui/${uid}/com.jeffspace.agent-runtime`, { stdio: "ignore" });
+  } catch {
+    // The packaged runtime is not loaded.
+  }
+  try {
+    execSync(`launchctl bootout gui/${uid}/com.jeffspace.agent-runtime.dev`, { stdio: "ignore" });
+  } catch {
+    // The dev runtime is not loaded.
+  }
+  execFileSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { stdio: "inherit" });
+  execFileSync("launchctl", ["kickstart", "-k", `gui/${uid}/com.jeffspace.agent-runtime.dev`], { stdio: "inherit" });
 }
 
 function quoteWindowsArg(value: string): string {
@@ -234,7 +333,7 @@ function publishableModules(): string[] {
 
 async function main() {
   const { developer, noCompose } = parseArgs();
-  const total = noCompose ? 5 : 6;
+  const total = noCompose ? 6 : 7;
   let step = 0;
 
   console.log("\n============================================================");
@@ -243,6 +342,10 @@ async function main() {
 
   heading(++step, total, "Install workspace dependencies");
   run(NPM_COMMAND, ["install", "--cache", "./.npm-cache"]);
+
+  heading(++step, total, "Build and install local agent runtime");
+  installAgentRuntimeForCurrentOs();
+  await waitForService("Agent Runtime Bridge", `http://localhost:${AGENT_BRIDGE_PORT}/health`, 20_000);
 
   if (!noCompose) {
     const compose = composeCmd();
