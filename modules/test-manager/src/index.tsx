@@ -391,10 +391,18 @@ type ReportArtifactContext = {
   artifact: ArtifactRef;
 };
 
+type ReportInstrumentSessionArtifactContext = {
+  test: ResolvedTest;
+  session: InstrumentSessionRecord;
+  entry: InstrumentSessionEntry;
+  artifact: ArtifactRef;
+};
+
 type ReportGenerationOptions = {
   detailHref?: (test: ResolvedTest) => string;
   backToSummaryHref?: string;
   artifactHref?: (context: ReportArtifactContext) => string;
+  instrumentSessionArtifactHref?: (context: ReportInstrumentSessionArtifactContext) => string;
   overviewArtifactHref?: (artifact: ArtifactRef) => string;
   notes?: string[];
 };
@@ -3030,6 +3038,8 @@ function generateReportPages(
   const assets: Record<string, { content: string; contentType: string }> = {};
   const detailHref = options.detailHref ?? ((test: ResolvedTest) => `tests/${safeFileSegment(test.id)}.md`);
   const artifactHref = options.artifactHref ?? ((context: ReportArtifactContext) => `s3://${context.artifact.bucket}/${context.artifact.key}`);
+  const instrumentSessionArtifactHref = options.instrumentSessionArtifactHref
+    ?? ((context: ReportInstrumentSessionArtifactContext) => `s3://${context.artifact.bucket}/${context.artifact.key}`);
   const overviewArtifactHref = options.overviewArtifactHref ?? ((artifact: ArtifactRef) => `s3://${artifact.bucket}/${artifact.key}`);
   const backToSummaryHref = options.backToSummaryHref ?? "../report.md";
 
@@ -3064,14 +3074,6 @@ function generateReportPages(
       }
       summary.push("");
     }
-  }
-  if ((run.instrumentSessions?.length ?? 0) > 0) {
-    summary.push("## Instrument Sessions");
-    summary.push("");
-    for (const session of run.instrumentSessions ?? []) {
-      summary.push(`- ${escapeMarkdownCell(session.scriptTitle)} · ${escapeMarkdownCell(session.testId)} · ${escapeMarkdownCell(formatDate(session.startedAt))} · ${escapeMarkdownCell(session.status)}`);
-    }
-    summary.push("");
   }
   if (definition.programAssets.length > 0) {
     summary.push("## Program Overview");
@@ -3136,7 +3138,7 @@ function generateReportPages(
             detail.push("");
           }
           if (entry.artifact) {
-            detail.push(`- Artifact: ${markdownArtifactLink(entry.artifact.name, artifactHref({ test, fieldId: null, artifact: entry.artifact }))}`);
+            detail.push(`- Artifact: ${markdownArtifactLink(entry.artifact.name, instrumentSessionArtifactHref({ test, session, entry, artifact: entry.artifact }))}`);
             detail.push("");
           }
           if (entry.preview?.kind === "waveform") {
@@ -4759,6 +4761,7 @@ function TestManagerInner({ config }: ModuleProps) {
     const exportRun = pruneRunArtifacts(activeRun, definition, testsById, user?.email);
     const zipPages = generateReportPages(definition, exportRun, includedTests, {
       artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
+      instrumentSessionArtifactHref: ({ session, artifact }) => `../${getInstrumentSessionArchivePath(session, artifact)}`,
       overviewArtifactHref: (artifact) => overviewArtifactArchivePath(artifact),
     });
     const files: Record<string, ZipFileContent> = {
