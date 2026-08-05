@@ -801,7 +801,7 @@ function parseDeviceAddress(address: string): { host: string; port: number } | n
 }
 
 function parseScpiNumber(text: string): number {
-  const matches = Array.from(text.matchAll(/(?:^|[\s,])(-?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/g));
+  const matches = Array.from(text.matchAll(/(?:^|[\s,])([+-]?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/g));
   const match = matches.at(-1);
   if (!match) {
     throw new Error(`Unable to parse numeric value from response: ${text}`);
@@ -1087,6 +1087,33 @@ function isTcpCommandResult(value: unknown): value is TcpCommandResult {
   return typeof record["text"] === "string" || typeof record["bytesBase64"] === "string";
 }
 
+function base64ToBytes(value: string): Uint8Array {
+  const binary = window.atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return window.btoa(binary);
+}
+
+function extractScpiBlockPayloadBase64(bytesBase64: string): string {
+  const bytes = base64ToBytes(bytesBase64);
+  const hashIndex = bytes.indexOf(35);
+  if (hashIndex < 0 || hashIndex + 1 >= bytes.length) return bytesBase64;
+  const digitCount = bytes[hashIndex + 1] - 48;
+  if (digitCount < 1 || digitCount > 9) return bytesBase64;
+  const lengthText = new TextDecoder().decode(bytes.slice(hashIndex + 2, hashIndex + 2 + digitCount));
+  const blockLength = Number(lengthText);
+  if (!Number.isFinite(blockLength) || blockLength < 0) return bytesBase64;
+  const dataStart = hashIndex + 2 + digitCount;
+  const dataEnd = Math.min(bytes.length, dataStart + blockLength);
+  return bytesToBase64(bytes.slice(dataStart, dataEnd));
+}
+
 function isSiglentWaveformResult(value: unknown): value is SiglentWaveformResult {
   if (!value || typeof value !== "object") return false;
   const kind = (value as { kind?: string }).kind;
@@ -1131,7 +1158,7 @@ function ExecutionArtifactView(props: { output: unknown; artifactMode?: Artifact
     if (artifactMode === "image" && output.bytesBase64) {
       return (
         <img
-          src={`data:${guessImageMimeTypeFromName(saveAs)};base64,${output.bytesBase64}`}
+          src={`data:${guessImageMimeTypeFromName(saveAs)};base64,${extractScpiBlockPayloadBase64(output.bytesBase64)}`}
           alt={label}
           style={{ display: "block", maxWidth: "100%", height: "auto", background: "white", borderRadius: 8 }}
         />
@@ -2921,7 +2948,7 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                   ) : currentCommandExecution && isTcpCommandResult(currentCommandExecution.output) ? (
                                     selectedCommand.artifactMode === "image" && currentCommandExecution.output.bytesBase64 ? (
                                       <img
-                                        src={`data:${guessImageMimeType(selectedCommand)};base64,${currentCommandExecution.output.bytesBase64}`}
+                                        src={`data:${guessImageMimeType(selectedCommand)};base64,${extractScpiBlockPayloadBase64(currentCommandExecution.output.bytesBase64)}`}
                                         alt={selectedCommand.name}
                                         style={{ display: "block", maxWidth: "100%", height: "auto", background: "white", borderRadius: 8 }}
                                       />

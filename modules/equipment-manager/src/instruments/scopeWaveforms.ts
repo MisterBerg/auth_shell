@@ -74,7 +74,7 @@ function base64ToBytes(value: string): Uint8Array {
 }
 
 function parseScpiNumber(text: string): number {
-  const matches = Array.from(text.matchAll(/(?:^|[\s,])(-?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/g));
+  const matches = Array.from(text.matchAll(/(?:^|[\s,])([+-]?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/g));
   const match = matches.at(-1);
   if (!match) throw new Error(`Unable to parse numeric value from response: ${text}`);
   const value = Number(match[1]);
@@ -227,8 +227,9 @@ function buildSiglentWaveformResult(args: {
 }
 
 function parseKeysightWaveformPreamble(text: string) {
-  const values = text.split(",").map((part) => Number(part.trim())).filter((value) => Number.isFinite(value));
-  if (values.length < 10) throw new Error(`Unexpected Keysight preamble: ${text}`);
+  const numericCsv = text.match(/[+-]?\d+(?:\.\d+)?(?:E[+-]?\d+)?(?:,[+-]?\d+(?:\.\d+)?(?:E[+-]?\d+)?){9,}/i)?.[0] ?? text.trim();
+  const values = numericCsv.split(",").map((part) => Number(part.trim())).filter((value) => Number.isFinite(value));
+  if (values.length < 10) throw new Error(`Unexpected Keysight preamble: ${text || "<empty response>"}`);
   return {
     xIncrement: values[4]!,
     xOrigin: values[5]!,
@@ -365,13 +366,20 @@ export async function executeKeysightWaveformCommand(args: {
   await args.callBridge<unknown>(args.activeBridge, "execute_tcp_command", { host: args.target.host, port: args.target.port, command: ":WAVeform:UNSigned 1", readMode: "none", timeoutMs: 1500 });
   await args.callBridge<unknown>(args.activeBridge, "execute_tcp_command", { host: args.target.host, port: args.target.port, command: ":WAVeform:POINts:MODE RAW", readMode: "none", timeoutMs: 1500 });
   await args.callBridge<unknown>(args.activeBridge, "execute_tcp_command", { host: args.target.host, port: args.target.port, command: `:WAVeform:POINts ${KEYSIGHT_WAVEFORM_POINT_LIMIT}`, readMode: "none", timeoutMs: 1500 });
-  const [preamble, waveform, voltsPerDivResponse, offsetResponse, timeDivResponse, sampleRateResponse] = await Promise.all([
-    args.fetchTcpText(args.activeBridge, args.target, ":WAVeform:PREamble?"),
-    args.callBridge<TcpCommandResult>(args.activeBridge, "execute_tcp_command", { host: args.target.host, port: args.target.port, command: args.command.payload || ":WAVeform:DATA?", readMode: "until-timeout", timeoutMs: args.command.timeoutMs || 15000, quietMs: 800, encoding: "base64" }),
-    args.fetchTcpText(args.activeBridge, args.target, `:CHANnel${channelNumber}:SCALe?`),
-    args.fetchTcpText(args.activeBridge, args.target, `:CHANnel${channelNumber}:OFFSet?`),
-    args.fetchTcpText(args.activeBridge, args.target, ":TIMebase:SCALe?"),
-    args.fetchTcpText(args.activeBridge, args.target, ":ACQuire:SRATe?").catch(() => ""),
-  ]);
+  let preamble = "";
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    preamble = await args.fetchTcpText(args.activeBridge, args.target, ":WAVeform:PREamble?");
+    try {
+      parseKeysightWaveformPreamble(preamble);
+      break;
+    } catch {
+      await new Promise((resolve) => window.setTimeout(resolve, 150 + (attempt * 150)));
+    }
+  }
+  const waveform = await args.callBridge<TcpCommandResult>(args.activeBridge, "execute_tcp_command", { host: args.target.host, port: args.target.port, command: args.command.payload || ":WAVeform:DATA?", readMode: "until-timeout", timeoutMs: args.command.timeoutMs || 15000, quietMs: 800, encoding: "base64" });
+  const voltsPerDivResponse = await args.fetchTcpText(args.activeBridge, args.target, `:CHANnel${channelNumber}:SCALe?`);
+  const offsetResponse = await args.fetchTcpText(args.activeBridge, args.target, `:CHANnel${channelNumber}:OFFSet?`);
+  const timeDivResponse = await args.fetchTcpText(args.activeBridge, args.target, ":TIMebase:SCALe?");
+  const sampleRateResponse = await args.fetchTcpText(args.activeBridge, args.target, ":ACQuire:SRATe?").catch(() => "");
   return buildKeysightWaveformResult({ channel, waveform, preambleResponse: preamble, voltsPerDivResponse, offsetResponse, timeDivResponse, sampleRateResponse });
 }

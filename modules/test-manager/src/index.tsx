@@ -12,6 +12,7 @@ type ValueMap = Record<string, unknown>;
 type AppSection = "overview" | "run" | "report";
 
 const SIGLENT_WAVEFORM_POINT_LIMIT = 20000;
+const KEYSIGHT_WAVEFORM_POINT_LIMIT = 20000;
 
 type FieldDefinition = {
   id: string;
@@ -179,6 +180,7 @@ type InstrumentScriptStepSpec = {
   command?: string;
   script?: string;
   waitMs?: number;
+  inputs?: Record<string, string>;
   notes?: string;
 };
 
@@ -379,6 +381,16 @@ type StorageInfo = {
   resultsKey: string;
 };
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s.`)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) window.clearTimeout(timer);
+  });
+}
+
 type ReportPages = {
   summary: string;
   details: Record<string, string>;
@@ -515,8 +527,12 @@ function getStorageInfo(config: ModuleProps["config"]): StorageInfo {
 
 async function readOptionalText(s3: S3Client, bucket: string, key: string): Promise<string | null> {
   try {
-    const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-    return response.Body?.transformToString("utf-8") ?? null;
+    const response = await withTimeout(
+      s3.send(new GetObjectCommand({ Bucket: bucket, Key: key })),
+      10000,
+      `Loading s3://${bucket}/${key}`
+    );
+    return response.Body ? await withTimeout(response.Body.transformToString("utf-8"), 10000, `Reading s3://${bucket}/${key}`) : null;
   } catch (error: unknown) {
     const err = error as { name?: string; $metadata?: { httpStatusCode?: number } };
     if (err.name === "NoSuchKey" || err.name === "NotFound" || err.$metadata?.httpStatusCode === 404) return null;
@@ -860,6 +876,11 @@ function normalizeInstrumentScriptSteps(value: unknown): InstrumentScriptStepSpe
   return Array.isArray(value)
     ? value.map((entry, index) => {
         const record = toRecord(entry);
+        const inputValues = Object.fromEntries(
+          Object.entries(toRecord(record.inputs ?? record.input_values ?? record.values))
+            .map(([key, item]) => [key, String(item)])
+            .filter(([key]) => key.trim())
+        );
         return {
           id: toStringValue(record.id, `step-${index + 1}`),
           title: toStringValue(record.title ?? record.label ?? record.name, humanize(toStringValue(record.id, `step-${index + 1}`))),
@@ -867,6 +888,7 @@ function normalizeInstrumentScriptSteps(value: unknown): InstrumentScriptStepSpe
           command: toStringValue(record.command ?? record.command_ref, "") || undefined,
           script: toStringValue(record.script ?? record.script_ref, "") || undefined,
           waitMs: Number.isFinite(Number(record.waitMs ?? record.wait_ms)) ? Number(record.waitMs ?? record.wait_ms) : undefined,
+          inputs: Object.keys(inputValues).length > 0 ? inputValues : undefined,
           notes: toStringValue(record.notes, "") || undefined,
         };
       })
@@ -2320,6 +2342,12 @@ function base64ToBytes(value: string): Uint8Array {
   return bytes;
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 function decodeSiglentWaveformBlock(bytesBase64: string): number[] {
   const bytes = base64ToBytes(bytesBase64);
   const hashIndex = bytes.indexOf(35);
@@ -2414,7 +2442,7 @@ function parseSiglentWaveDescriptor(bytesBase64: string, returnedPointCount: num
 }
 
 function parseScpiNumber(text: string): number {
-  const matches = Array.from(text.matchAll(/(?:^|[\s,])(-?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/g));
+  const matches = Array.from(text.matchAll(/(?:^|[\s,])([+-]?\d+(?:\.\d+)?(?:E[+-]?\d+)?)([GMKmunp]?)/g));
   const match = matches.at(-1);
   if (!match) {
     throw new Error(`Unable to parse numeric value from response: ${text}`);
@@ -2435,6 +2463,32 @@ function parseScpiNumber(text: string): number {
 function parseSiglentWaveformChannel(payload: string): string {
   const match = payload.match(/\b(C[1-4])\s*:/i);
   return match?.[1]?.toUpperCase() ?? "C1";
+}
+
+function parseKeysightWaveformChannel(payload: string): string {
+  const match = payload.match(/\bCHAN(?:NEL)?\s*([1-4])\b/i);
+  return match?.[1] ?? "1";
+}
+
+function parseKeysightWaveformPreamble(text: string): {
+  xIncrement: number;
+  xOrigin: number;
+  xReference: number;
+  yIncrement: number;
+  yOrigin: number;
+  yReference: number;
+} {
+  const numericCsv = text.match(/[+-]?\d+(?:\.\d+)?(?:E[+-]?\d+)?(?:,[+-]?\d+(?:\.\d+)?(?:E[+-]?\d+)?){9,}/i)?.[0] ?? text.trim();
+  const values = numericCsv.split(",").map((part) => Number(part.trim())).filter((value) => Number.isFinite(value));
+  if (values.length < 10) throw new Error(`Unexpected Keysight preamble: ${text || "<empty response>"}`);
+  return {
+    xIncrement: values[4]!,
+    xOrigin: values[5]!,
+    xReference: values[6]!,
+    yIncrement: values[7]!,
+    yOrigin: values[8]!,
+    yReference: values[9]!,
+  };
 }
 
 function buildSiglentWaveformPreview(args: {
@@ -2486,6 +2540,48 @@ function buildSiglentWaveformPreview(args: {
       triggerDelaySeconds,
       sampleRateHz,
       grid,
+    },
+    points,
+  };
+}
+
+function buildKeysightWaveformPreview(args: {
+  channel: string;
+  bytesBase64: string;
+  preambleResponse: string;
+  voltsPerDivResponse: string;
+  offsetResponse: string;
+  timeDivResponse: string;
+  sampleRateResponse?: string;
+}): NonNullable<InstrumentSessionEntry["preview"]> {
+  const preamble = parseKeysightWaveformPreamble(args.preambleResponse);
+  const payload = extractScpiBlockPayload(args.bytesBase64);
+  const points = Array.from(payload).map((rawCode, index) => ({
+    index,
+    rawCode,
+    timeSeconds: preamble.xOrigin + ((index - preamble.xReference) * preamble.xIncrement),
+    voltage: ((rawCode - preamble.yReference) * preamble.yIncrement) + preamble.yOrigin,
+  }));
+  const minVoltage = points.length ? points.reduce((min, point) => Math.min(min, point.voltage), Number.POSITIVE_INFINITY) : 0;
+  const maxVoltage = points.length ? points.reduce((max, point) => Math.max(max, point.voltage), Number.NEGATIVE_INFINITY) : 0;
+  const sampleRateHz = args.sampleRateResponse ? parseScpiNumber(args.sampleRateResponse) : (preamble.xIncrement > 0 ? 1 / preamble.xIncrement : 0);
+  return {
+    kind: "waveform",
+    samples: points.map((point) => point.voltage),
+    channel: `CHAN${args.channel}`,
+    sampleCount: points.length,
+    intervalSeconds: preamble.xIncrement,
+    startTimeSeconds: points[0]?.timeSeconds ?? preamble.xOrigin,
+    endTimeSeconds: points[points.length - 1]?.timeSeconds ?? preamble.xOrigin,
+    minVoltage,
+    maxVoltage,
+    metadata: {
+      voltsPerDiv: parseScpiNumber(args.voltsPerDivResponse),
+      offsetVolts: parseScpiNumber(args.offsetResponse),
+      timePerDivSeconds: parseScpiNumber(args.timeDivResponse),
+      triggerDelaySeconds: 0,
+      sampleRateHz,
+      grid: 10,
     },
     points,
   };
@@ -4160,30 +4256,148 @@ function TestManagerInner({ config }: ModuleProps) {
       const port = Number(config?.port || binding.defaultPort || catalog.defaultPort || 5025);
       if (!host) throw new Error(`No local address is configured for "${binding.label}".`);
       const payload = command.payload;
-      const readMode = command.mode === "scpi" && (command.parser === "binary" || command.parser === "siglent-waveform" || payload.includes("?"))
+      const isBinaryCommand = command.parser === "binary";
+      const isSiglentWaveformCommand = command.parser === "siglent-waveform";
+      const isKeysightWaveformCommand = command.parser === "keysight-waveform";
+      const isWaveformCommand = isSiglentWaveformCommand || isKeysightWaveformCommand;
+      const isPngBinaryCommand = isBinaryCommand && /\bPNG\b/i.test(`${payload} ${command.payload} ${command.label}`);
+      const readMode = command.mode === "scpi" && (isBinaryCommand || isWaveformCommand || payload.includes("?"))
         ? "until-timeout"
         : "none";
-      const result = await callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
+      let result = isKeysightWaveformCommand ? {} as TcpCommandResult : await callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
         host,
         port,
         command: payload,
         parser: "text",
-        timeoutMs: command.parser === "binary" || command.parser === "siglent-waveform" ? 15000 : 5000,
+        timeoutMs: isBinaryCommand || isWaveformCommand ? 15000 : 5000,
         readMode,
-        quietMs: command.parser === "binary" || command.parser === "siglent-waveform" ? 500 : 250,
+        quietMs: isBinaryCommand || isWaveformCommand ? 500 : 250,
         sendDelayMs: 100,
+        encoding: isBinaryCommand || isWaveformCommand ? "base64" : undefined,
       });
       let interpretedText = result.text?.trim() || (command.parser === "none" ? "Command completed." : "");
       let artifact: ArtifactRef | undefined;
       let preview: InstrumentSessionEntry["preview"] | undefined;
-      if (result.bytesBase64 && result.bytesLength && result.bytesLength > 0 && (command.parser === "binary" || command.parser === "siglent-waveform")) {
-        const binary = base64ToBytes(result.bytesBase64);
-        const extension = command.parser === "binary" ? "bmp" : "bin";
-        const contentType = command.parser === "binary" ? "image/bmp" : "application/octet-stream";
+      if (isKeysightWaveformCommand) {
+        const channelNumber = toStringValue(step.inputs?.["channelNumber"] ?? step.inputs?.["channel"], parseKeysightWaveformChannel(payload)).replace(/\D/g, "") || "1";
+        const readText = async (query: string) => {
+          const response = await callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
+            host,
+            port,
+            command: query,
+            parser: "text",
+            timeoutMs: 5000,
+            readMode: "until-timeout",
+            quietMs: 250,
+            sendDelayMs: 100,
+          });
+          return response.text?.trim() || "";
+        };
+        const readPreamble = async () => {
+          let lastResponse = "";
+          for (let attempt = 0; attempt < 3; attempt += 1) {
+            lastResponse = await readText(":WAVeform:PREamble?");
+            try {
+              parseKeysightWaveformPreamble(lastResponse);
+              return lastResponse;
+            } catch {
+              await new Promise((resolve) => window.setTimeout(resolve, 150 + (attempt * 150)));
+            }
+          }
+          return lastResponse;
+        };
+        await callBridge<unknown>(bridge, "execute_tcp_command", {
+          host,
+          port,
+          command: `:WAVeform:SOURce CHANnel${channelNumber}`,
+          parser: "text",
+          readMode: "none",
+          timeoutMs: 1500,
+          sendDelayMs: 100,
+        });
+        await callBridge<unknown>(bridge, "execute_tcp_command", {
+          host,
+          port,
+          command: ":WAVeform:FORMat BYTE",
+          parser: "text",
+          readMode: "none",
+          timeoutMs: 1500,
+          sendDelayMs: 100,
+        });
+        await callBridge<unknown>(bridge, "execute_tcp_command", {
+          host,
+          port,
+          command: ":WAVeform:UNSigned 1",
+          parser: "text",
+          readMode: "none",
+          timeoutMs: 1500,
+          sendDelayMs: 100,
+        });
+        await callBridge<unknown>(bridge, "execute_tcp_command", {
+          host,
+          port,
+          command: ":WAVeform:POINts:MODE RAW",
+          parser: "text",
+          readMode: "none",
+          timeoutMs: 1500,
+          sendDelayMs: 100,
+        });
+        await callBridge<unknown>(bridge, "execute_tcp_command", {
+          host,
+          port,
+          command: `:WAVeform:POINts ${KEYSIGHT_WAVEFORM_POINT_LIMIT}`,
+          parser: "text",
+          readMode: "none",
+          timeoutMs: 1500,
+          sendDelayMs: 100,
+        });
+        const preambleResponse = await readPreamble();
+        const waveformResult = await callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
+          host,
+          port,
+          command: payload || ":WAVeform:DATA?",
+          parser: "text",
+          readMode: "until-timeout",
+          timeoutMs: 15000,
+          quietMs: 800,
+          sendDelayMs: 100,
+          encoding: "base64",
+        });
+        const voltsPerDivResponse = await readText(`:CHANnel${channelNumber}:SCALe?`);
+        const offsetResponse = await readText(`:CHANnel${channelNumber}:OFFSet?`);
+        const timeDivResponse = await readText(":TIMebase:SCALe?");
+        const sampleRateResponse = await readText(":ACQuire:SRATe?").catch(() => "");
+        result = waveformResult;
+        if (!result.bytesBase64 || !result.bytesLength) throw new Error("Keysight waveform capture did not return a binary block.");
+        const binary = extractScpiBlockPayload(result.bytesBase64);
+        artifact = await uploadSessionArtifact(`${safeFileSegment(scriptTitle)}-${safeFileSegment(step.title)}.bin`, binary, "application/octet-stream");
+        preview = buildKeysightWaveformPreview({
+          channel: channelNumber,
+          bytesBase64: result.bytesBase64,
+          preambleResponse,
+          voltsPerDivResponse,
+          offsetResponse,
+          timeDivResponse,
+          sampleRateResponse,
+        });
+        interpretedText = [
+          `Captured waveform artifact ${artifact.name} (${formatBytes(artifact.sizeBytes)}).`,
+          preview.channel ? `Channel: ${preview.channel}` : "",
+          typeof preview.startTimeSeconds === "number" && typeof preview.endTimeSeconds === "number"
+            ? `Window: ${preview.startTimeSeconds.toFixed(6)} s to ${preview.endTimeSeconds.toFixed(6)} s`
+            : "",
+          typeof preview.minVoltage === "number" && typeof preview.maxVoltage === "number"
+            ? `Range: ${preview.minVoltage.toFixed(3)} V to ${preview.maxVoltage.toFixed(3)} V`
+            : "",
+        ].filter(Boolean).join("\n");
+      } else if (result.bytesBase64 && result.bytesLength && result.bytesLength > 0 && (isBinaryCommand || isSiglentWaveformCommand)) {
+        const binary = isBinaryCommand ? extractScpiBlockPayload(result.bytesBase64) : base64ToBytes(result.bytesBase64);
+        const extension = isBinaryCommand ? (isPngBinaryCommand ? "png" : "bmp") : "bin";
+        const contentType = isBinaryCommand ? (isPngBinaryCommand ? "image/png" : "image/bmp") : "application/octet-stream";
         artifact = await uploadSessionArtifact(`${safeFileSegment(scriptTitle)}-${safeFileSegment(step.title)}.${extension}`, binary, contentType);
-        if (command.parser === "binary") {
-          preview = { kind: "image", src: `data:${contentType};base64,${result.bytesBase64}` };
-        } else {
+        if (isBinaryCommand) {
+          preview = { kind: "image", src: `data:${contentType};base64,${bytesToBase64(binary)}` };
+        } else if (isSiglentWaveformCommand) {
           const channel = parseSiglentWaveformChannel(payload);
           const readText = async (query: string) => {
             const response = await callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
@@ -4282,7 +4496,7 @@ function TestManagerInner({ config }: ModuleProps) {
             sampleRateResponse,
           });
         }
-        interpretedText = command.parser === "binary"
+        interpretedText = isBinaryCommand
           ? `Captured binary artifact ${artifact.name} (${formatBytes(artifact.sizeBytes)}).`
           : [
             `Captured waveform artifact ${artifact.name} (${formatBytes(artifact.sizeBytes)}).`,
@@ -4302,7 +4516,7 @@ function TestManagerInner({ config }: ModuleProps) {
         deviceId: binding.id,
         deviceLabel: binding.label,
         commandText: payload,
-        responseText: command.parser === "binary" || command.parser === "siglent-waveform"
+        responseText: isBinaryCommand || isWaveformCommand
           ? undefined
           : result.text?.trim() || undefined,
         interpretedText,
