@@ -70,6 +70,11 @@ type ProtectedShellCoreProps = {
     awsCredentialProvider: () => Promise<AwsCredentials>;
     userProfile?: UserProfile;
     signOut: () => void;
+    // Reports an auth error (expired token, etc.) from an AWS request up to AuthGate without
+    // triggering a full sign-out. AuthGate shows a reconnect prompt on top of the still-mounted
+    // app instead of unmounting it — see installAutoResetOnAuthError below, which reports here
+    // rather than calling signOut() directly the way it used to.
+    flagReauthNeeded: () => void;
   };
   runtimeEnv: PublicRuntimeEnv;
 };
@@ -167,25 +172,35 @@ function isLocalBucket(runtimeEnv: PublicRuntimeEnv, bucket?: string): boolean {
   return Boolean(bucket) && runtimeEnv.localBuckets.includes(bucket!);
 }
 
+// Matches both the modeled exception names (DynamoDB/STS-style, e.g. "ExpiredTokenException") and
+// S3's differently-named REST-XML codes (e.g. "ExpiredToken", no "Exception" suffix) — the two
+// naming conventions differ per-service, and a code-only allowlist missed real-world failures.
+// Also falls back to matching the error message text: credential-provider failures (e.g. Cognito
+// rejecting an expired Google ID token with "Invalid login token. Token expired: ...") get wrapped
+// by @smithy/property-provider's CredentialsProviderError as they propagate up, which can replace
+// .name with something generic — the original message text survives that wrapping even when the
+// code doesn't, so matching on it too is what actually catches this case reliably.
+const AUTH_ERROR_CODE_PATTERN = /^(ExpiredTokenException|ExpiredToken|UnrecognizedClientException|InvalidIdentityTokenException|InvalidIdentityToken|NotAuthorizedException|InvalidToken|InvalidClientTokenId|TokenRefreshRequired)$/i;
+const AUTH_ERROR_MESSAGE_PATTERN = /token\s+(is\s+|has\s+)?expired|invalid\s+(login|session|security)\s+token|security\s+token.*invalid/i;
+
+function isAwsAuthError(err: unknown): boolean {
+  const record = err as { name?: string; Code?: string; code?: string; message?: string } | null | undefined;
+  const code = record?.name ?? record?.Code ?? record?.code ?? "";
+  if (AUTH_ERROR_CODE_PATTERN.test(code)) return true;
+  const message = record?.message ?? String(err ?? "");
+  return AUTH_ERROR_MESSAGE_PATTERN.test(message);
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function installAutoResetOnAuthError(client: any, signOut: () => void) {
+function installAutoResetOnAuthError(client: any, onAuthError: () => void) {
   client.middlewareStack.addRelativeTo(
     (next: (args: unknown) => Promise<unknown>) => async (args: unknown) => {
       try {
         return await next(args);
       } catch (err: unknown) {
-        const code = (err as { name?: string; Code?: string; code?: string })?.name
-          ?? (err as { Code?: string })?.Code
-          ?? (err as { code?: string })?.code;
-
-        if (
-          code === "ExpiredTokenException" ||
-          code === "UnrecognizedClientException" ||
-          code === "InvalidIdentityTokenException" ||
-          code === "NotAuthorizedException"
-        ) {
-          console.warn("[ShellCore] Auth error — signing out", err);
-          signOut();
+        if (isAwsAuthError(err)) {
+          console.warn("[ShellCore] Auth error — flagging reauth needed", err);
+          onAuthError();
         }
         throw err;
       }
@@ -203,7 +218,7 @@ function createAwsClients(
   config: ShellConfig,
   runtimeEnv: PublicRuntimeEnv,
   awsCredentialProvider: () => Promise<AwsCredentials>,
-  signOut: () => void
+  onAuthError: () => void
 ) {
   let remoteDdbClient: DynamoDBDocumentClient | null = null;
   const s3ClientCache = new Map<string, S3Client>();
@@ -243,7 +258,7 @@ function createAwsClients(
           region: config.region,
           credentials: awsCredentialProvider,
         });
-        installAutoResetOnAuthError(raw, signOut);
+        installAutoResetOnAuthError(raw, onAuthError);
         remoteDdbClient = DynamoDBDocumentClient.from(raw, {
           marshallOptions: { removeUndefinedValues: true },
         });
@@ -285,7 +300,7 @@ function createAwsClients(
           credentials: awsCredentialProvider,
         };
         client = new S3Client(s3Config);
-        installAutoResetOnAuthError(client, signOut);
+        installAutoResetOnAuthError(client, onAuthError);
       }
 
       if (!useLocal) {
@@ -336,15 +351,19 @@ function ShellAuthProvider({
   runtimeEnv,
   children,
 }: ProtectedShellCoreProps & { children: React.ReactNode }) {
+  // Rebuilds (and drops its internal client cache) whenever auth.awsCredentialProvider gets a new
+  // identity — i.e. on reconnect after an expired token, not just on initial sign-in — so every
+  // module picks up fresh AWS clients bound to the new credentials without needing this component,
+  // or anything below it, to unmount.
   const { getS3Client, getDdbDocClient } = useMemo(
     () =>
       createAwsClients(
         shellConfig,
         runtimeEnv,
         auth.awsCredentialProvider,
-        auth.signOut
+        auth.flagReauthNeeded
       ),
-    [auth.awsCredentialProvider, auth.signOut, runtimeEnv, shellConfig]
+    [auth.awsCredentialProvider, auth.flagReauthNeeded, runtimeEnv, shellConfig]
   );
 
   const authValue: AuthContextValue = {

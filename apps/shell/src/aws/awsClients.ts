@@ -51,8 +51,11 @@ function isLocalBucket(bucket?: string): boolean {
 // Client cache — one per endpoint (local and remote can both be in use)
 // ---------------------------------------------------------------------------
 
-let remoteDdbClient: DynamoDBDocumentClient | null = null;
-const s3ClientCache = new Map<string, S3Client>(); // keyed by endpoint URL
+// Remote (non-local) entries are keyed by authGeneration as well as endpoint, so a reconnect after
+// an expired-token error produces fresh clients bound to the new credential provider instead of
+// reusing a client whose credentials closure is permanently tied to the token that just expired.
+const remoteDdbClientCache = new Map<number, DynamoDBDocumentClient>();
+const s3ClientCache = new Map<string, S3Client>(); // keyed by endpoint URL (local) or `remote:${authGeneration}`
 
 async function getLocalS3ClockOffset(endpoint: string): Promise<number> {
   return readEndpointClockOffset(endpoint, "[awsClients] Local S3");
@@ -113,8 +116,13 @@ function installAutoResetOnAuthError(client: { middlewareStack: any }) {
           code === "InvalidIdentityTokenException" ||
           code === "NotAuthorizedException"
         ) {
-          console.warn("[awsClients] Auth error — clearing session", err);
-          useAuthStore.getState().clearSession();
+          // Flag it instead of clearSession(): clearing the session unmounts the entire signed-in
+          // app (AuthGate gates on isSignedIn), destroying every module's in-memory state along
+          // with it. Flagging just surfaces a "reconnect" prompt on top of the still-mounted app —
+          // see AuthGate.tsx — so an expired token costs a click, not whatever the operator hadn't
+          // saved yet.
+          console.warn("[awsClients] Auth error — flagging reauth needed", err);
+          useAuthStore.getState().flagReauthNeeded();
         }
         throw err;
       }
@@ -151,21 +159,23 @@ export function getAwsClients(): AwsClients {
       }
 
       const { config } = useConfigStore.getState();
-      const { awsCredentialProvider } = useAuthStore.getState();
+      const { awsCredentialProvider, authGeneration } = useAuthStore.getState();
       if (!config) throw new Error("Config not initialized");
       if (!awsCredentialProvider) throw new Error("AWS credential provider not available");
 
-      if (!remoteDdbClient) {
-        const raw = new DynamoDBClient({
-          region: config.region,
-          credentials: awsCredentialProvider,
-        });
-        installAutoResetOnAuthError(raw);
-        remoteDdbClient = DynamoDBDocumentClient.from(raw, {
-          marshallOptions: { removeUndefinedValues: true },
-        });
-      }
-      return remoteDdbClient;
+      const cached = remoteDdbClientCache.get(authGeneration);
+      if (cached) return cached;
+
+      const raw = new DynamoDBClient({
+        region: config.region,
+        credentials: awsCredentialProvider,
+      });
+      installAutoResetOnAuthError(raw);
+      const client = DynamoDBDocumentClient.from(raw, {
+        marshallOptions: { removeUndefinedValues: true },
+      });
+      remoteDdbClientCache.set(authGeneration, client);
+      return client;
     },
 
     /**
@@ -175,7 +185,7 @@ export function getAwsClients(): AwsClients {
      */
     getS3Client: async (bucket?: string) => {
       const useLocal = import.meta.env.DEV && !!localS3Endpoint && isLocalBucket(bucket);
-      const cacheKey = useLocal ? `local:${localS3Endpoint}` : "remote";
+      const cacheKey = useLocal ? `local:${localS3Endpoint}` : `remote:${useAuthStore.getState().authGeneration}`;
 
       if (!useLocal && s3ClientCache.has(cacheKey)) {
         return s3ClientCache.get(cacheKey)!;

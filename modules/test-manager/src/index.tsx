@@ -1,11 +1,12 @@
 import React, { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from "react";
-import { DeleteObjectCommand, DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { parse as parseYaml } from "yaml";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ExportContext, ModuleProps } from "module-core";
 import { useAwsS3Client, useUserProfile } from "module-core";
+import { executeHttpDeviceCommand } from "http-device-client";
 
 type Scalar = string | number | boolean | null;
 type ValueMap = Record<string, unknown>;
@@ -157,7 +158,7 @@ type InstrumentCommandOutputSpec = {
 type InstrumentCommandSpec = {
   id: string;
   label: string;
-  mode: "scpi" | "script";
+  mode: "scpi" | "http" | "script";
   payload: string;
   parser?: string;
   notes?: string;
@@ -223,6 +224,8 @@ type ResolvedInstrumentConfigEntry = {
   scriptIds: string[];
 };
 
+type WaveformPoint = { index: number; rawCode: number; timeSeconds: number; voltage: number };
+
 type InstrumentSessionEntry = {
   id: string;
   kind: "command" | "script" | "note";
@@ -253,12 +256,13 @@ type InstrumentSessionEntry = {
       sampleRateHz: number;
       grid: number;
     };
-    points?: Array<{
-      index: number;
-      rawCode: number;
-      timeSeconds: number;
-      voltage: number;
-    }>;
+    points?: WaveformPoint[];
+    // Pointer to the same points array stored as its own small S3 object. persistWorkspace strips
+    // the (large, ~1MB+ per waveform capture) inline `points`/`samples` before writing to S3 once
+    // this is set, since the data is recoverable from here instead of being duplicated in the
+    // shared workspace JSON. Live in-memory state (the current browser session) keeps points/samples
+    // populated regardless; this is purely a persistence-time optimization.
+    pointsRef?: ArtifactRef;
     cursors?: Array<{
       id: string;
       label: string;
@@ -852,7 +856,7 @@ function normalizeInstrumentCatalogs(value: unknown): Record<string, InstrumentC
           return [commandId, {
             id: commandId,
             label: toStringValue(command.label ?? command.title ?? command.name, humanize(commandId)),
-            mode: mode === "script" ? "script" : "scpi",
+            mode: mode === "script" ? "script" : mode === "http" ? "http" : "scpi",
             payload: toStringValue(command.payload ?? command.request, ""),
             parser: toStringValue(command.parser, "") || undefined,
             notes: toStringValue(command.notes, "") || undefined,
@@ -899,10 +903,14 @@ function normalizeInstrumentScripts(value: unknown): Record<string, InstrumentSc
   return Object.fromEntries(
     Object.entries(toRecord(value)).map(([id, entry]) => {
       const record = toRecord(entry);
+      // Preserve "not specified" as undefined (not false) so a per-test-group local override that
+      // doesn't mention `expose` inherits the base definition's value in mergeInstrumentScopes,
+      // instead of silently forcing it to false and hiding the button.
+      const exposeRaw = record.expose ?? record.show_button ?? record.runnable;
       return [id, {
         id,
         title: toStringValue(record.title ?? record.label ?? record.name, humanize(id)),
-        expose: Boolean(record.expose ?? record.show_button ?? record.runnable),
+        expose: exposeRaw === undefined ? undefined : Boolean(exposeRaw),
         notes: toStringValue(record.notes, "") || undefined,
         steps: normalizeInstrumentScriptSteps(record.steps),
       } satisfies InstrumentScriptSpec];
@@ -1377,13 +1385,11 @@ function createDefaultRun(currentUser?: string, label = "Run 1"): TestRun {
   };
 }
 
-function normalizeInstrumentSessionEntry(value: unknown, index: number): InstrumentSessionEntry {
-  const record = toRecord(value);
-  const artifact = toRecord(record.artifact);
-  const preview = toRecord(record.preview);
-  const artifactValue = toStringValue(artifact.id, "")
+function parseStoredArtifactRef(rawArtifact: unknown, fallbackId: string): ArtifactRef | undefined {
+  const artifact = toRecord(rawArtifact);
+  return toStringValue(artifact.id, "")
     ? {
-        id: toStringValue(artifact.id, `artifact-${index + 1}`),
+        id: toStringValue(artifact.id, fallbackId),
         fieldId: toStringValue(artifact.fieldId, "") || undefined,
         kind: toStringValue(artifact.kind, "supporting") as ArtifactRef["kind"],
         name: toStringValue(artifact.name, "artifact"),
@@ -1395,7 +1401,20 @@ function normalizeInstrumentSessionEntry(value: unknown, index: number): Instrum
         uploadedBy: toStringValue(artifact.uploadedBy, "") || undefined,
       } satisfies ArtifactRef
     : undefined;
+}
+
+function normalizeInstrumentSessionEntry(value: unknown, index: number): InstrumentSessionEntry {
+  const record = toRecord(value);
+  const preview = toRecord(record.preview);
+  const artifactValue = parseStoredArtifactRef(record.artifact, `artifact-${index + 1}`);
   const kind = toStringValue(record.kind, "note");
+  // Entries captured while image previews briefly had no preview object at all (a since-fixed bug:
+  // the artifact upload + link were always fine, but nothing told the popup an image preview
+  // existed) were persisted with no preview.kind. Synthesize one here from the artifact's content
+  // type so those already-saved entries pick up the artifactHref image-rendering fallback too,
+  // instead of only new captures going forward.
+  const hasStoredPreview = Boolean(toStringValue(preview.kind, ""));
+  const inferImagePreview = !hasStoredPreview && Boolean(artifactValue?.contentType?.startsWith("image/"));
   return {
     id: toStringValue(record.id, `session-entry-${index + 1}`),
     kind: kind === "command" || kind === "script" ? kind : "note",
@@ -1406,7 +1425,7 @@ function normalizeInstrumentSessionEntry(value: unknown, index: number): Instrum
     responseText: toStringValue(record.responseText, "") || undefined,
     interpretedText: toStringValue(record.interpretedText, "") || undefined,
     artifact: artifactValue,
-    preview: toStringValue(preview.kind, "")
+    preview: hasStoredPreview || inferImagePreview
       ? {
           kind: toStringValue(preview.kind, "image") === "svg"
             ? "svg"
@@ -1447,6 +1466,7 @@ function normalizeInstrumentSessionEntry(value: unknown, index: number): Instrum
                   : [];
               })
             : undefined,
+          pointsRef: parseStoredArtifactRef(preview.pointsRef, `points-${index + 1}`),
           cursors: Array.isArray(preview.cursors)
             ? preview.cursors.flatMap((cursor) => {
                 const row = toRecord(cursor);
@@ -1851,6 +1871,197 @@ function pruneWorkspaceArtifacts(workspace: WorkspaceState, definition: TestDefi
   return changed ? { ...workspace, runs } : workspace;
 }
 
+// Drops the large duplicated payloads (a full base64 image, or a waveform's full point array) from
+// an instrument session entry's preview before it's written to S3 — but only when the data is
+// actually recoverable another way (an uploaded artifact for the image, a pointsRef for the
+// waveform). If neither exists, the entry is left untouched rather than risk losing data with no
+// way to get it back. This never touches the caller's in-memory copy — persistWorkspace applies it
+// only to the object it writes to S3, and keeps the full, unstripped data in React state so the
+// current browser session keeps rendering exactly as before.
+function stripRecoverablePreviewData(entry: InstrumentSessionEntry): InstrumentSessionEntry {
+  const preview = entry.preview;
+  if (!preview) return entry;
+  const canDropSrc = Boolean(preview.src) && Boolean(entry.artifact);
+  const canDropPoints = Boolean(preview.points?.length || preview.samples?.length) && Boolean(preview.pointsRef);
+  if (!canDropSrc && !canDropPoints) return entry;
+  return {
+    ...entry,
+    preview: {
+      ...preview,
+      src: canDropSrc ? undefined : preview.src,
+      points: canDropPoints ? undefined : preview.points,
+      samples: canDropPoints ? undefined : preview.samples,
+    },
+  };
+}
+
+function stripRecoverablePreviewDataFromWorkspace(workspace: WorkspaceState): WorkspaceState {
+  let workspaceChanged = false;
+  const runs = workspace.runs.map((run) => {
+    if (!run.instrumentSessions?.length) return run;
+    let runChanged = false;
+    const instrumentSessions = run.instrumentSessions.map((session) => {
+      let sessionChanged = false;
+      const entries = session.entries.map((entry) => {
+        const stripped = stripRecoverablePreviewData(entry);
+        if (stripped !== entry) sessionChanged = true;
+        return stripped;
+      });
+      if (!sessionChanged) return session;
+      runChanged = true;
+      return { ...session, entries };
+    });
+    if (!runChanged) return run;
+    workspaceChanged = true;
+    return { ...run, instrumentSessions };
+  });
+  return workspaceChanged ? { ...workspace, runs } : workspace;
+}
+
+function parseWaveformPointsJson(text: string | null): WaveformPoint[] {
+  const parsed: unknown = text ? JSON.parse(text) : [];
+  if (!Array.isArray(parsed)) return [];
+  return parsed.flatMap((row) => {
+    const record = toRecord(row);
+    const index = Number(record.index);
+    const rawCode = Number(record.rawCode);
+    const timeSeconds = Number(record.timeSeconds);
+    const voltage = Number(record.voltage);
+    return Number.isFinite(index) && Number.isFinite(rawCode) && Number.isFinite(timeSeconds) && Number.isFinite(voltage)
+      ? [{ index, rawCode, timeSeconds, voltage }]
+      : [];
+  });
+}
+
+async function uploadArtifactBytes(
+  s3: S3Client,
+  bucket: string,
+  basePrefix: string,
+  runId: string,
+  sessionId: string,
+  name: string,
+  bytes: Uint8Array,
+  contentType: string,
+  uploadedBy?: string,
+): Promise<ArtifactRef> {
+  const key = `${basePrefix}/runs/${runId}/instrument-sessions/${sessionId}/${makeId("artifact")}-${name.replace(/[^a-zA-Z0-9._-]+/g, "-")}`;
+  await withAuthRetry(() => s3.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: bytes,
+    ContentType: contentType,
+    CacheControl: "no-store",
+  })));
+  return {
+    id: makeId("artifact"),
+    kind: "supporting",
+    name,
+    bucket,
+    key,
+    contentType,
+    sizeBytes: bytes.byteLength,
+    uploadedAt: nowIso(),
+    uploadedBy,
+  };
+}
+
+// One-time-per-entry migration for sessions captured before waveform points got their own S3
+// object: those entries still carry the full inline points/samples array with no pointsRef, so
+// stripRecoverablePreviewData can't drop them (it only drops data that's recoverable elsewhere) —
+// every single save was re-writing megabytes of per-sample data for every old capture, forever.
+// This uploads the missing pointsRef once (across every run in the workspace, not just the active
+// one, since persistWorkspace writes the whole workspace on every save) so the strip step can
+// finally take over from here on.
+async function backfillWaveformPointsArtifacts(
+  s3: S3Client,
+  bucket: string,
+  basePrefix: string,
+  workspace: WorkspaceState,
+  uploadedBy?: string,
+): Promise<WorkspaceState> {
+  let workspaceChanged = false;
+  const runs = await Promise.all(workspace.runs.map(async (run) => {
+    if (!run.instrumentSessions?.length) return run;
+    let runChanged = false;
+    const instrumentSessions = await Promise.all(run.instrumentSessions.map(async (session) => {
+      let sessionChanged = false;
+      const entries = await Promise.all(session.entries.map(async (entry) => {
+        const preview = entry.preview;
+        if (!preview?.points?.length || preview.pointsRef) return entry;
+        const bytes = new TextEncoder().encode(JSON.stringify(preview.points));
+        const pointsRef = await uploadArtifactBytes(
+          s3, bucket, basePrefix, run.id, session.id,
+          `${safeFileSegment(session.scriptTitle)}-${safeFileSegment(entry.title)}-points.json`,
+          bytes, "application/json", uploadedBy,
+        );
+        sessionChanged = true;
+        return { ...entry, preview: { ...preview, pointsRef } };
+      }));
+      if (!sessionChanged) return session;
+      runChanged = true;
+      return { ...session, entries };
+    }));
+    if (!runChanged) return run;
+    workspaceChanged = true;
+    return { ...run, instrumentSessions };
+  }));
+  return workspaceChanged ? { ...workspace, runs } : workspace;
+}
+
+// Used both by onExport (no React state / in-memory cache available there) and by
+// buildResolvedReportPages (deliberately resolving on demand at export/print time rather than
+// eagerly for the whole run on every load) to fetch back any entry's points that were stripped at
+// persist time, before generateReportPages renders its chart/CSV.
+async function resolveRunWaveformPoints(s3: S3Client, run: TestRun): Promise<TestRun> {
+  let runChanged = false;
+  const instrumentSessions = await Promise.all((run.instrumentSessions ?? []).map(async (session) => {
+    let sessionChanged = false;
+    const entries = await Promise.all(session.entries.map(async (entry) => {
+      const preview = entry.preview;
+      const pointsRef = preview?.pointsRef;
+      if (!preview || preview.points?.length || !pointsRef) return entry;
+      const text = await readOptionalText(s3, pointsRef.bucket, pointsRef.key);
+      const points = parseWaveformPointsJson(text);
+      if (points.length === 0) return entry;
+      sessionChanged = true;
+      return { ...entry, preview: { ...preview, points, samples: points.map((point) => point.voltage) } };
+    }));
+    if (!sessionChanged) return session;
+    runChanged = true;
+    return { ...session, entries };
+  }));
+  return runChanged ? { ...run, instrumentSessions } : run;
+}
+
+// Matches the shell's own auth-error detection (see shell-core's isAwsAuthError) — kept as a
+// separate copy here since modules and the shell ship as independently published bundles with no
+// shared code between them.
+const AUTH_ERROR_PATTERN = /token\s+(is\s+|has\s+)?expired|invalid\s+(login|session|security)\s+token|ExpiredToken|NotAuthorized|UnrecognizedClient|InvalidIdentityToken|InvalidClientTokenId/i;
+
+function looksLikeAuthError(error: unknown): boolean {
+  const record = error as { name?: string; message?: string } | null | undefined;
+  return AUTH_ERROR_PATTERN.test(record?.name ?? "") || AUTH_ERROR_PATTERN.test(record?.message ?? String(error ?? ""));
+}
+
+// The shell now shows a "Reconnect" banner on an expired token instead of losing in-progress work
+// (see the auth-shell fixes), but without this, a save that failed the instant the token expired
+// just stays failed until the operator notices and manually redoes whatever didn't save — stressful
+// on top of the interruption itself. For writes that are safe to retry (uploading bytes already
+// held in memory; no hardware side effects), retrying with backoff after an auth-shaped failure
+// means the save quietly succeeds moments after the operator clicks Reconnect, with nothing further
+// for them to do.
+async function withAuthRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const retryDelaysMs = [4000, 10000, 20000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (!looksLikeAuthError(error) || attempt >= retryDelaysMs.length) throw error;
+      await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
+    }
+  }
+}
+
 async function clearS3Prefix(s3: S3Client, bucket: string, prefix: string): Promise<void> {
   let continuationToken: string | undefined;
   do {
@@ -1862,15 +2073,12 @@ async function clearS3Prefix(s3: S3Client, bucket: string, prefix: string): Prom
     const objects = (listed.Contents ?? [])
       .map((item) => item.Key)
       .filter((key): key is string => Boolean(key));
-    if (objects.length > 0) {
-      await s3.send(new DeleteObjectsCommand({
-        Bucket: bucket,
-        Delete: {
-          Objects: objects.map((Key) => ({ Key })),
-          Quiet: true,
-        },
-      }));
-    }
+    // One DELETE per object rather than a single batch DeleteObjectsCommand: the batch API is a
+    // POST request, and this bucket's CORS policy only allows GET/PUT/DELETE/HEAD — POST fails
+    // CORS preflight in the browser with an opaque "Failed to fetch", even though the delete
+    // itself would otherwise succeed. Per-object DELETE matches what already works elsewhere in
+    // this file (single-artifact delete) without needing to touch the bucket's CORS policy.
+    await Promise.all(objects.map((Key) => s3.send(new DeleteObjectCommand({ Bucket: bucket, Key }))));
     continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
   } while (continuationToken);
 }
@@ -2241,9 +2449,11 @@ function normalizeInstrumentAddressConfig(value: unknown): Record<string, Instru
 }
 
 function getTopLevelInstrumentScripts(scope: InstrumentScopeDefinition): InstrumentScriptSpec[] {
+  // Order follows the spec's declaration order, not alphabetically, so a spec author controls
+  // button order by placing scripts in the sequence an operator should run them.
   const explicit = Object.values(scope.scripts).filter((script) => script.expose);
   if (explicit.length > 0) {
-    return explicit.sort((a, b) => a.title.localeCompare(b.title));
+    return explicit;
   }
   const referenced = new Set<string>();
   for (const script of Object.values(scope.scripts)) {
@@ -2251,12 +2461,17 @@ function getTopLevelInstrumentScripts(scope: InstrumentScopeDefinition): Instrum
       if (step.script) referenced.add(step.script);
     }
   }
-  return Object.values(scope.scripts)
-    .filter((script) => !referenced.has(script.id))
-    .sort((a, b) => a.title.localeCompare(b.title));
+  return Object.values(scope.scripts).filter((script) => !referenced.has(script.id));
 }
 
 function getSessionInstrumentScripts(scope: InstrumentScopeDefinition): InstrumentScriptSpec[] {
+  const exposedScripts = getTopLevelInstrumentScripts(scope);
+  // Scopes with an http-mode device (e.g. a camera adapter) don't fit the scope-only 2-button
+  // "configure/capture" collapse below, since that flow only knows about SCPI scope scripts.
+  const hasHttpBinding = Object.values(scope.bindings).some((binding) => binding.protocol.toLowerCase() === "http");
+  if (hasHttpBinding) {
+    return exposedScripts;
+  }
   const captureFlow = scope.scripts.scope_fault_capture;
   if (captureFlow) {
     const viewScriptId = captureFlow.steps.find((step) => step.script && step.script !== "configure_scope_window" && step.script !== "execute_scope_capture")?.script;
@@ -2346,6 +2561,21 @@ function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
+}
+
+function guessArtifactContentType(name: string, fallback = "application/octet-stream"): string {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".bmp")) return "image/bmp";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".mp4")) return "video/mp4";
+  return fallback;
+}
+
+function basenameFromPath(path: string, fallback: string): string {
+  const normalized = path.replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).at(-1) || fallback;
 }
 
 function decodeSiglentWaveformBlock(bytesBase64: string): number[] {
@@ -2673,8 +2903,10 @@ function renderInstrumentSessionWindowShellHtml(): string {
         .script-list { margin-top: 14px; display: grid; gap: 8px; }
         .script-button, .danger-button { width: 100%; text-align: left; border-radius: 12px; padding: 10px 12px; cursor: pointer; font: inherit; }
         .script-button { border: 1px solid #2dd4bf; background: rgba(45,212,191,0.12); color: #dffcf8; }
+        .script-button.running { border: 1px solid #f59e0b; background: rgba(245,158,11,0.16); color: #fef3c7; font-weight: 700; opacity: 1; }
         .danger-button { border: 1px solid #f87171; background: rgba(248,113,113,0.12); color: #fecaca; margin-top: 12px; }
         .script-button:disabled, .danger-button:disabled { opacity: 0.55; cursor: default; }
+        .script-button.running:disabled { opacity: 0.9; cursor: default; }
         .entry { border: 1px solid #24354f; border-radius: 14px; background: #101d30; padding: 14px; }
         .entry.failed { border-color: #f87171; }
         .entry-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
@@ -2685,6 +2917,8 @@ function renderInstrumentSessionWindowShellHtml(): string {
         pre { margin: 10px 0 0; padding: 10px 12px; background: #0a1424; border: 1px solid #24354f; border-radius: 12px; color: #e5edf8; white-space: pre-wrap; overflow-x: auto; }
         .raw { color: #94a3b8; }
         .artifact { margin-top: 10px; color: #2dd4bf; font-size: 13px; }
+        .artifact a { color: #2dd4bf; }
+        .artifact-video { display: block; width: 100%; max-width: 640px; border-radius: 8px; margin-bottom: 6px; background: #000; }
         .error { margin-top: 10px; color: #f87171; white-space: pre-wrap; font-size: 13px; }
         .empty { color: #94a3b8; }
         .preview { margin-top: 12px; border: 1px solid #24354f; border-radius: 12px; background: #ffffff; padding: 10px; overflow: auto; }
@@ -2731,9 +2965,29 @@ function renderInstrumentSessionWindowShellHtml(): string {
             if (entry.preview.kind === "svg") {
               preview = '<div class="preview">' + (entry.preview.svg || "") + '</div>';
             } else if (entry.preview.kind === "image") {
-              preview = '<div class="preview"><img alt="preview" src="' + escapeHtml(entry.preview.src || "") + '" /></div>';
+              // Newer entries don't inline the image bytes (preview.src); they render from the
+              // artifact's presigned URL instead. Older already-saved entries still carry src inline.
+              var isImageArtifact = (entry.artifactContentType || "").indexOf("image/") === 0;
+              var imgSrc = entry.preview.src || (isImageArtifact ? entry.artifactHref : "");
+              preview = imgSrc
+                ? '<div class="preview"><img alt="preview" src="' + escapeHtml(imgSrc) + '" /></div>'
+                : (entry.artifactLabel ? '<div class="preview"><em>Loading image&hellip;</em></div>' : "");
             } else if (entry.preview.kind === "waveform") {
               preview = '<div class="preview"><div class="wave-chart-shell" data-waveform-entry="' + escapeHtml(entry.id) + '"></div></div>';
+            }
+          }
+          let artifact = "";
+          if (entry.artifactLabel) {
+            var isVideo = (entry.artifactContentType || "").indexOf("video/") === 0;
+            if (isVideo && entry.artifactHref) {
+              artifact = '<div class="artifact">' +
+                '<video class="artifact-video" controls preload="metadata" src="' + escapeHtml(entry.artifactHref) + '"></video>' +
+                '<div><a href="' + escapeHtml(entry.artifactHref) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(entry.artifactLabel) + ' (open in S3)</a></div>' +
+              '</div>';
+            } else if (entry.artifactHref) {
+              artifact = '<div class="artifact"><a href="' + escapeHtml(entry.artifactHref) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(entry.artifactLabel) + '</a></div>';
+            } else {
+              artifact = '<div class="artifact">' + escapeHtml(entry.artifactLabel) + ' (link loading...)</div>';
             }
           }
           return '<section class="entry ' + (entry.ok ? "ok" : "failed") + '">' +
@@ -2742,7 +2996,7 @@ function renderInstrumentSessionWindowShellHtml(): string {
             (entry.interpretedText ? '<div class="interpreted">' + escapeHtml(entry.interpretedText) + '</div>' : '') +
             preview +
             (entry.responseText && entry.responseText !== entry.interpretedText ? '<pre class="raw">' + escapeHtml(entry.responseText) + '</pre>' : '') +
-            (entry.artifactLabel ? '<div class="artifact">' + escapeHtml(entry.artifactLabel) + '</div>' : '') +
+            artifact +
             (entry.error ? '<div class="error">' + escapeHtml(entry.error) + '</div>' : '') +
           '</section>';
         }
@@ -2972,8 +3226,8 @@ function renderInstrumentSessionWindowShellHtml(): string {
           document.getElementById("sidebar-copy").textContent = state.sidebarCopy || "";
           const list = document.getElementById("script-list");
           list.innerHTML = (state.scripts || []).map(function(script) {
-            const disabled = state.readOnly || state.runningScriptId;
-            return '<button class="script-button" type="button" data-script-id="' + escapeHtml(script.id) + '"' + (disabled ? ' disabled' : '') + '>' + escapeHtml(script.title) + '</button>';
+            const classes = "script-button" + (script.running ? " running" : "");
+            return '<button class="' + classes + '" type="button" data-script-id="' + escapeHtml(script.id) + '"' + (script.disabled ? ' disabled' : '') + '>' + escapeHtml(script.title) + (script.running ? ' (running...)' : '') + '</button>';
           }).join("") || '<div class="empty">No scripts are available for this session.</div>';
           Array.from(list.querySelectorAll("[data-script-id]")).forEach(function(node) {
             node.addEventListener("click", function() {
@@ -2984,7 +3238,7 @@ function renderInstrumentSessionWindowShellHtml(): string {
           });
           const finish = document.getElementById("finish-session");
           finish.style.display = state.readOnly ? "none" : "block";
-          finish.disabled = Boolean(state.runningScriptId);
+          finish.disabled = Boolean(state.anyRunning);
           finish.onclick = function() {
             if (window.opener && window.opener.__testManagerInstrumentSessionApi) {
               window.opener.__testManagerInstrumentSessionApi.finishSession();
@@ -2999,16 +3253,28 @@ function renderInstrumentSessionWindowShellHtml(): string {
   </html>`;
 }
 
-function buildInstrumentSessionWindowState(session: InstrumentSessionRecord, scripts: InstrumentScriptSpec[], runningScriptId: string | null, readOnly: boolean) {
+function buildInstrumentSessionWindowState(
+  session: InstrumentSessionRecord,
+  scripts: InstrumentScriptSpec[],
+  runningScriptIds: string[],
+  isScriptBlocked: (scriptId: string) => boolean,
+  readOnly: boolean,
+  artifactLinks: Record<string, string>,
+) {
   return {
     title: session.scriptTitle || "Instrument Session",
     meta: `${session.testTitle} · ${formatDate(session.startedAt)} · ${humanize(session.status)}`,
     sidebarCopy: readOnly
       ? "Saved session view."
-      : "Use the scripts on the left to execute captures and configuration steps for this active session.",
-    scripts: scripts.map((script) => ({ id: script.id, title: script.title })),
+      : "Use the scripts on the left to execute captures and configuration steps for this active session. Scripts on different instruments can run at the same time.",
+    scripts: scripts.map((script) => ({
+      id: script.id,
+      title: script.title,
+      running: runningScriptIds.includes(script.id),
+      disabled: readOnly || isScriptBlocked(script.id),
+    })),
     readOnly,
-    runningScriptId,
+    anyRunning: runningScriptIds.length > 0,
     entries: session.entries.map((entry) => ({
       id: entry.id,
       title: entry.title,
@@ -3018,6 +3284,8 @@ function buildInstrumentSessionWindowState(session: InstrumentSessionRecord, scr
       interpretedText: entry.interpretedText ?? "",
       responseText: entry.responseText ?? "",
       artifactLabel: entry.artifact ? `Saved artifact: ${entry.artifact.name} (${formatBytes(entry.artifact.sizeBytes)})` : "",
+      artifactHref: entry.artifact ? artifactLinks[entry.artifact.id] ?? "" : "",
+      artifactContentType: entry.artifact?.contentType ?? "",
       error: entry.error ?? "",
       ok: entry.ok,
       preview: entry.preview,
@@ -3879,11 +4147,18 @@ function TestManagerInner({ config }: ModuleProps) {
   const [error, setError] = useState("");
   const [reportDialogOpen, setReportDialogOpen] = useState(false);
   const [printReportOpen, setPrintReportOpen] = useState(false);
+  // Populated on demand by openReportPdf, with waveform points resolved — see buildResolvedReportPages.
+  const [printReportPages, setPrintReportPages] = useState<ReportPages | null>(null);
+  const [printReportLoading, setPrintReportLoading] = useState(false);
   const [instrumentDialogOpen, setInstrumentDialogOpen] = useState(false);
   const [activeInstrumentSession, setActiveInstrumentSession] = useState<InstrumentSessionRecord | null>(null);
   const [selectedInstrumentSessionId, setSelectedInstrumentSessionId] = useState<string | null>(null);
-  const [runningInstrumentScriptId, setRunningInstrumentScriptId] = useState<string | null>(null);
+  // Scripts that touch different instrument bindings (e.g. the oscilloscope vs. the thermal
+  // camera) can run concurrently; scripts sharing a binding cannot. See lockedInstrumentBindingIds.
+  const [runningInstrumentScriptIds, setRunningInstrumentScriptIds] = useState<string[]>([]);
   const [reportArtifactLinks, setReportArtifactLinks] = useState<Record<string, string>>({});
+  const [instrumentSessionArtifactLinks, setInstrumentSessionArtifactLinks] = useState<Record<string, string>>({});
+  const [instrumentSessionWaveformPoints, setInstrumentSessionWaveformPoints] = useState<Record<string, WaveformPoint[]>>({});
   const [overviewDragActive, setOverviewDragActive] = useState(false);
   const [pendingOverviewImages, setPendingOverviewImages] = useState<Array<{ id: string; file: File; caption: string }>>([]);
   const instrumentStorageKey = useMemo(() => buildInstrumentConfigStorageKey(storage.projectId, config.id), [config.id, storage.projectId]);
@@ -3981,15 +4256,25 @@ function TestManagerInner({ config }: ModuleProps) {
     setError("");
     try {
       const s3 = await getS3Client(storage.bucket);
-      await writeText(s3, storage.bucket, storage.resultsKey, JSON.stringify(nextWorkspace, null, 2), "application/json");
-      setWorkspace(nextWorkspace);
+      // Backfill any pre-existing entries (captured before waveform points got their own S3
+      // object) with a pointsRef, so the strip below can finally drop their inline data too —
+      // otherwise those old entries would keep bloating every save indefinitely. The backfilled
+      // copy (still full, now with pointsRef attached) becomes the new React state so this only
+      // needs to upload each entry's points once, not on every subsequent save.
+      const backfilled = await backfillWaveformPointsArtifacts(s3, storage.bucket, storage.basePrefix, nextWorkspace, user?.email);
+      // Written copy only: the large preview payloads are stripped here, but the backfilled copy
+      // (kept in React state below) stays full so the current session keeps rendering instantly
+      // from memory instead of needing to re-fetch what it just captured.
+      const toWrite = stripRecoverablePreviewDataFromWorkspace(backfilled);
+      await withAuthRetry(() => writeText(s3, storage.bucket, storage.resultsKey, JSON.stringify(toWrite, null, 2), "application/json"));
+      setWorkspace(backfilled);
       setMessage(successMessage);
     } catch (saveError: unknown) {
       setError((saveError as Error).message);
     } finally {
       setSaving(false);
     }
-  }, [getS3Client, storage.bucket, storage.resultsKey]);
+  }, [getS3Client, storage.basePrefix, storage.bucket, storage.resultsKey, user?.email]);
 
   const persistDefinition = useCallback(async (yamlText: string): Promise<void> => {
     setSaving(true);
@@ -4019,6 +4304,21 @@ function TestManagerInner({ config }: ModuleProps) {
     return url ? { url } : null;
   }, []);
   const topLevelInstrumentScripts = useMemo(() => selectedTest ? getSessionInstrumentScripts(selectedTest.instrumentScope) : [], [selectedTest]);
+  // Union of instrument bindings touched by every currently-running script. A script is safe to
+  // start concurrently as long as none of its own bindings appear in this set.
+  const lockedInstrumentBindingIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!selectedTest) return ids;
+    for (const scriptId of runningInstrumentScriptIds) {
+      for (const bindingId of collectReferencedBindingIds(selectedTest.instrumentScope, scriptId)) ids.add(bindingId);
+    }
+    return ids;
+  }, [selectedTest, runningInstrumentScriptIds]);
+  const isInstrumentScriptBlocked = useCallback((scriptId: string): boolean => {
+    if (!selectedTest) return true;
+    if (runningInstrumentScriptIds.includes(scriptId)) return true;
+    return collectReferencedBindingIds(selectedTest.instrumentScope, scriptId).some((id) => lockedInstrumentBindingIds.has(id));
+  }, [selectedTest, runningInstrumentScriptIds, lockedInstrumentBindingIds]);
   const savedInstrumentSessions = useMemo(
     () => activeRun && selectedTest ? sessionsForTest(activeRun, selectedTest.id) : [],
     [activeRun, selectedTest],
@@ -4117,7 +4417,7 @@ function TestManagerInner({ config }: ModuleProps) {
     }, "Exclusion reason updated");
   }, [activeRun, updateWorkspace, workspace]);
 
-  const saveInstrumentSession = useCallback((session: InstrumentSessionRecord) => {
+  const saveInstrumentSession = useCallback((session: InstrumentSessionRecord, successMessage = "Instrument session saved") => {
     if (!activeRun) return;
     updateWorkspace((current) => ({
       ...current,
@@ -4126,8 +4426,22 @@ function TestManagerInner({ config }: ModuleProps) {
         instrumentSessions: [session, ...(run.instrumentSessions ?? []).filter((candidate) => candidate.id !== session.id)],
         updatedAt: nowIso(),
       }),
-    }), "Instrument session saved");
+    }), successMessage);
   }, [activeRun, updateWorkspace]);
+
+  // Persist the active session continuously as entries and cursor/math-row edits come in, not only
+  // when "Finish Session" is clicked. Before this, mid-session data lived only in this component's
+  // React state — anything that force-unmounted the app (an expired auth token nuking the whole
+  // tree, a crashed tab, a stray reload) silently destroyed every capture back to the last Finish
+  // Session. Debounced so a burst of entries or a cursor drag doesn't trigger a PutObject on every
+  // single change.
+  useEffect(() => {
+    if (!activeInstrumentSession || activeInstrumentSession.entries.length === 0) return;
+    const timeout = setTimeout(() => {
+      saveInstrumentSession(activeInstrumentSession, "Autosaved");
+    }, 1500);
+    return () => clearTimeout(timeout);
+  }, [activeInstrumentSession, saveInstrumentSession]);
 
   const startInstrumentSession = useCallback(() => {
     if (!selectedTest) return;
@@ -4163,6 +4477,18 @@ function TestManagerInner({ config }: ModuleProps) {
 
   const deleteInstrumentSession = useCallback((sessionId: string) => {
     if (!activeRun) return;
+    // Every artifact uploadSessionArtifact writes for this session lives under this exact
+    // prefix, so clearing it removes the images/video/waveforms too instead of leaving them
+    // as unreferenced (and unbillable-to-notice) objects once the local record is gone.
+    const prefix = `${storage.basePrefix}/runs/${activeRun.id}/instrument-sessions/${sessionId}/`;
+    void (async () => {
+      try {
+        const s3 = await getS3Client(storage.bucket);
+        await clearS3Prefix(s3, storage.bucket, prefix);
+      } catch (error) {
+        setError(`Session record was deleted, but some artifacts may not have been removed from storage: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    })();
     updateWorkspace((current) => ({
       ...current,
       runs: current.runs.map((run) => run.id !== activeRun.id ? run : {
@@ -4179,7 +4505,7 @@ function TestManagerInner({ config }: ModuleProps) {
       }
       instrumentSessionWindowRef.current = null;
     }
-  }, [activeRun, selectedInstrumentSessionId, updateWorkspace]);
+  }, [activeRun, getS3Client, selectedInstrumentSessionId, storage.basePrefix, storage.bucket, updateWorkspace]);
 
   const executeInstrumentScript = useCallback(async (scriptId: string) => {
     if (!selectedTest || !activeRun || !bridge) return;
@@ -4188,20 +4514,31 @@ function TestManagerInner({ config }: ModuleProps) {
       setError(`Unknown instrument script: ${scriptId}`);
       return;
     }
-    const missingBindingLabels = collectReferencedBindingIds(selectedTest.instrumentScope, scriptId)
+    if (runningInstrumentScriptIds.includes(scriptId)) return;
+    const scriptBindingIds = collectReferencedBindingIds(selectedTest.instrumentScope, scriptId);
+    const conflictingBinding = scriptBindingIds
+      .map((bindingId) => selectedTest.instrumentScope.bindings[bindingId])
+      .find((binding): binding is InstrumentBindingSpec => Boolean(binding) && lockedInstrumentBindingIds.has(binding.id));
+    if (conflictingBinding) {
+      setError(`"${conflictingBinding.label}" is already in use by a running script. Wait for it to finish, or run a script that uses a different instrument.`);
+      return;
+    }
+    // http-mode devices (e.g. the thermal camera) embed their URL in the command payload and
+    // never read a locally-configured host/port, so they're exempt from this check.
+    const missingBindingLabels = scriptBindingIds
       .map((bindingId) => selectedTest.instrumentScope.bindings[bindingId])
       .filter((binding): binding is InstrumentBindingSpec => Boolean(binding))
-      .filter((binding) => !instrumentConfigs[binding.id]?.host?.trim())
+      .filter((binding) => binding.protocol.toLowerCase() !== "http" && !instrumentConfigs[binding.id]?.host?.trim())
       .map((binding) => binding.label);
     if (missingBindingLabels.length > 0) {
       setError(`Set local instrument addresses before running this script: ${missingBindingLabels.join(", ")}`);
       setInstrumentDialogOpen(true);
       return;
     }
-    setRunningInstrumentScriptId(scriptId);
+    setRunningInstrumentScriptIds((current) => current.includes(scriptId) ? current : [...current, scriptId]);
     setError("");
     setMessage("");
-    let session: InstrumentSessionRecord = activeInstrumentSession ?? {
+    const session: InstrumentSessionRecord = activeInstrumentSession ?? {
       id: makeId("instrument-session"),
       testId: selectedTest.id,
       testTitle: selectedTest.title,
@@ -4211,24 +4548,28 @@ function TestManagerInner({ config }: ModuleProps) {
       status: "running",
       entries: [],
     };
-    setActiveInstrumentSession(session);
+    setActiveInstrumentSession((current) => current ?? session);
     setSelectedInstrumentSessionId(null);
 
+    // Other scripts may be appending to the same session concurrently, so every update reads the
+    // latest state instead of a value captured at the start of this call.
     const appendEntry = (entry: InstrumentSessionEntry) => {
-      session = { ...session, entries: [...session.entries, entry] };
-      setActiveInstrumentSession(session);
+      setActiveInstrumentSession((current) => {
+        const base = current && current.id === session.id ? current : session;
+        return { ...base, entries: [...base.entries, entry] };
+      });
     };
 
     const uploadSessionArtifact = async (name: string, bytes: Uint8Array, contentType: string): Promise<ArtifactRef> => {
       const s3 = await getS3Client(storage.bucket);
       const key = `${storage.basePrefix}/runs/${activeRun.id}/instrument-sessions/${session.id}/${makeId("artifact")}-${name.replace(/[^a-zA-Z0-9._-]+/g, "-")}`;
-      await s3.send(new PutObjectCommand({
+      await withAuthRetry(() => s3.send(new PutObjectCommand({
         Bucket: storage.bucket,
         Key: key,
         Body: bytes,
         ContentType: contentType,
         CacheControl: "no-store",
-      }));
+      })));
       return {
         id: makeId("artifact"),
         kind: "supporting",
@@ -4242,6 +4583,21 @@ function TestManagerInner({ config }: ModuleProps) {
       };
     };
 
+    // Uploads the decoded waveform points as their own small S3 object and attaches pointsRef.
+    // persistWorkspace uses that pointer to drop the (large, one point per sample) inline points
+    // array before writing the shared workspace JSON, instead of duplicating it there. The
+    // in-memory `preview` returned here keeps points/samples populated as normal for live rendering
+    // in the current session.
+    const withPointsRef = async (
+      preview: NonNullable<InstrumentSessionEntry["preview"]>,
+      namePrefix: string,
+    ): Promise<NonNullable<InstrumentSessionEntry["preview"]>> => {
+      if (!preview.points?.length) return preview;
+      const bytes = new TextEncoder().encode(JSON.stringify(preview.points));
+      const pointsRef = await uploadSessionArtifact(`${namePrefix}-points.json`, bytes, "application/json");
+      return { ...preview, pointsRef };
+    };
+
     const executeCommandStep = async (scriptTitle: string, step: InstrumentScriptStepSpec) => {
       const startedAt = nowIso();
       const binding = step.device ? selectedTest.instrumentScope.bindings[step.device] : undefined;
@@ -4251,11 +4607,63 @@ function TestManagerInner({ config }: ModuleProps) {
       if (!step.command) throw new Error(`Step "${step.title}" does not define a command.`);
       const command = catalog.commands[step.command];
       if (!command) throw new Error(`Command "${step.command}" is not defined for ${binding.deviceType}.`);
+      const payload = command.payload;
+      if (command.mode === "http") {
+        const bodyText = step.inputs?.["body"] ?? step.inputs?.["json"] ?? "";
+        const outcome = await executeHttpDeviceCommand(
+          (rpcMethod, params) => callBridge(bridge, rpcMethod, params),
+          command.label,
+          payload,
+          bodyText || undefined,
+          120000,
+        );
+        const { result, artifact: fetchedArtifact, isNullBody } = outcome;
+        let artifact: ArtifactRef | undefined;
+        let preview: InstrumentSessionEntry["preview"] | undefined;
+        let interpretedText = isNullBody
+          ? "No active thermal recording was found to stop — nothing was attached."
+          : result.text || `HTTP ${result.status ?? ""} ${result.statusText ?? ""}`.trim();
+        if (fetchedArtifact) {
+          const bytes = base64ToBytes(fetchedArtifact.bytesBase64);
+          const name = basenameFromPath(fetchedArtifact.path, `${safeFileSegment(scriptTitle)}-${safeFileSegment(step.title)}`);
+          const contentType = fetchedArtifact.mimeType || guessArtifactContentType(name);
+          artifact = await uploadSessionArtifact(name, bytes, contentType);
+          // No inline preview.src: image display renders from the artifact's own presigned URL
+          // (see artifactContentType/artifactHref in the popup) instead of duplicating the image
+          // bytes a second time into the shared workspace JSON. preview.kind still needs to be set
+          // to "image" (just without src) so the popup's renderEntry actually reaches that
+          // fallback-to-artifactHref branch — leaving preview undefined here skips it entirely.
+          // Video artifacts (thermal camera recordings) render via the artifact/video block below
+          // regardless of preview, so they're deliberately left out of this.
+          if (contentType.startsWith("image/")) {
+            preview = { kind: "image" };
+          }
+          interpretedText = [
+            `Captured ${fetchedArtifact.artifactType || "artifact"} ${artifact.name} (${formatBytes(artifact.sizeBytes)}).`,
+            result.text,
+          ].filter(Boolean).join("\n");
+        }
+        appendEntry({
+          id: makeId("session-entry"),
+          kind: "command",
+          title: step.title,
+          deviceId: binding.id,
+          deviceLabel: binding.label,
+          commandText: `${result.method ?? ""} ${result.url ?? ""}${bodyText ? `\n${bodyText}` : ""}`,
+          responseText: result.text,
+          interpretedText,
+          artifact,
+          preview,
+          startedAt,
+          completedAt: nowIso(),
+          ok: true,
+        });
+        return;
+      }
       const config = instrumentConfigs[binding.id];
       const host = config?.host?.trim();
       const port = Number(config?.port || binding.defaultPort || catalog.defaultPort || 5025);
       if (!host) throw new Error(`No local address is configured for "${binding.label}".`);
-      const payload = command.payload;
       const isBinaryCommand = command.parser === "binary";
       const isSiglentWaveformCommand = command.parser === "siglent-waveform";
       const isKeysightWaveformCommand = command.parser === "keysight-waveform";
@@ -4371,7 +4779,7 @@ function TestManagerInner({ config }: ModuleProps) {
         if (!result.bytesBase64 || !result.bytesLength) throw new Error("Keysight waveform capture did not return a binary block.");
         const binary = extractScpiBlockPayload(result.bytesBase64);
         artifact = await uploadSessionArtifact(`${safeFileSegment(scriptTitle)}-${safeFileSegment(step.title)}.bin`, binary, "application/octet-stream");
-        preview = buildKeysightWaveformPreview({
+        preview = await withPointsRef(buildKeysightWaveformPreview({
           channel: channelNumber,
           bytesBase64: result.bytesBase64,
           preambleResponse,
@@ -4379,7 +4787,7 @@ function TestManagerInner({ config }: ModuleProps) {
           offsetResponse,
           timeDivResponse,
           sampleRateResponse,
-        });
+        }), `${safeFileSegment(scriptTitle)}-${safeFileSegment(step.title)}`);
         interpretedText = [
           `Captured waveform artifact ${artifact.name} (${formatBytes(artifact.sizeBytes)}).`,
           preview.channel ? `Channel: ${preview.channel}` : "",
@@ -4395,9 +4803,14 @@ function TestManagerInner({ config }: ModuleProps) {
         const extension = isBinaryCommand ? (isPngBinaryCommand ? "png" : "bmp") : "bin";
         const contentType = isBinaryCommand ? (isPngBinaryCommand ? "image/png" : "image/bmp") : "application/octet-stream";
         artifact = await uploadSessionArtifact(`${safeFileSegment(scriptTitle)}-${safeFileSegment(step.title)}.${extension}`, binary, contentType);
+        // No inline preview.src for the binary/PNG case either — see the http-branch comment above;
+        // image display renders from the artifact's presigned URL instead. Still need kind: "image"
+        // set (without src) so the popup's renderEntry reaches that fallback branch at all — the
+        // Siglent waveform branch below overwrites this with kind: "waveform" when applicable.
         if (isBinaryCommand) {
-          preview = { kind: "image", src: `data:${contentType};base64,${bytesToBase64(binary)}` };
-        } else if (isSiglentWaveformCommand) {
+          preview = { kind: "image" };
+        }
+        if (isSiglentWaveformCommand) {
           const channel = parseSiglentWaveformChannel(payload);
           const readText = async (query: string) => {
             const response = await callBridge<TcpCommandResult>(bridge, "execute_tcp_command", {
@@ -4485,7 +4898,7 @@ function TestManagerInner({ config }: ModuleProps) {
             }
           }
           if (lastWaveformError) throw lastWaveformError;
-          preview = buildSiglentWaveformPreview({
+          preview = await withPointsRef(buildSiglentWaveformPreview({
             channel,
             bytesBase64: waveformResult.bytesBase64 ?? "",
             descriptorBytesBase64: descriptorResult?.bytesBase64,
@@ -4494,7 +4907,7 @@ function TestManagerInner({ config }: ModuleProps) {
             timeDivResponse,
             triggerDelayResponse,
             sampleRateResponse,
-          });
+          }), `${safeFileSegment(scriptTitle)}-${safeFileSegment(step.title)}`);
         }
         interpretedText = isBinaryCommand
           ? `Captured binary artifact ${artifact.name} (${formatBytes(artifact.sizeBytes)}).`
@@ -4562,8 +4975,10 @@ function TestManagerInner({ config }: ModuleProps) {
 
     try {
       await executeNestedScript(scriptId, rootScript.title);
-      session = { ...session, status: "running" };
-      setActiveInstrumentSession(session);
+      // Don't resurrect a session another concurrent script already marked "failed".
+      setActiveInstrumentSession((current) => current && current.id === session.id && current.status !== "failed"
+        ? { ...current, status: "running" }
+        : current);
     } catch (executionError: unknown) {
       const messageText = executionError instanceof Error ? executionError.message : String(executionError);
       appendEntry({
@@ -4576,16 +4991,100 @@ function TestManagerInner({ config }: ModuleProps) {
         ok: false,
         error: messageText,
       });
-      session = { ...session, status: "failed", completedAt: nowIso() };
       setError(messageText);
-      setActiveInstrumentSession(session);
+      setActiveInstrumentSession((current) => current && current.id === session.id
+        ? { ...current, status: "failed", completedAt: nowIso() }
+        : current);
     } finally {
-      setRunningInstrumentScriptId(null);
+      setRunningInstrumentScriptIds((current) => current.filter((id) => id !== scriptId));
     }
-  }, [activeInstrumentSession, activeRun, bridge, getS3Client, instrumentConfigs, selectedTest, storage.basePrefix, storage.bucket, user?.email]);
+  }, [activeInstrumentSession, activeRun, bridge, getS3Client, instrumentConfigs, lockedInstrumentBindingIds, runningInstrumentScriptIds, selectedTest, storage.basePrefix, storage.bucket, user?.email]);
+
+  // Entries whose points were stripped at persist time (loaded fresh from S3, not the live capture
+  // that's still in memory) carry a pointsRef instead of inline points. Deliberately scoped to only
+  // the currently-open session, not the whole run: fetching every session's waveform data as soon
+  // as the run loads is exactly the "everything loads on refresh" bloat this whole pointsRef
+  // mechanism was built to avoid — it should only fetch once the operator actually opens a session.
+  // Report generation resolves points separately, on demand, only when a report is actually
+  // generated (see buildResolvedReportPages below). Same stable-id-list precaution as
+  // instrumentSessionArtifactIds below, for the same reason (cursor edits must not retrigger this).
+  const instrumentSessionPendingPointsRefIds = (visibleInstrumentSession?.entries ?? [])
+    .filter((entry) => !entry.preview?.points?.length && entry.preview?.pointsRef)
+    .map((entry) => entry.preview!.pointsRef!.id)
+    .join(",");
+  const instrumentSessionPendingPointsRefs = useMemo(
+    () => (visibleInstrumentSession?.entries ?? [])
+      .filter((entry) => !entry.preview?.points?.length)
+      .map((entry) => entry.preview?.pointsRef)
+      .filter((ref): ref is ArtifactRef => Boolean(ref)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on the stable id list above, not visibleInstrumentSession
+    [instrumentSessionPendingPointsRefIds],
+  );
 
   useEffect(() => {
-    if (!visibleInstrumentSession) {
+    let cancelled = false;
+    const missing = instrumentSessionPendingPointsRefs.filter((ref) => !(ref.id in instrumentSessionWaveformPoints));
+    if (missing.length === 0) return;
+    void (async () => {
+      try {
+        const s3 = await getS3Client(storage.bucket);
+        const resolved = await Promise.all(missing.map(async (ref) => {
+          const text = await readOptionalText(s3, ref.bucket, ref.key);
+          return [ref.id, parseWaveformPointsJson(text)] as const;
+        }));
+        if (!cancelled) setInstrumentSessionWaveformPoints((current) => ({ ...current, ...Object.fromEntries(resolved) }));
+      } catch {
+        // Leave unresolved; chart/report rendering below treats a missing entry as "no data yet"
+        // rather than failing outright.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [getS3Client, instrumentSessionPendingPointsRefs, instrumentSessionWaveformPoints, storage.bucket]);
+
+  // The visible session's entries with points/samples resolved from either the live in-memory
+  // capture or the fetch above, regardless of which one actually has the data.
+  const resolvedVisibleInstrumentSession = useMemo(() => {
+    if (!visibleInstrumentSession) return visibleInstrumentSession;
+    let changed = false;
+    const entries = visibleInstrumentSession.entries.map((entry) => {
+      const preview = entry.preview;
+      const pointsRefId = preview?.pointsRef?.id;
+      if (!preview || preview.points?.length || !pointsRefId) return entry;
+      const resolvedPoints = instrumentSessionWaveformPoints[pointsRefId];
+      if (!resolvedPoints) return entry;
+      changed = true;
+      return {
+        ...entry,
+        preview: {
+          ...preview,
+          points: resolvedPoints,
+          samples: resolvedPoints.map((point) => point.voltage),
+        },
+      };
+    });
+    return changed ? { ...visibleInstrumentSession, entries } : visibleInstrumentSession;
+  }, [visibleInstrumentSession, instrumentSessionWaveformPoints]);
+
+  // Stable stand-in for resolvedVisibleInstrumentSession that only changes on structural edits (a
+  // new entry appended, an entry's ok/error flipping, the session finishing, or a pending waveform
+  // fetch resolving for the first time). Deliberately excludes preview data that changes on its own
+  // afterward (waveform cursors/math rows/pan-zoom range): updateEntryPreview replaces the session's
+  // top-level object on every cursor edit, and depending on that object directly here would rebuild
+  // the popup's entire entry list — including tearing down and recreating the very chart <svg> the
+  // operator is mid-click on — on every single cursor placement. The chart already redraws itself
+  // immediately from its own local JS state before syncing to React (see renderWaveformChart in the
+  // shell HTML below), so a round trip through this effect isn't needed for live visual feedback —
+  // only for persisting the edit into session state for later save/export. The resolved-points flag
+  // is included so the one-time transition from "pending fetch" to "data available" still pushes a
+  // rebuild — otherwise a chart whose points arrived asynchronously would never actually render.
+  const instrumentSessionStructuralKey = resolvedVisibleInstrumentSession
+    ? `${resolvedVisibleInstrumentSession.id}:${resolvedVisibleInstrumentSession.status}:${resolvedVisibleInstrumentSession.entries.map((entry) => `${entry.id}:${entry.ok}:${entry.preview?.points?.length ? 1 : 0}`).join(",")}`
+    : "";
+
+  useEffect(() => {
+    if (!resolvedVisibleInstrumentSession) {
       if (instrumentSessionWindowRef.current && !instrumentSessionWindowRef.current.closed) {
         instrumentSessionWindowRef.current.close();
       }
@@ -4604,13 +5103,17 @@ function TestManagerInner({ config }: ModuleProps) {
       popup.document.close();
     }
     const nextState = buildInstrumentSessionWindowState(
-      visibleInstrumentSession,
+      resolvedVisibleInstrumentSession,
       topLevelInstrumentScripts,
-      runningInstrumentScriptId,
+      runningInstrumentScriptIds,
+      isInstrumentScriptBlocked,
       isInstrumentSessionReadOnly,
+      instrumentSessionArtifactLinks,
     );
     (popup as Window & { __setInstrumentSessionState?: (state: unknown) => void }).__setInstrumentSessionState?.(nextState);
-  }, [instrumentSessionWindowRequestKey, isInstrumentSessionReadOnly, runningInstrumentScriptId, topLevelInstrumentScripts, visibleInstrumentSession]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on the structural
+    // fingerprint above, not resolvedVisibleInstrumentSession itself; see comment on that constant.
+  }, [instrumentSessionArtifactLinks, instrumentSessionStructuralKey, instrumentSessionWindowRequestKey, isInstrumentScriptBlocked, isInstrumentSessionReadOnly, runningInstrumentScriptIds, topLevelInstrumentScripts]);
 
   useEffect(() => {
     const host = window as Window & {
@@ -4959,6 +5462,58 @@ function TestManagerInner({ config }: ModuleProps) {
     };
   }, [getS3Client, reportArtifacts, storage.bucket]);
 
+  // Keyed on a stable id list, not the session object itself: updateEntryPreview (cursor/math-row
+  // edits on a waveform chart) replaces the session's top-level object identity on every edit
+  // without changing which artifacts exist. Depending on the object directly would recompute this
+  // array — and re-trigger the presigned-URL effect and the popup DOM rebuild below — on every
+  // cursor placement, tearing down the chart the operator is mid-interaction with.
+  const instrumentSessionArtifactIds = (visibleInstrumentSession?.entries ?? [])
+    .map((entry) => entry.artifact?.id)
+    .filter((id): id is string => Boolean(id))
+    .join(",");
+  const instrumentSessionArtifacts = useMemo(
+    () => (visibleInstrumentSession?.entries ?? [])
+      .map((entry) => entry.artifact)
+      .filter((artifact): artifact is ArtifactRef => Boolean(artifact)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on the stable id list above, not visibleInstrumentSession
+    [instrumentSessionArtifactIds],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    if (instrumentSessionArtifacts.length === 0) {
+      setInstrumentSessionArtifactLinks({});
+      return;
+    }
+
+    void (async () => {
+      try {
+        const s3 = await getS3Client(storage.bucket);
+        const entries = await Promise.all(instrumentSessionArtifacts.map(async (artifact) => {
+          const href = await getSignedUrl(
+            s3,
+            new GetObjectCommand({ Bucket: artifact.bucket, Key: artifact.key }),
+            { expiresIn: 60 * 60 * 24 * 7 },
+          );
+          return [artifact.id, href] as const;
+        }));
+        if (!cancelled) setInstrumentSessionArtifactLinks(Object.fromEntries(entries));
+      } catch {
+        if (!cancelled) setInstrumentSessionArtifactLinks({});
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [getS3Client, instrumentSessionArtifacts, storage.bucket]);
+
+  // Cheap, synchronous, and used only for the summary-text live preview + the "Generate Report"
+  // button's enabled state — deliberately built from the raw (unresolved) activeRun rather than
+  // fetching every session's waveform points just to show this. Any entry whose points haven't
+  // been fetched yet just renders a blank chart placeholder in .details, which is fine since only
+  // .summary (no charts) is ever shown from this particular memo — see buildResolvedReportPages
+  // below for the on-demand, fully-resolved version used by the actual PDF/ZIP export.
   const reportPages = useMemo(() => {
     if (!definition || !activeRun) return null;
     return generateReportPages(definition, activeRun, includedTests, {
@@ -4970,9 +5525,28 @@ function TestManagerInner({ config }: ModuleProps) {
     });
   }, [activeRun, definition, includedTests, reportArtifactLinks, reportArtifacts.length]);
 
+  // On-demand, fully-resolved report pages for actual export (PDF print view, ZIP download): fetches
+  // every session's waveform points fresh at click time via resolveRunWaveformPoints (the same
+  // helper onExport uses), rather than keeping the whole run's points hot in memory/cache at all
+  // times just in case the operator exports later.
+  const buildResolvedReportPages = useCallback(async (): Promise<ReportPages | null> => {
+    if (!definition || !activeRun) return null;
+    const s3 = await getS3Client(storage.bucket);
+    const resolvedRun = await resolveRunWaveformPoints(s3, activeRun);
+    return generateReportPages(definition, resolvedRun, includedTests, {
+      artifactHref: ({ artifact }) => reportArtifactLinks[artifact.id] ?? `s3://${artifact.bucket}/${artifact.key}`,
+      overviewArtifactHref: (artifact) => reportArtifactLinks[artifact.id] ?? `s3://${artifact.bucket}/${artifact.key}`,
+      notes: reportArtifacts.length > 0
+        ? ["Evidence links in the live report and PDF are time-limited access URLs and may expire after about 7 days."]
+        : undefined,
+    });
+  }, [activeRun, definition, getS3Client, includedTests, reportArtifactLinks, reportArtifacts.length, storage.bucket]);
+
   const buildReportFiles = useCallback(async (): Promise<Record<string, ZipFileContent> | null> => {
     if (!definition || !activeRun) return null;
-    const exportRun = pruneRunArtifacts(activeRun, definition, testsById, user?.email);
+    const s3 = await getS3Client(storage.bucket);
+    const resolvedRun = await resolveRunWaveformPoints(s3, activeRun);
+    const exportRun = pruneRunArtifacts(resolvedRun, definition, testsById, user?.email);
     const zipPages = generateReportPages(definition, exportRun, includedTests, {
       artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
       instrumentSessionArtifactHref: ({ session, artifact }) => `../${getInstrumentSessionArchivePath(session, artifact)}`,
@@ -4987,7 +5561,6 @@ function TestManagerInner({ config }: ModuleProps) {
     };
 
     const manifest: Array<Record<string, string | number | null>> = [];
-    const s3 = await getS3Client(storage.bucket);
     for (const entry of exportRun.overviewArtifacts ?? []) {
       const archivePath = overviewArtifactArchivePath(entry.artifact);
       const bytes = await readOptionalBytes(s3, entry.artifact.bucket, entry.artifact.key);
@@ -5064,7 +5637,7 @@ function TestManagerInner({ config }: ModuleProps) {
 
     files["evidence/manifest.json"] = JSON.stringify(manifest, null, 2);
     return files;
-  }, [activeRun, definition, getS3Client, includedTests, storage.bucket, user?.email, workspace]);
+  }, [activeRun, definition, getS3Client, includedTests, storage.bucket, testsById, user?.email, workspace]);
 
   const downloadReportZip = useCallback(() => {
     void (async () => {
@@ -5076,10 +5649,21 @@ function TestManagerInner({ config }: ModuleProps) {
   }, [buildReportFiles, storage.projectId]);
 
   const openReportPdf = useCallback(() => {
-    if (!definition || !reportPages || !activeRun) return;
+    if (!definition || !activeRun) return;
     setReportDialogOpen(false);
-    setPrintReportOpen(true);
-  }, [activeRun, config, definition, reportPages]);
+    setPrintReportLoading(true);
+    void (async () => {
+      try {
+        const pages = await buildResolvedReportPages();
+        setPrintReportPages(pages);
+        if (pages) setPrintReportOpen(true);
+      } catch (buildError: unknown) {
+        setError((buildError as Error).message);
+      } finally {
+        setPrintReportLoading(false);
+      }
+    })();
+  }, [activeRun, buildResolvedReportPages, definition]);
 
   if (loading || !workspace) {
     return <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: C.bg, color: C.muted }}>Loading test manager...</div>;
@@ -5485,7 +6069,7 @@ function TestManagerInner({ config }: ModuleProps) {
                             >
                               Open Active Session
                             </button>
-                            <button type="button" onClick={finishInstrumentSession} disabled={Boolean(runningInstrumentScriptId)} style={buttonStyle("danger")}>
+                            <button type="button" onClick={finishInstrumentSession} disabled={runningInstrumentScriptIds.length > 0} style={buttonStyle("danger")}>
                               Finish Session
                             </button>
                           </>
@@ -5507,39 +6091,55 @@ function TestManagerInner({ config }: ModuleProps) {
                               key={script.id}
                               type="button"
                               onClick={() => void executeInstrumentScript(script.id)}
-                              disabled={Boolean(runningInstrumentScriptId)}
-                              style={buttonStyle(script.id === runningInstrumentScriptId ? "primary" : "ghost")}
+                              disabled={isInstrumentScriptBlocked(script.id)}
+                              style={buttonStyle(runningInstrumentScriptIds.includes(script.id) ? "primary" : "ghost")}
                             >
                               {script.title}
                             </button>
                           ))}
                         </div>
                       ) : null}
-                      {runningInstrumentScriptId ? (
-                        <div style={{ marginTop: "0.55rem", color: C.accent, fontSize: "0.82rem" }}>Running script session...</div>
+                      {runningInstrumentScriptIds.length > 0 ? (
+                        <div style={{ marginTop: "0.55rem", color: C.accent, fontSize: "0.82rem" }}>Running: {runningInstrumentScriptIds.length} script(s)...</div>
                       ) : null}
                       <div style={{ marginTop: "0.9rem", display: "grid", gap: "0.55rem" }}>
-                        {savedInstrumentSessions.length === 0 ? (
-                          <div style={{ color: C.muted, fontSize: "0.84rem" }}>No saved instrument sessions for this test yet.</div>
-                        ) : savedInstrumentSessions.map((session) => (
+                        {(() => {
+                          // The currently-active session is autosaved into this same list under
+                          // the hood, but it already has its own "Active session: N entries"
+                          // indicator above — list it here too and it'd not only duplicate that,
+                          // it'd wrongly read as "Interrupted" while it's actually live.
+                          const visibleSavedSessions = savedInstrumentSessions.filter((session) => session.id !== activeInstrumentSession?.id);
+                          return visibleSavedSessions.length === 0 ? (
+                            <div style={{ color: C.muted, fontSize: "0.84rem" }}>No saved instrument sessions for this test yet.</div>
+                          ) : visibleSavedSessions.map((session) => (
                           <div key={session.id} style={{ border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.75rem 0.85rem", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem", flexWrap: "wrap" }}>
                             <button
                               type="button"
                               onClick={() => {
-                                setActiveInstrumentSession(null);
-                                setSelectedInstrumentSessionId(session.id);
+                                // A "running" record here means it was autosaved mid-capture but
+                                // never explicitly finished (e.g. the browser was interrupted) —
+                                // resume it as the live session instead of opening it read-only,
+                                // so the operator can pick up exactly where they left off.
+                                if (session.status === "running") {
+                                  setActiveInstrumentSession(session);
+                                  setSelectedInstrumentSessionId(null);
+                                } else {
+                                  setActiveInstrumentSession(null);
+                                  setSelectedInstrumentSessionId(session.id);
+                                }
                                 setInstrumentSessionWindowRequestKey((value) => value + 1);
                               }}
                               style={{ ...buttonStyle("ghost"), padding: 0, border: "none", background: "transparent", textAlign: "left", fontWeight: 700 }}
                             >
                               {session.scriptTitle}
                               <span style={{ display: "block", marginTop: "0.22rem", color: C.muted, fontSize: "0.8rem", fontWeight: 500 }}>
-                                {formatDate(session.startedAt)} · {humanize(session.status)} · {session.entries.length} entries
+                                {formatDate(session.startedAt)} · {session.status === "running" ? "Interrupted — click to resume" : humanize(session.status)} · {session.entries.length} entries
                               </span>
                             </button>
                             <button type="button" onClick={() => deleteInstrumentSession(session.id)} style={{ ...buttonStyle("danger"), padding: "0.35rem 0.55rem" }}>x</button>
                           </div>
-                        ))}
+                          ));
+                        })()}
                       </div>
                     </section>
                   ) : null}
@@ -5554,15 +6154,15 @@ function TestManagerInner({ config }: ModuleProps) {
                                 key={script.id}
                                 type="button"
                                 onClick={() => void executeInstrumentScript(script.id)}
-                                disabled={Boolean(runningInstrumentScriptId)}
-                                style={buttonStyle(script.id === runningInstrumentScriptId ? "primary" : "ghost")}
+                                disabled={isInstrumentScriptBlocked(script.id)}
+                                style={buttonStyle(runningInstrumentScriptIds.includes(script.id) ? "primary" : "ghost")}
                               >
                                 {script.title}
                               </button>
                             ))}
                           </div>
-                          {runningInstrumentScriptId ? (
-                            <div style={{ marginTop: "0.55rem", color: C.accent, fontSize: "0.82rem" }}>Running script session...</div>
+                          {runningInstrumentScriptIds.length > 0 ? (
+                            <div style={{ marginTop: "0.55rem", color: C.accent, fontSize: "0.82rem" }}>Running: {runningInstrumentScriptIds.length} script(s)...</div>
                           ) : null}
                           <div style={{ marginTop: "0.9rem", display: "grid", gap: "0.55rem" }}>
                             {savedInstrumentSessions.length === 0 ? (
@@ -5839,8 +6439,8 @@ function TestManagerInner({ config }: ModuleProps) {
               <div style={{ marginTop: "0.25rem", color: C.muted, fontSize: "0.84rem" }}>Choose a portable PDF view or the full markdown report structure.</div>
             </header>
             <div style={{ padding: "1rem 1.1rem", display: "grid", gap: "0.8rem" }}>
-              <button onClick={openReportPdf} style={{ ...buttonStyle("primary"), textAlign: "left", padding: "0.85rem 1rem" }} disabled={!reportPages}>
-                PDF
+              <button onClick={openReportPdf} style={{ ...buttonStyle("primary"), textAlign: "left", padding: "0.85rem 1rem" }} disabled={!reportPages || printReportLoading}>
+                {printReportLoading ? "Loading..." : "PDF"}
                 <span style={{ display: "block", marginTop: "0.25rem", color: C.accentText, opacity: 0.78, fontWeight: 500 }}>Opens a print-ready report view. Use the browser print dialog to save as PDF.</span>
               </button>
               <button onClick={downloadReportZip} style={{ ...buttonStyle(), textAlign: "left", padding: "0.85rem 1rem" }} disabled={!reportPages}>
@@ -5854,7 +6454,7 @@ function TestManagerInner({ config }: ModuleProps) {
           </section>
         </div>
       ) : null}
-      {printReportOpen && definition && reportPages && activeRun ? (
+      {printReportOpen && definition && printReportPages && activeRun ? (
         <div className="test-manager-print-root" style={{ position: "fixed", inset: 0, zIndex: 60, overflow: "auto", background: "#eef2f7", color: "#111827", padding: "0.2rem" }}>
           <div className="test-manager-print-actions" style={{ position: "sticky", top: 0, zIndex: 2, display: "flex", justifyContent: "space-between", gap: "0.75rem", alignItems: "center", padding: "0.6rem 0.6rem 0.8rem", background: "#eef2f7" }}>
             <div style={{ fontWeight: 800 }}>Print Report</div>
@@ -5892,12 +6492,12 @@ function TestManagerInner({ config }: ModuleProps) {
             ) : null}
             <section id="report-summary">
               <h2>Summary</h2>
-              <PrintMarkdownBlock value={reportPages.summary} assets={reportPages.assets} />
+              <PrintMarkdownBlock value={printReportPages.summary} assets={printReportPages.assets} />
             </section>
-            {Object.entries(reportPages.details).map(([testId, markdown]) => (
+            {Object.entries(printReportPages.details).map(([testId, markdown]) => (
               <section key={testId} id={`test-${safeFileSegment(testId)}`} className="test-manager-print-page">
                 <h2>{testId}</h2>
-                <PrintMarkdownBlock value={markdown} assets={reportPages.assets} />
+                <PrintMarkdownBlock value={markdown} assets={printReportPages.assets} />
               </section>
             ))}
           </article>
@@ -5934,7 +6534,7 @@ export async function onExport(ctx: ExportContext): Promise<void> {
       await writeText(ctx.s3Client as S3Client, storage.bucket, storage.resultsKey, JSON.stringify(workspace, null, 2), "application/json");
       await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}workspace.json`, JSON.stringify(workspace, null, 2), "application/json");
     }
-    const activeRun = getActiveRun(workspace);
+    const activeRun = await resolveRunWaveformPoints(ctx.s3Client as S3Client, getActiveRun(workspace));
     const excludedIds = new Set(activeRun.excludedTestIds ?? []);
     const tests = allTests.filter((test) => !excludedIds.has(test.id));
     const pages = generateReportPages(definition, activeRun, tests, {

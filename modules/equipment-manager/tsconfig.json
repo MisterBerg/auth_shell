@@ -12,7 +12,8 @@
     "strict": true,
     "skipLibCheck": true,
     "paths": {
-      "module-core": ["../../core/src/index.ts"]
+      "module-core": ["../../core/src/index.ts"],
+      "http-device-client": ["../../shared/http-device-client/src/index.ts"]
     }
   },
   "include": ["src"]

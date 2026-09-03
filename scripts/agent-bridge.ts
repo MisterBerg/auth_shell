@@ -43,6 +43,7 @@ const CAPABILITIES = [
   "python",
   "pdf_text",
   "equipment_tcp",
+  "equipment_http",
   "workspace_root",
   "appspace_context",
   "appspace_operation_queue",
@@ -230,6 +231,8 @@ async function runRpc(body: RpcRequest): Promise<unknown> {
       return runWorkspaceCommand(body.params);
     case "execute_tcp_command":
       return executeTcpCommand(body.params);
+    case "execute_http_request":
+      return executeHttpRequest(body.params);
     case "get_python_environment":
       return getPythonEnvironment();
     case "check_python_dependencies":
@@ -1019,6 +1022,50 @@ async function writeWorkspaceFile(params: Record<string, unknown> = {}): Promise
     mode,
     encoding,
   };
+}
+
+async function executeHttpRequest(params: Record<string, unknown> = {}): Promise<unknown> {
+  const url = typeof params["url"] === "string" ? params["url"].trim() : "";
+  if (!url) throw new Error("execute_http_request requires a URL.");
+  const parsedUrl = new URL(url);
+  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+    throw new Error("execute_http_request only supports http and https URLs.");
+  }
+
+  const method = (typeof params["method"] === "string" ? params["method"] : "GET").toUpperCase();
+  const timeoutMs = clampNumber(params["timeoutMs"], 1, 120000, 15000);
+  const headers = readOptionalRecord(params["headers"]) ?? {};
+  const body = typeof params["body"] === "string" ? params["body"] : undefined;
+  const encoding = params["encoding"] === "base64" ? "base64" : "utf8";
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value)])),
+      body: method === "GET" || method === "HEAD" ? undefined : body,
+      signal: controller.signal,
+    });
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const contentType = response.headers.get("content-type") ?? "";
+    const text = encoding === "base64" ? "" : buffer.toString("utf8");
+    return {
+      url,
+      method,
+      status: response.status,
+      statusText: response.statusText,
+      ok: response.ok,
+      contentType,
+      text,
+      data: encoding === "base64" ? buffer.toString("base64") : text,
+      bytesBase64: buffer.toString("base64"),
+      bytesLength: buffer.length,
+      durationMs: Date.now() - startedAt,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function runWorkspaceCommand(params: Record<string, unknown> = {}): Promise<unknown> {

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import type { ExportContext, ModuleProps } from "module-core";
 import { useAwsS3Client, useUserProfile } from "module-core";
+import { executeHttpDeviceCommand, type HttpRequestResult } from "http-device-client";
 import {
   createKnownKeysightPreset as createKnownKeysightPresetExternal,
   createKnownSiglentPreset as createKnownSiglentPresetExternal,
@@ -871,6 +872,19 @@ function buildCommandResponseModel(command: EquipmentCommand, output: unknown): 
       raw: output,
     };
   }
+  if (isHttpRequestResult(output)) {
+    const text = output.text ?? output.data ?? "";
+    const parsed = command.parser === "json" ? parseMaybeJson(text) : undefined;
+    return {
+      text,
+      status: output.status,
+      statusText: output.statusText,
+      contentType: output.contentType,
+      bytesLength: output.bytesLength,
+      parsed,
+      raw: output,
+    };
+  }
   if (output && typeof output === "object") {
     return output as Record<string, unknown>;
   }
@@ -1114,6 +1128,35 @@ function extractScpiBlockPayloadBase64(bytesBase64: string): string {
   return bytesToBase64(bytes.slice(dataStart, dataEnd));
 }
 
+function isHttpRequestResult(value: unknown): value is HttpRequestResult {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return typeof record["status"] === "number" && typeof record["url"] === "string";
+}
+
+type HttpArtifactResult = HttpRequestResult & {
+  artifactType: string;
+  artifactMimeType: string;
+  artifactBytesBase64: string;
+  artifactBytesLength: number;
+};
+
+// A file an http-mode device wrote to disk and we fetched via read_workspace_file. Distinct from
+// a TcpCommandResult's bytesBase64 (an SCPI definite-length binary block) — this is a plain file,
+// so it must never go through extractScpiBlockPayloadBase64.
+function isHttpArtifactResult(value: unknown): value is HttpArtifactResult {
+  if (!value || typeof value !== "object") return false;
+  return typeof (value as Record<string, unknown>)["artifactBytesBase64"] === "string";
+}
+
+function renderHttpArtifact(output: HttpArtifactResult, label: string): { kind: "image"; src: string } | { kind: "text"; text: string } {
+  if (output.artifactMimeType.startsWith("image/")) {
+    return { kind: "image", src: `data:${output.artifactMimeType};base64,${output.artifactBytesBase64}` };
+  }
+  const sizeKb = (output.artifactBytesLength / 1024).toFixed(1);
+  return { kind: "text", text: `${label}: ${output.artifactType || "binary artifact"} (${sizeKb} KB, ${output.artifactMimeType || "unknown type"}). Response: ${output.text ?? ""}` };
+}
+
 function isSiglentWaveformResult(value: unknown): value is SiglentWaveformResult {
   if (!value || typeof value !== "object") return false;
   const kind = (value as { kind?: string }).kind;
@@ -1153,6 +1196,16 @@ function ExecutionArtifactView(props: { output: unknown; artifactMode?: Artifact
   const { output, artifactMode, saveAs, label } = props;
   if (isSiglentWaveformResult(output)) {
     return <WaveformChartInteractive key={`wave-${label}-${output.channel}-${output.sampleCount}-${output.startTimeSeconds}`} result={output} />;
+  }
+  if (isHttpArtifactResult(output)) {
+    const rendered = renderHttpArtifact(output, label);
+    return rendered.kind === "image" ? (
+      <img src={rendered.src} alt={label} style={{ display: "block", maxWidth: "100%", height: "auto", background: "white", borderRadius: 8 }} />
+    ) : (
+      <pre style={{ margin: 0, color: C.text, fontSize: "0.84rem", lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+        {rendered.text}
+      </pre>
+    );
   }
   if (isTcpCommandResult(output)) {
     if (artifactMode === "image" && output.bytesBase64) {
@@ -1790,6 +1843,34 @@ function buildTcpExecutionParams(target: { host: string; port: number }, command
   };
 }
 
+async function executeHttpCommand(bridge: BridgeConfig, command: EquipmentCommand, payload: string): Promise<unknown> {
+  const body = command.testValues?.["body"] ?? command.testValues?.["json"] ?? "";
+  // Whether a file gets fetched is driven by the response shape (a `path` field, not still
+  // "recording") rather than the command's own artifactMode — a device that returns an artifact
+  // envelope gets fetched regardless of whether artifactMode was remembered to be set.
+  const outcome = await executeHttpDeviceCommand(
+    (rpcMethod, params) => callBridge(bridge, rpcMethod, params),
+    command.name,
+    payload,
+    body || undefined,
+    command.timeoutMs || 120000,
+  );
+  if (!outcome.artifact) return outcome.result;
+  // Tagged distinctly (artifactBytesBase64/artifactBytesLength) so display code can render it
+  // directly from its own mime type instead of falling into isTcpCommandResult's
+  // SCPI-block-unwrapping path, which would corrupt a plain file this adapter wrote to disk.
+  // outcome.result's own bytesBase64/bytesLength are left untouched — they describe the raw JSON
+  // response body, not the fetched artifact file, and other code (output-variable extraction)
+  // may still expect that meaning.
+  return {
+    ...outcome.result,
+    artifactType: outcome.artifact.artifactType,
+    artifactMimeType: outcome.artifact.mimeType,
+    artifactBytesBase64: outcome.artifact.bytesBase64,
+    artifactBytesLength: base64ToBytes(outcome.artifact.bytesBase64).byteLength,
+  };
+}
+
 function resolveCommandInputValues(command: EquipmentCommand, overrides?: Record<string, unknown>): Record<string, unknown> {
   const values: Record<string, unknown> = {};
   for (const def of command.inputDefs) {
@@ -2163,11 +2244,6 @@ export default function EquipmentManager({ config }: ModuleProps) {
       setError("Bridge URL is required before executing device commands.");
       return;
     }
-    const target = parseDeviceAddress(device.address);
-    if (!target) {
-      setError("Device address must be set before executing commands.");
-      return;
-    }
     setExecuting(true);
     setError("");
     try {
@@ -2177,11 +2253,17 @@ export default function EquipmentManager({ config }: ModuleProps) {
         throw new Error(`Missing required inputs: ${missingInputs.join(", ")}`);
       }
       const payload = applyTemplate(command.payload, inputValues);
+      const target = parseDeviceAddress(device.address);
+      if (!target && command.mode !== "http") {
+        throw new Error("Device address must be set before executing commands.");
+      }
       const output = command.parser === "siglent-waveform"
-        ? await executeSiglentWaveformCommand(target, command, inputValues)
+        ? await executeSiglentWaveformCommand(target!, command, inputValues)
         : command.parser === "keysight-waveform"
-          ? await executeKeysightWaveformCommand(target, command, inputValues)
-          : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, command, payload));
+          ? await executeKeysightWaveformCommand(target!, command, inputValues)
+          : command.mode === "http"
+            ? await executeHttpCommand(activeBridge, command, payload)
+            : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target!, command, payload));
       const result: ExecutionResult = {
         scope: "command",
         title: `${device.name} · ${command.name}`,
@@ -2211,10 +2293,6 @@ export default function EquipmentManager({ config }: ModuleProps) {
       return;
     }
     const target = parseDeviceAddress(device.address);
-    if (!target) {
-      setError("Device address must be set before executing scripts.");
-      return;
-    }
 
     const commandMap = new Map(device.commands.map((command) => [command.id, command]));
     setExecuting(true);
@@ -2240,12 +2318,20 @@ export default function EquipmentManager({ config }: ModuleProps) {
         }
 
         const timeoutMs = ref?.timeoutMs ?? 5000;
-        const output = await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, {
+        const commandForStep = {
           payload,
           parser: ref?.parser ?? "text",
           timeoutMs,
           artifactMode: ref?.artifactMode ?? (step.type === "capture" ? "image" : "text"),
-        }));
+          mode: ref?.mode ?? "raw",
+          testValues: ref?.testValues ?? {},
+        };
+        if (!target && commandForStep.mode !== "http") {
+          throw new Error("Device address must be set before executing scripts.");
+        }
+        const output = commandForStep.mode === "http"
+          ? await executeHttpCommand(activeBridge, { ...commandForStep, id: step.id, name: step.title, inputDefs: [], outputDefs: [] } as EquipmentCommand, payload)
+          : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target!, commandForStep, payload));
         stepResults.push({ title: step.title, ok: true, output });
       }
 
@@ -2283,10 +2369,6 @@ export default function EquipmentManager({ config }: ModuleProps) {
       return;
     }
     const target = parseDeviceAddress(device.address);
-    if (!target) {
-      setError("Device address must be set before executing scripts.");
-      return;
-    }
 
     const commandMap = new Map(device.commands.map((command) => [command.id, command]));
     setExecuting(true);
@@ -2347,10 +2429,12 @@ export default function EquipmentManager({ config }: ModuleProps) {
           saveAs: step.saveAs ?? baseCommand.saveAs,
         };
         const output = resolvedCommand.parser === "siglent-waveform"
-          ? await executeSiglentWaveformCommand(target, resolvedCommand, resolvedInputs)
+          ? await executeSiglentWaveformCommand(target!, resolvedCommand, resolvedInputs)
           : resolvedCommand.parser === "keysight-waveform"
-            ? await executeKeysightWaveformCommand(target, resolvedCommand, resolvedInputs)
-            : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target, resolvedCommand, payload));
+            ? await executeKeysightWaveformCommand(target!, resolvedCommand, resolvedInputs)
+            : resolvedCommand.mode === "http"
+              ? await executeHttpCommand(activeBridge, { ...resolvedCommand, testValues: { ...resolvedCommand.testValues, body: toStringValue(resolvedInputs["body"] ?? resolvedCommand.testValues?.["body"] ?? "") } }, payload)
+              : await callBridge<unknown>(activeBridge, "execute_tcp_command", buildTcpExecutionParams(target!, resolvedCommand, payload));
         const outputs = extractCommandOutputs(resolvedCommand, output);
         stepOutputContext.set(step.id, outputs);
         stepResults.push({
@@ -2945,6 +3029,21 @@ export default function EquipmentManager({ config }: ModuleProps) {
                                 <div style={{ marginTop: "0.85rem", border: `1px solid ${C.border}`, borderRadius: 12, background: C.panel2, padding: "0.9rem", overflow: "visible", minWidth: 0, height: "auto" }}>
                                   {currentCommandExecution && isSiglentWaveformResult(currentCommandExecution.output) ? (
                                     <WaveformChartInteractive key={`${currentCommandExecution.startedAt}-${currentCommandExecution.output.channel}-${currentCommandExecution.output.sampleCount}`} result={currentCommandExecution.output} />
+                                  ) : currentCommandExecution && isHttpArtifactResult(currentCommandExecution.output) ? (
+                                    (() => {
+                                      const rendered = renderHttpArtifact(currentCommandExecution.output, selectedCommand.name);
+                                      return rendered.kind === "image" ? (
+                                        <img
+                                          src={rendered.src}
+                                          alt={selectedCommand.name}
+                                          style={{ display: "block", maxWidth: "100%", height: "auto", background: "white", borderRadius: 8 }}
+                                        />
+                                      ) : (
+                                        <pre style={{ margin: 0, color: C.text, fontSize: "0.84rem", lineHeight: 1.55, whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+                                          {rendered.text}
+                                        </pre>
+                                      );
+                                    })()
                                   ) : currentCommandExecution && isTcpCommandResult(currentCommandExecution.output) ? (
                                     selectedCommand.artifactMode === "image" && currentCommandExecution.output.bytesBase64 ? (
                                       <img

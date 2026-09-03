@@ -20,6 +20,16 @@ export type AuthState = {
   userProfile?: UserProfile;
   loading: boolean;
   error?: string;
+  // True when a request failed with an auth error (expired token, etc.) mid-session. Distinct from
+  // isSignedIn/clearSession: flagging this does NOT tear down the signed-in app — AuthGate keeps
+  // the whole module tree mounted and shows a "reconnect" prompt on top of it instead, so no
+  // in-memory work in any module gets destroyed just because a token needs renewing.
+  needsReauth: boolean;
+  // Bumped every time a fresh awsCredentialProvider is established (initial sign-in or reconnect).
+  // awsClients.ts includes this in its S3/DynamoDB client cache keys so a reconnect actually
+  // produces new clients bound to the new provider, instead of old cached clients silently
+  // continuing to use a credential closure permanently tied to the expired token.
+  authGeneration: number;
   signInWithGoogle: () => void;
   signInWithMicrosoft: () => void;
   signOut: () => void;
@@ -30,6 +40,7 @@ export type AuthState = {
     awsCredentialProvider: () => Promise<AwsCredentials>;
   }) => void;
   clearSession: () => void;
+  flagReauthNeeded: () => void;
   setLoading: (loading: boolean) => void;
   setError: (error?: string) => void;
 };
@@ -108,17 +119,21 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   userProfile: undefined,
   loading: false,
   error: undefined,
+  needsReauth: false,
+  authGeneration: 0,
 
   setGoogleSession: ({ googleToken, expiresAt, userProfile, awsCredentialProvider }) => {
     saveSession(googleToken, expiresAt, userProfile);
-    set({
+    set((state) => ({
       isSignedIn: true,
       googleToken,
       userProfile,
       awsCredentialProvider,
       loading: false,
       error: undefined,
-    });
+      needsReauth: false,
+      authGeneration: state.authGeneration + 1,
+    }));
   },
 
   clearSession: () => {
@@ -130,8 +145,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       awsCredentialProvider: undefined,
       loading: false,
       error: undefined,
+      needsReauth: false,
     });
   },
+
+  flagReauthNeeded: () => set({ needsReauth: true }),
 
   setLoading: (loading) => set({ loading }),
   setError: (error) => set({ error }),

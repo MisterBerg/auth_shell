@@ -53,6 +53,32 @@ function isSessionExpired(expiresAt?: number): boolean {
   return Date.now() >= expiresAt - 60_000;
 }
 
+// Best-effort proactive renewal: the Google ID token backing AWS credentials is normally valid for
+// about an hour with no automatic refresh, so without this the token silently goes stale mid-session
+// and the first request after that fails with an auth error. That failure is now handled gracefully
+// (see awsClients-side flagReauthNeeded — it surfaces a one-click reconnect prompt instead of losing
+// any in-progress work), but avoiding the failure in the first place is still nicer than recovering
+// from it. This is deliberately "best effort" — GIS's silent prompt() can be suppressed by browser
+// policy or a prior dismissal, and that's fine: the reactive path is the actual safety net.
+const PROACTIVE_REFRESH_MARGIN_MS = 5 * 60_000;
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleProactiveRefresh(expiresAt?: number) {
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+  if (!expiresAt) return;
+  const delay = Math.max(expiresAt - PROACTIVE_REFRESH_MARGIN_MS - Date.now(), 5_000);
+  refreshTimer = setTimeout(() => {
+    try {
+      window.google?.accounts.id.prompt();
+    } catch (error) {
+      console.warn("[auth] Proactive silent refresh failed", error);
+    }
+  }, delay);
+}
+
 function makeAwsCredentialProviderFromGoogle(
   config: AppConfig,
   googleToken: string
@@ -167,6 +193,7 @@ function ensureGisInitialized(): void {
           userProfile,
           awsCredentialProvider,
         });
+        scheduleProactiveRefresh(expiresAt);
       } catch (error) {
         handleUnauthorizedSignIn(error);
       }
@@ -198,6 +225,7 @@ async function restoreSavedSession(config: AppConfig) {
       userProfile: saved.userProfile ?? userProfile,
       awsCredentialProvider,
     });
+    scheduleProactiveRefresh(saved.expiresAt);
   } catch (error) {
     handleUnauthorizedSignIn(error);
   }

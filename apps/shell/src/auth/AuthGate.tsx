@@ -28,6 +28,11 @@ type ProtectedShellCoreProps = {
     awsCredentialProvider: () => Promise<AwsCredentials>;
     userProfile?: { email?: string; name?: string; picture?: string };
     signOut: () => void;
+    // Called by shell-core's AWS clients when a request fails with an auth error (expired token,
+    // etc). Distinct from signOut: this must NOT cause AuthGate to unmount the module tree — see
+    // the needsReauth handling below — so shell-core reports the error here instead of calling
+    // signOut() directly the way it used to.
+    flagReauthNeeded: () => void;
   };
   runtimeEnv: PublicRuntimeEnv;
 };
@@ -294,8 +299,18 @@ async function readLocalObjectText(
 }
 
 export const AuthGate: React.FC = () => {
-  const { isSignedIn, awsCredentialProvider, userProfile, loading, error, signOut, signInWithGoogle, signInWithMicrosoft } =
-    useAuthStore();
+  const {
+    isSignedIn,
+    awsCredentialProvider,
+    userProfile,
+    loading,
+    error,
+    signOut,
+    signInWithGoogle,
+    signInWithMicrosoft,
+    needsReauth,
+    flagReauthNeeded,
+  } = useAuthStore();
   const runtimeEnvRef = useRef(getRuntimeEnv());
 
   useEffect(() => {
@@ -304,26 +319,22 @@ export const AuthGate: React.FC = () => {
 
   const ready = isSignedIn && !!awsCredentialProvider;
 
+  // Created once, the first time credentials are available to fetch the bundle with, and then left
+  // alone — NOT recomputed when awsCredentialProvider is later replaced by a reconnect. Recreating
+  // this on every credential refresh would hand React a brand-new component reference each time,
+  // which forces a full unmount/remount of the entire shell-core tree (and every module inside it)
+  // exactly the moment we're trying to avoid that. Fresh auth values instead flow into the
+  // already-mounted component as ordinary props on every render, below.
   const LazyShellCore = useMemo(() => {
     if (!ready || !awsCredentialProvider) return null;
-
-    return React.lazy(async (): Promise<{ default: React.ComponentType }> => {
-      const Component = await loadProtectedShellCore(
-        awsCredentialProvider,
-        runtimeEnvRef.current
-      );
-
-      const Bound = () => (
-        <Component
-          shellConfig={CONFIG}
-          auth={{ awsCredentialProvider, userProfile, signOut }}
-          runtimeEnv={runtimeEnvRef.current}
-        />
-      );
-      Bound.displayName = "ProtectedShellCore";
-      return { default: Bound };
+    const initialCredentialProvider = awsCredentialProvider;
+    return React.lazy(async (): Promise<{ default: React.ComponentType<ProtectedShellCoreProps> }> => {
+      const Component = await loadProtectedShellCore(initialCredentialProvider, runtimeEnvRef.current);
+      return { default: Component };
     });
-  }, [ready, awsCredentialProvider, userProfile, signOut]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately created once on first
+    // readiness; see comment above.
+  }, [ready]);
 
   if (!ready || !LazyShellCore) {
     return (
@@ -412,25 +423,87 @@ export const AuthGate: React.FC = () => {
   }
 
   return (
-    <ModuleErrorBoundary>
-      <Suspense
-        fallback={
-          <div
-            style={{
-              minHeight: "100vh",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              background: "#020617",
-              color: "#e5e7eb",
-            }}
-          >
-            Loading protected shell...
-          </div>
-        }
-      >
-        <LazyShellCore />
-      </Suspense>
-    </ModuleErrorBoundary>
+    <>
+      <ModuleErrorBoundary>
+        <Suspense
+          fallback={
+            <div
+              style={{
+                minHeight: "100vh",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "#020617",
+                color: "#e5e7eb",
+              }}
+            >
+              Loading protected shell...
+            </div>
+          }
+        >
+          <LazyShellCore
+            shellConfig={CONFIG}
+            auth={{ awsCredentialProvider: awsCredentialProvider!, userProfile, signOut, flagReauthNeeded }}
+            runtimeEnv={runtimeEnvRef.current}
+          />
+        </Suspense>
+      </ModuleErrorBoundary>
+      {needsReauth && (
+        <ReauthBanner onReconnect={signInWithGoogle} loading={loading} error={error} />
+      )}
+    </>
   );
 };
+
+// Shown on top of the still-mounted app (never replaces it) when a request failed with an expired
+// or otherwise invalid token. Deliberately non-blocking: whatever the operator is doing keeps
+// working from memory, and reconnecting is one click away whenever they get to it. Any writes that
+// failed in the meantime are retried by the module that made them once fresh credentials land.
+const ReauthBanner: React.FC<{ onReconnect: () => void; loading: boolean; error?: string }> = ({
+  onReconnect,
+  loading,
+  error,
+}) => (
+  <div
+    style={{
+      position: "fixed",
+      top: 0,
+      left: 0,
+      right: 0,
+      zIndex: 2147483000,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: "0.85rem",
+      flexWrap: "wrap",
+      padding: "0.6rem 1rem",
+      background: "#7c2d12",
+      color: "#fef3c7",
+      fontFamily: "system-ui, sans-serif",
+      fontSize: "0.88rem",
+      boxShadow: "0 2px 10px rgba(0,0,0,0.35)",
+    }}
+  >
+    <span>
+      Your sign-in has expired. Reconnect to keep saving — nothing on screen will be lost.
+      {error ? ` (${error})` : ""}
+    </span>
+    <button
+      type="button"
+      onClick={onReconnect}
+      disabled={loading}
+      style={{
+        padding: "0.35rem 0.85rem",
+        borderRadius: "999px",
+        border: "1px solid #fbbf24",
+        cursor: loading ? "default" : "pointer",
+        fontWeight: 600,
+        fontSize: "0.85rem",
+        background: "#fbbf24",
+        color: "#1c1917",
+      }}
+    >
+      {loading ? "Reconnecting..." : "Reconnect"}
+    </button>
+  </div>
+);

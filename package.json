@@ -24,7 +24,8 @@
     "modules/shell-core",
     "modules/agent-chat",
     "shared/web-serial-runtime",
-    "shared/kicad-board-export"
+    "shared/kicad-board-export",
+    "shared/http-device-client"
   ],
   "scripts": {
     "reset": "tsx scripts/reset-local.ts",

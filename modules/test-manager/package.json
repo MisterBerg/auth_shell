@@ -15,6 +15,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "3.943.0",
     "@aws-sdk/s3-request-presigner": "3.943.0",
+    "http-device-client": "*",
     "module-core": "*",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

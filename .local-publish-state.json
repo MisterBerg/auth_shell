@@ -11,13 +11,13 @@
     "modules/document-viewer": "24506860847c28a833ee77724243b3a95500048762ebf89325780c2e86581219",
     "modules/documentation-viewer": "41312ab7d4f97d4208c4d99e5c4d83f74ff3d75296b40af7e5cf7799a2d655ea",
     "modules/links": "aa0a2590884ed22afa5b092c4839153ec4546070b1c13b1e7d7cd21117d845a1",
-    "modules/test-manager": "555f59c7602aba4d331181c14774111bcce940dd2e047aea493946c8943b3f7f",
+    "modules/test-manager": "861dde1c7936be6c87e1fb2fd4faf564b02df55f828637eb797e373f0b4d524c",
     "modules/task-tracker": "49dcf58e2ed945094b5ff279f378a0956e1434ea4f0e95f41a86a1ee87854ed6",
     "modules/work-manager": "8d344e81b60dd75cec4a4e2ebea4322f0e06fca49a945a0bb86d8aa930e1d469",
     "modules/kicad-board-viewer": "6ce2b36fc9f9aac99e5c855fe2508551243119b1d62b8349399cc16d96d83bf5",
     "modules/serial-display": "0296c932736703871a508334143f8d5fdda84cb95720b042761a8c29113e2c41",
     "modules/shell-core": "ba56fefa7f82f68738761e5dbc1b3bd38ab662e7f2a7dbd2eaf3c557f3e26d2f",
     "modules/agent-chat": "709b201d13039c0fe5d21c8e90fbfc88115e0052738e6d50d24b9e54aa4de939",
-    "modules/equipment-manager": "9cf5b64edc304e4b279e196f7f902656fe73aeba2f6070b421555b35fb99597b"
+    "modules/equipment-manager": "ee1ea2755b16bcef71fc6e7ba4a1c39fd02284e4d52b7fc9b1e0e3e42681c5b4"
   }
 }
