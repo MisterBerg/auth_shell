@@ -395,6 +395,23 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
+// Runs `fn` over `items` with at most `limit` in flight at once. A run can carry dozens of
+// 1-2MB waveform-points files; firing them all as one big Promise.all blows past the browser's
+// per-host connection limit, so most of them just sit queued until they trip their own timeout.
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    for (;;) {
+      const current = nextIndex++;
+      if (current >= items.length) return;
+      results[current] = await fn(items[current]!, current);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 type ReportPages = {
   summary: string;
   details: Record<string, string>;
@@ -533,10 +550,10 @@ async function readOptionalText(s3: S3Client, bucket: string, key: string): Prom
   try {
     const response = await withTimeout(
       s3.send(new GetObjectCommand({ Bucket: bucket, Key: key })),
-      10000,
+      20000,
       `Loading s3://${bucket}/${key}`
     );
-    return response.Body ? await withTimeout(response.Body.transformToString("utf-8"), 10000, `Reading s3://${bucket}/${key}`) : null;
+    return response.Body ? await withTimeout(response.Body.transformToString("utf-8"), 20000, `Reading s3://${bucket}/${key}`) : null;
   } catch (error: unknown) {
     const err = error as { name?: string; $metadata?: { httpStatusCode?: number } };
     if (err.name === "NoSuchKey" || err.name === "NotFound" || err.$metadata?.httpStatusCode === 404) return null;
@@ -2013,24 +2030,34 @@ async function backfillWaveformPointsArtifacts(
 // eagerly for the whole run on every load) to fetch back any entry's points that were stripped at
 // persist time, before generateReportPages renders its chart/CSV.
 async function resolveRunWaveformPoints(s3: S3Client, run: TestRun): Promise<TestRun> {
-  let runChanged = false;
-  const instrumentSessions = await Promise.all((run.instrumentSessions ?? []).map(async (session) => {
-    let sessionChanged = false;
-    const entries = await Promise.all(session.entries.map(async (entry) => {
-      const preview = entry.preview;
-      const pointsRef = preview?.pointsRef;
-      if (!preview || preview.points?.length || !pointsRef) return entry;
-      const text = await readOptionalText(s3, pointsRef.bucket, pointsRef.key);
-      const points = parseWaveformPointsJson(text);
-      if (points.length === 0) return entry;
-      sessionChanged = true;
-      return { ...entry, preview: { ...preview, points, samples: points.map((point) => point.voltage) } };
-    }));
-    if (!sessionChanged) return session;
-    runChanged = true;
-    return { ...session, entries };
-  }));
-  return runChanged ? { ...run, instrumentSessions } : run;
+  const sessions = run.instrumentSessions ?? [];
+  type PendingFetch = { sessionIndex: number; entryIndex: number; bucket: string; key: string };
+  const pending: PendingFetch[] = [];
+  sessions.forEach((session, sessionIndex) => {
+    session.entries.forEach((entry, entryIndex) => {
+      const pointsRef = entry.preview?.pointsRef;
+      if (entry.preview && !entry.preview.points?.length && pointsRef) {
+        pending.push({ sessionIndex, entryIndex, bucket: pointsRef.bucket, key: pointsRef.key });
+      }
+    });
+  });
+  if (pending.length === 0) return run;
+
+  const nextSessions = sessions.map((session) => ({ ...session, entries: [...session.entries] }));
+  const changedSessionIndices = new Set<number>();
+
+  // Bounded to a handful at a time — see mapWithConcurrency — so a run with dozens of waveform
+  // captures doesn't fire them all as one burst that starves the browser's connection pool.
+  await mapWithConcurrency(pending, 4, async ({ sessionIndex, entryIndex, bucket, key }) => {
+    const text = await readOptionalText(s3, bucket, key);
+    const points = parseWaveformPointsJson(text);
+    if (points.length === 0) return;
+    const entry = nextSessions[sessionIndex]!.entries[entryIndex]!;
+    nextSessions[sessionIndex]!.entries[entryIndex] = { ...entry, preview: { ...entry.preview!, points, samples: points.map((point) => point.voltage) } };
+    changedSessionIndices.add(sessionIndex);
+  });
+
+  return changedSessionIndices.size > 0 ? { ...run, instrumentSessions: nextSessions } : run;
 }
 
 // Matches the shell's own auth-error detection (see shell-core's isAwsAuthError) — kept as a
@@ -4150,6 +4177,7 @@ function TestManagerInner({ config }: ModuleProps) {
   // Populated on demand by openReportPdf, with waveform points resolved — see buildResolvedReportPages.
   const [printReportPages, setPrintReportPages] = useState<ReportPages | null>(null);
   const [printReportLoading, setPrintReportLoading] = useState(false);
+  const [zipReportProgress, setZipReportProgress] = useState<{ stage: string; completed: number; total: number } | null>(null);
   const [instrumentDialogOpen, setInstrumentDialogOpen] = useState(false);
   const [activeInstrumentSession, setActiveInstrumentSession] = useState<InstrumentSessionRecord | null>(null);
   const [selectedInstrumentSessionId, setSelectedInstrumentSessionId] = useState<string | null>(null);
@@ -5542,11 +5570,15 @@ function TestManagerInner({ config }: ModuleProps) {
     });
   }, [activeRun, definition, getS3Client, includedTests, reportArtifactLinks, reportArtifacts.length, storage.bucket]);
 
-  const buildReportFiles = useCallback(async (): Promise<Record<string, ZipFileContent> | null> => {
+  const buildReportFiles = useCallback(async (
+    onProgress?: (update: { stage: string; completed: number; total: number }) => void,
+  ): Promise<Record<string, ZipFileContent> | null> => {
     if (!definition || !activeRun) return null;
+    onProgress?.({ stage: "Resolving waveform data...", completed: 0, total: 0 });
     const s3 = await getS3Client(storage.bucket);
     const resolvedRun = await resolveRunWaveformPoints(s3, activeRun);
     const exportRun = pruneRunArtifacts(resolvedRun, definition, testsById, user?.email);
+    onProgress?.({ stage: "Building report pages...", completed: 0, total: 0 });
     const zipPages = generateReportPages(definition, exportRun, includedTests, {
       artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
       instrumentSessionArtifactHref: ({ session, artifact }) => `../${getInstrumentSessionArchivePath(session, artifact)}`,
@@ -5560,11 +5592,24 @@ function TestManagerInner({ config }: ModuleProps) {
       "workspace.json": JSON.stringify(workspace, null, 2),
     };
 
+    // Every evidence file is fetched from S3 one at a time below, which is the slow part of a
+    // report export — count them upfront so the progress bar has a real total instead of an
+    // indeterminate spinner for the whole download.
+    const testResults = includedTests.map((test) => ensureResult(exportRun, test, user?.email));
+    const totalArtifactCount = (exportRun.overviewArtifacts ?? []).length
+      + testResults.reduce((sum, result) => sum + Object.values(result.typedArtifacts).reduce((s, list) => s + list.length, 0) + result.supportingArtifacts.length, 0)
+      + (exportRun.instrumentSessions ?? []).reduce((sum, session) => sum + session.entries.filter((entry) => entry.artifact).length, 0);
+    let completedArtifactCount = 0;
+    const reportArtifactProgress = () => onProgress?.({ stage: "Downloading evidence files...", completed: completedArtifactCount, total: totalArtifactCount });
+    reportArtifactProgress();
+
     const manifest: Array<Record<string, string | number | null>> = [];
     for (const entry of exportRun.overviewArtifacts ?? []) {
       const archivePath = overviewArtifactArchivePath(entry.artifact);
       const bytes = await readOptionalBytes(s3, entry.artifact.bucket, entry.artifact.key);
       if (bytes) files[archivePath] = bytes;
+      completedArtifactCount += 1;
+      reportArtifactProgress();
       manifest.push({
         testId: null,
         fieldId: null,
@@ -5578,13 +5623,16 @@ function TestManagerInner({ config }: ModuleProps) {
         caption: entry.caption ?? null,
       });
     }
-    for (const test of includedTests) {
-      const result = ensureResult(exportRun, test, user?.email);
+    for (let i = 0; i < includedTests.length; i++) {
+      const test = includedTests[i]!;
+      const result = testResults[i]!;
       for (const [fieldId, artifacts] of Object.entries(result.typedArtifacts)) {
         for (const artifact of artifacts) {
           const archivePath = artifactArchivePath(test.id, artifact, fieldId);
           const bytes = await readOptionalBytes(s3, artifact.bucket, artifact.key);
           if (bytes) files[archivePath] = bytes;
+          completedArtifactCount += 1;
+          reportArtifactProgress();
           manifest.push({
             testId: test.id,
             fieldId,
@@ -5602,6 +5650,8 @@ function TestManagerInner({ config }: ModuleProps) {
         const archivePath = artifactArchivePath(test.id, artifact, null);
         const bytes = await readOptionalBytes(s3, artifact.bucket, artifact.key);
         if (bytes) files[archivePath] = bytes;
+        completedArtifactCount += 1;
+        reportArtifactProgress();
         manifest.push({
           testId: test.id,
           fieldId: null,
@@ -5621,6 +5671,8 @@ function TestManagerInner({ config }: ModuleProps) {
         const archivePath = getInstrumentSessionArchivePath(session, entry.artifact);
         const bytes = await readOptionalBytes(s3, entry.artifact.bucket, entry.artifact.key);
         if (bytes) files[archivePath] = bytes;
+        completedArtifactCount += 1;
+        reportArtifactProgress();
         manifest.push({
           testId: session.testId,
           fieldId: null,
@@ -5635,16 +5687,24 @@ function TestManagerInner({ config }: ModuleProps) {
       }
     }
 
+    onProgress?.({ stage: "Packaging ZIP...", completed: totalArtifactCount, total: totalArtifactCount });
     files["evidence/manifest.json"] = JSON.stringify(manifest, null, 2);
     return files;
   }, [activeRun, definition, getS3Client, includedTests, storage.bucket, testsById, user?.email, workspace]);
 
   const downloadReportZip = useCallback(() => {
+    setReportDialogOpen(false);
+    setZipReportProgress({ stage: "Preparing report...", completed: 0, total: 0 });
     void (async () => {
-      const files = await buildReportFiles();
-      if (!files) return;
-      downloadBlob(`test-report-${safeFileSegment(storage.projectId)}.zip`, createZipBlob(files));
-      setReportDialogOpen(false);
+      try {
+        const files = await buildReportFiles((update) => setZipReportProgress(update));
+        if (!files) return;
+        downloadBlob(`test-report-${safeFileSegment(storage.projectId)}.zip`, createZipBlob(files));
+      } catch (buildError: unknown) {
+        setError((buildError as Error).message);
+      } finally {
+        setZipReportProgress(null);
+      }
     })();
   }, [buildReportFiles, storage.projectId]);
 
@@ -5672,6 +5732,10 @@ function TestManagerInner({ config }: ModuleProps) {
   return (
     <div style={{ height: "100%", minHeight: 0, display: "grid", gridTemplateRows: "auto auto auto 1fr", background: C.bg, color: C.text, fontFamily: "\"Segoe UI\", \"Aptos\", sans-serif" }}>
       <style>{`
+        @keyframes zip-report-progress-indeterminate {
+          0% { transform: translateX(-60%); }
+          100% { transform: translateX(220%); }
+        }
         @media print {
           @page {
             size: auto;
@@ -6451,6 +6515,38 @@ function TestManagerInner({ config }: ModuleProps) {
             <footer style={{ padding: "0.85rem 1.1rem", borderTop: `1px solid ${C.border}`, display: "flex", justifyContent: "flex-end" }}>
               <button onClick={() => setReportDialogOpen(false)} style={buttonStyle()}>Cancel</button>
             </footer>
+          </section>
+        </div>
+      ) : null}
+      {zipReportProgress ? (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.58)", display: "flex", alignItems: "center", justifyContent: "center", padding: "1rem", zIndex: 50 }}>
+          <section style={{ width: "min(420px, 100%)", border: `1px solid ${C.border}`, borderRadius: 16, background: C.panel, boxShadow: "0 24px 80px rgba(0,0,0,0.45)", padding: "1.1rem 1.2rem" }}>
+            <div style={{ fontWeight: 800 }}>Generating ZIP Report</div>
+            <div style={{ marginTop: "0.35rem", color: C.muted, fontSize: "0.84rem" }}>
+              {zipReportProgress.stage}
+              {zipReportProgress.total > 0 ? ` (${zipReportProgress.completed}/${zipReportProgress.total})` : ""}
+            </div>
+            <div style={{ marginTop: "0.85rem", height: 8, borderRadius: 999, background: C.panel2, border: `1px solid ${C.border}`, overflow: "hidden", position: "relative" }}>
+              {zipReportProgress.total > 0 ? (
+                <div style={{
+                  height: "100%",
+                  width: `${Math.round((zipReportProgress.completed / zipReportProgress.total) * 100)}%`,
+                  background: C.accent,
+                  borderRadius: 999,
+                  transition: "width 0.2s ease",
+                }} />
+              ) : (
+                <div style={{
+                  position: "absolute",
+                  top: 0,
+                  bottom: 0,
+                  width: "40%",
+                  background: C.accent,
+                  borderRadius: 999,
+                  animation: "zip-report-progress-indeterminate 1.1s ease-in-out infinite",
+                }} />
+              )}
+            </div>
           </section>
         </div>
       ) : null}
