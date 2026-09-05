@@ -438,6 +438,11 @@ type ReportGenerationOptions = {
   instrumentSessionArtifactHref?: (context: ReportInstrumentSessionArtifactContext) => string;
   overviewArtifactHref?: (artifact: ArtifactRef) => string;
   notes?: string[];
+  // When true, chart/CSV/diagram assets this function generates are embedded directly as data:
+  // URIs in the returned HTML instead of being written to `assets` and referenced by relative
+  // path. Used by the in-app preview and PDF/print view, which have no `assets/` directory
+  // alongside them to link to; the ZIP export leaves this off so files stay separate.
+  inlineAssets?: boolean;
 };
 
 type AgentBridgeDefaults = {
@@ -617,10 +622,6 @@ function humanize(value: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .replace(/\b\w/g, (match) => match.toUpperCase());
-}
-
-function escapeMarkdownCell(value: string): string {
-  return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 
 function escapeXml(value: string): string {
@@ -2558,8 +2559,15 @@ function getInstrumentSessionArchivePath(session: InstrumentSessionRecord, artif
   return `instrument-sessions/${safeFileSegment(session.testId)}/${safeFileSegment(session.id)}/${safeFileSegment(artifact.id)}-${safeFileSegment(artifact.name)}`;
 }
 
+// run.instrumentSessions is not stored in chronological order: saveInstrumentSession (see its
+// definition) prepends whichever session was just touched, including on every debounced autosave
+// during a still-running session, so the array's order reflects "most recently saved" rather than
+// "when it happened." Sort by startedAt here so callers — the report and the Run tab's session
+// list — show sessions in actual execution order regardless of what was edited most recently.
 function sessionsForTest(run: TestRun, testId: string): InstrumentSessionRecord[] {
-  return (run.instrumentSessions ?? []).filter((session) => session.testId === testId);
+  return (run.instrumentSessions ?? [])
+    .filter((session) => session.testId === testId)
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
 }
 
 function collectReferencedBindingIds(scope: InstrumentScopeDefinition, scriptId: string, visited = new Set<string>()): string[] {
@@ -3320,8 +3328,54 @@ function buildInstrumentSessionWindowState(
   };
 }
 
-function markdownArtifactLink(label: string, href: string): string {
-  return `[${label}](${href})`;
+function isImageContentType(contentType?: string): boolean {
+  return (contentType ?? "").toLowerCase().startsWith("image/");
+}
+
+function isVideoContentType(contentType?: string): boolean {
+  return (contentType ?? "").toLowerCase().startsWith("video/");
+}
+
+// Renders a linked file inline as an image or video when its content type supports it, falling
+// back to a plain download link for everything else (PDFs, CSVs, SCPI captures, ...).
+function htmlArtifactBlock(name: string, href: string, contentType: string | undefined, sizeBytes?: number): string {
+  const label = escapeHtml(sizeBytes != null ? `${name} (${formatBytes(sizeBytes)})` : name);
+  const safeHref = escapeHtml(href);
+  if (isImageContentType(contentType)) {
+    return `<figure class="report-media"><img src="${safeHref}" alt="${escapeHtml(name)}" loading="lazy" /><figcaption><a href="${safeHref}" target="_blank" rel="noreferrer">${label}</a></figcaption></figure>`;
+  }
+  if (isVideoContentType(contentType)) {
+    return `<figure class="report-media"><video controls preload="metadata" src="${safeHref}"></video><figcaption><a href="${safeHref}" target="_blank" rel="noreferrer">${label}</a></figcaption></figure>`;
+  }
+  return `<div class="report-file"><a href="${safeHref}" target="_blank" rel="noreferrer">${label}</a></div>`;
+}
+
+function htmlOverviewArtifactBlock(entry: OverviewArtifact, href: string): string {
+  const altLabel = escapeHtml(entry.caption || entry.artifact.name);
+  const safeHref = escapeHtml(href);
+  const caption = isMeaningful(entry.caption) ? `<figcaption>${escapeHtml(entry.caption ?? "")}</figcaption>` : "";
+  if (isVideoContentType(entry.artifact.contentType)) {
+    return `<figure class="report-media"><video controls preload="metadata" src="${safeHref}"></video>${caption}</figure>`;
+  }
+  return `<figure class="report-media"><img src="${safeHref}" alt="${altLabel}" loading="lazy" />${caption}</figure>`;
+}
+
+// Registers a generated asset (chart SVG, waveform CSV, program/pre-test diagram) under `path` for
+// the ZIP export, and returns the `src`/`href` to reference it with — a relative path normally, or
+// (see ReportGenerationOptions.inlineAssets) a data: URI when there's no assets/ directory to link to.
+function reportAssetSrc(
+  assets: Record<string, { content: string; contentType: string }>,
+  path: string,
+  content: string,
+  contentType: string,
+  inline: boolean | undefined,
+  relativePrefix: string,
+): string {
+  assets[path] = { content, contentType };
+  if (inline) {
+    return `data:${contentType};base64,${btoa(unescape(encodeURIComponent(content)))}`;
+  }
+  return `${relativePrefix}${path}`;
 }
 
 function stepStatusLabel(result: StepResult | undefined): string {
@@ -3427,202 +3481,255 @@ function generateReportPages(
   const summary: string[] = [];
   const details: Record<string, string> = {};
   const assets: Record<string, { content: string; contentType: string }> = {};
-  const detailHref = options.detailHref ?? ((test: ResolvedTest) => `tests/${safeFileSegment(test.id)}.md`);
+  const inlineAssets = options.inlineAssets;
+  const detailHref = options.detailHref ?? ((test: ResolvedTest) => `tests/${safeFileSegment(test.id)}.html`);
   const artifactHref = options.artifactHref ?? ((context: ReportArtifactContext) => `s3://${context.artifact.bucket}/${context.artifact.key}`);
   const instrumentSessionArtifactHref = options.instrumentSessionArtifactHref
     ?? ((context: ReportInstrumentSessionArtifactContext) => `s3://${context.artifact.bucket}/${context.artifact.key}`);
   const overviewArtifactHref = options.overviewArtifactHref ?? ((artifact: ArtifactRef) => `s3://${artifact.bucket}/${artifact.key}`);
-  const backToSummaryHref = options.backToSummaryHref ?? "../report.md";
+  const backToSummaryHref = options.backToSummaryHref ?? "../report.html";
 
-  summary.push(`# ${title} Report`);
-  summary.push("");
-  summary.push("## Report Summary");
-  summary.push("");
-  summary.push(`- Program: ${escapeMarkdownCell(title)}`);
-  summary.push(`- Run: ${escapeMarkdownCell(run.label)}`);
-  summary.push(`- Generated On: ${escapeMarkdownCell(formatDate(nowIso()))}`);
-  summary.push(`- Tests in Scope: ${tests.length}`);
+  summary.push(`<h1>${escapeHtml(title)} Report</h1>`);
+  summary.push("<h2>Report Summary</h2>");
+  summary.push("<ul>");
+  summary.push(`<li><strong>Program:</strong> ${escapeHtml(title)}</li>`);
+  summary.push(`<li><strong>Run:</strong> ${escapeHtml(run.label)}</li>`);
+  summary.push(`<li><strong>Generated On:</strong> ${escapeHtml(formatDate(nowIso()))}</li>`);
+  summary.push(`<li><strong>Tests in Scope:</strong> ${tests.length}</li>`);
   if (options.notes?.length) {
     for (const note of options.notes) {
-      summary.push(`- Note: ${escapeMarkdownCell(note)}`);
+      summary.push(`<li><strong>Note:</strong> ${escapeHtml(note)}</li>`);
     }
   }
-  summary.push("");
+  summary.push("</ul>");
   if (isMeaningful(run.overviewNotes)) {
-    summary.push("## Run Notes");
-    summary.push("");
-    summary.push(run.overviewNotes?.trim() ?? "");
-    summary.push("");
+    summary.push("<h2>Run Notes</h2>");
+    summary.push(`<div class="report-note">${escapeHtml(run.overviewNotes?.trim() ?? "")}</div>`);
   }
   if ((run.overviewArtifacts?.length ?? 0) > 0) {
-    summary.push("## Run Overview Images");
-    summary.push("");
+    summary.push("<h2>Run Overview Images</h2>");
     for (const entry of run.overviewArtifacts ?? []) {
-      summary.push(`![${escapeMarkdownCell(entry.caption || entry.artifact.name)}](${overviewArtifactHref(entry.artifact)})`);
-      if (isMeaningful(entry.caption)) {
-        summary.push("");
-        summary.push(`_${escapeMarkdownCell(entry.caption ?? "")}_`);
-      }
-      summary.push("");
+      summary.push(htmlOverviewArtifactBlock(entry, overviewArtifactHref(entry.artifact)));
     }
   }
   if (definition.programAssets.length > 0) {
-    summary.push("## Program Overview");
-    summary.push("");
+    summary.push("<h2>Program Overview</h2>");
     for (const [index, asset] of definition.programAssets.entries()) {
-      if (asset.type === "image_url") {
-        summary.push(`![${escapeMarkdownCell(asset.label)}](${asset.content})`);
-      } else {
-        const assetPath = `assets/program-${String(index + 1)}-${safeFileSegment(asset.id)}.svg`;
-        assets[assetPath] = { content: asset.content, contentType: "image/svg+xml" };
-        summary.push(`![${escapeMarkdownCell(asset.label)}](${assetPath})`);
-      }
-      summary.push("");
+      const src = asset.type === "image_url"
+        ? asset.content
+        : reportAssetSrc(assets, `assets/program-${String(index + 1)}-${safeFileSegment(asset.id)}.svg`, asset.content, "image/svg+xml", inlineAssets, "");
+      summary.push(`<figure class="report-media"><img src="${escapeHtml(src)}" alt="${escapeHtml(asset.label)}" loading="lazy" /><figcaption>${escapeHtml(asset.label)}</figcaption></figure>`);
     }
   }
-  summary.push("## Results Summary");
-  summary.push("");
-  summary.push("| Test ID | Test Group | Status | Failure Mode | Target Module | Detail |");
-  summary.push("|---|---|---|---|---|---|");
+  summary.push("<h2>Results Summary</h2>");
+  summary.push("<table><thead><tr><th>Test ID</th><th>Test Group</th><th>Status</th><th>Failure Mode</th><th>Target Module</th><th>Detail</th></tr></thead><tbody>");
 
   for (const test of tests) {
     const result = ensureResult(run, test);
-    summary.push(`| ${escapeMarkdownCell(test.id)} | ${escapeMarkdownCell(test.testGroupId)} | ${escapeMarkdownCell(result.status)} | ${escapeMarkdownCell(valueDisplay(test.definedValues.failure_mode))} | ${escapeMarkdownCell(valueDisplay(test.definedValues.target_module))} | [View](${detailHref(test)}) |`);
+    summary.push(`<tr><td>${escapeHtml(test.id)}</td><td>${escapeHtml(test.testGroupId)}</td><td>${escapeHtml(result.status)}</td><td>${escapeHtml(valueDisplay(test.definedValues.failure_mode))}</td><td>${escapeHtml(valueDisplay(test.definedValues.target_module))}</td><td><a href="${escapeHtml(detailHref(test))}">View</a></td></tr>`);
 
     const detail: string[] = [];
-    detail.push(`# Test Result: ${test.id}`);
-    detail.push("");
-    detail.push(`- Program: ${escapeMarkdownCell(title)}`);
-    detail.push(`- Run: ${escapeMarkdownCell(run.label)}`);
-    detail.push(`- Test Group: ${escapeMarkdownCell(test.testGroupTitle)}`);
-    detail.push(`- Status: ${escapeMarkdownCell(result.status)}`);
-    detail.push(`- Last Updated: ${escapeMarkdownCell(formatDate(result.updatedAt))}`);
-    detail.push("");
+    detail.push(`<h1>Test Result: ${escapeHtml(test.id)}</h1>`);
+    detail.push("<ul>");
+    detail.push(`<li><strong>Program:</strong> ${escapeHtml(title)}</li>`);
+    detail.push(`<li><strong>Run:</strong> ${escapeHtml(run.label)}</li>`);
+    detail.push(`<li><strong>Test Group:</strong> ${escapeHtml(test.testGroupTitle)}</li>`);
+    detail.push(`<li><strong>Status:</strong> ${escapeHtml(result.status)}</li>`);
+    detail.push(`<li><strong>Last Updated:</strong> ${escapeHtml(formatDate(result.updatedAt))}</li>`);
+    detail.push("</ul>");
     if (test.preTestGuidance) {
-      detail.push("## Pre-Test Guidance");
-      detail.push("");
-      detail.push(test.preTestGuidance.trim());
-      detail.push("");
+      detail.push("<h2>Pre-Test Guidance</h2>");
+      detail.push(`<div class="report-note">${escapeHtml(test.preTestGuidance.trim())}</div>`);
     }
+    // Built now (it needs the assets/inlineAssets machinery available at this point in the loop)
+    // but pushed onto `detail` last, after the test's own results — see below.
     const testSessions = sessionsForTest(run, test.id);
+    const sessionsHtml: string[] = [];
     if (testSessions.length > 0) {
-      detail.push("## Instrument Sessions");
-      detail.push("");
-      for (const session of testSessions) {
-        detail.push(`### ${escapeMarkdownCell(session.scriptTitle)}`);
-        detail.push("");
-        detail.push(`- Started: ${escapeMarkdownCell(formatDate(session.startedAt))}`);
-        detail.push(`- Status: ${escapeMarkdownCell(session.status)}`);
-        detail.push(`- Entries: ${session.entries.length}`);
-        detail.push("");
+      sessionsHtml.push("<h2>Instrument Sessions</h2>");
+      const sessionAnchor = (session: InstrumentSessionRecord) => `session-${safeFileSegment(session.id)}`;
+      sessionsHtml.push('<ul class="report-session-jump">');
+      testSessions.forEach((session, index) => {
+        sessionsHtml.push(`<li><a href="#${sessionAnchor(session)}">${index + 1}. ${escapeHtml(session.scriptTitle)} &mdash; ${escapeHtml(formatDate(session.startedAt))}</a></li>`);
+      });
+      sessionsHtml.push("</ul>");
+      testSessions.forEach((session, index) => {
+        sessionsHtml.push(`<h3 id="${sessionAnchor(session)}" class="report-session-header">${index + 1}. ${escapeHtml(session.scriptTitle)}</h3>`);
+        sessionsHtml.push("<ul>");
+        sessionsHtml.push(`<li><strong>Started:</strong> ${escapeHtml(formatDate(session.startedAt))}</li>`);
+        sessionsHtml.push(`<li><strong>Status:</strong> ${escapeHtml(session.status)}</li>`);
+        sessionsHtml.push(`<li><strong>Entries:</strong> ${session.entries.length}</li>`);
+        sessionsHtml.push("</ul>");
         for (const entry of session.entries) {
-          detail.push(`#### ${escapeMarkdownCell(entry.title)}`);
-          detail.push("");
+          sessionsHtml.push(`<h4>${escapeHtml(entry.title)}</h4>`);
           if (entry.commandText) {
-            detail.push("```text");
-            detail.push(entry.commandText);
-            detail.push("```");
-            detail.push("");
+            sessionsHtml.push(`<pre>${escapeHtml(entry.commandText)}</pre>`);
           }
           if (isMeaningful(entry.interpretedText)) {
-            detail.push(entry.interpretedText?.trim() ?? "");
-            detail.push("");
+            sessionsHtml.push(`<div class="report-note">${escapeHtml(entry.interpretedText?.trim() ?? "")}</div>`);
           }
           if (entry.artifact) {
-            detail.push(`- Artifact: ${markdownArtifactLink(entry.artifact.name, instrumentSessionArtifactHref({ test, session, entry, artifact: entry.artifact }))}`);
-            detail.push("");
+            sessionsHtml.push(htmlArtifactBlock(entry.artifact.name, instrumentSessionArtifactHref({ test, session, entry, artifact: entry.artifact }), entry.artifact.contentType, entry.artifact.sizeBytes));
           }
           if (entry.preview?.kind === "waveform") {
             const chartPath = instrumentSessionPreviewAssetPath(session, entry, "chart.svg");
             const csvPath = instrumentSessionPreviewAssetPath(session, entry, "waveform.csv");
-            assets[chartPath] = { content: buildWaveformPreviewSvg(entry.preview, `${session.scriptTitle} - ${entry.title}`), contentType: "image/svg+xml" };
-            assets[csvPath] = { content: buildWaveformPreviewCsv(entry.preview), contentType: "text/csv;charset=utf-8" };
-            detail.push(`- Chart: [${escapeMarkdownCell(entry.title)} chart](../${chartPath})`);
-            detail.push(`- Waveform CSV: [${escapeMarkdownCell(entry.title)} data](../${csvPath})`);
-            detail.push("");
-            detail.push(`![${escapeMarkdownCell(entry.title)} chart](../${chartPath})`);
-            detail.push("");
+            const chartSrc = reportAssetSrc(assets, chartPath, buildWaveformPreviewSvg(entry.preview, `${session.scriptTitle} - ${entry.title}`), "image/svg+xml", inlineAssets, "../");
+            const csvSrc = reportAssetSrc(assets, csvPath, buildWaveformPreviewCsv(entry.preview), "text/csv;charset=utf-8", inlineAssets, "../");
+            sessionsHtml.push(`<figure class="report-media"><img src="${escapeHtml(chartSrc)}" alt="${escapeHtml(entry.title)} chart" loading="lazy" /><figcaption><a href="${escapeHtml(chartSrc)}" target="_blank" rel="noreferrer">${escapeHtml(entry.title)} chart</a> &middot; <a href="${escapeHtml(csvSrc)}" target="_blank" rel="noreferrer">waveform data (CSV)</a></figcaption></figure>`);
           }
           if (entry.error) {
-            detail.push(`- Error: ${escapeMarkdownCell(entry.error)}`);
-            detail.push("");
+            sessionsHtml.push(`<div class="report-error">${escapeHtml(entry.error)}</div>`);
           }
         }
-      }
+      });
     }
     if (test.preTestAssets.length > 0) {
-      detail.push("## Diagrams and Pre-Test Assets");
-      detail.push("");
+      detail.push("<h2>Diagrams and Pre-Test Assets</h2>");
       for (const asset of test.preTestAssets) {
-        if (asset.type === "image_url") {
-          detail.push(`![${escapeMarkdownCell(asset.label)}](${asset.content})`);
-        } else {
-          const assetPath = `assets/${safeFileSegment(test.id)}-${safeFileSegment(asset.id)}.svg`;
-          assets[assetPath] = { content: asset.content, contentType: "image/svg+xml" };
-          detail.push(`![${escapeMarkdownCell(asset.label)}](../${assetPath})`);
-        }
-        detail.push("");
+        const src = asset.type === "image_url"
+          ? asset.content
+          : reportAssetSrc(assets, `assets/${safeFileSegment(test.id)}-${safeFileSegment(asset.id)}.svg`, asset.content, "image/svg+xml", inlineAssets, "../");
+        detail.push(`<figure class="report-media"><img src="${escapeHtml(src)}" alt="${escapeHtml(asset.label)}" loading="lazy" /><figcaption>${escapeHtml(asset.label)}</figcaption></figure>`);
       }
     }
     if (test.equipmentRuntime.length > 0) {
-      detail.push("## Equipment Runtime");
-      detail.push("");
+      detail.push("<h2>Equipment Runtime</h2>");
+      detail.push("<ul>");
       for (const spec of test.equipmentRuntime) {
-        detail.push(`- ${spec.label}: provider=${spec.provider}; mode=${spec.mode}; actions=${spec.actions.join(", ")}; outputs=${spec.outputs.join(", ")}`);
+        detail.push(`<li><strong>${escapeHtml(spec.label)}:</strong> provider=${escapeHtml(spec.provider)}; mode=${escapeHtml(spec.mode)}; actions=${escapeHtml(spec.actions.join(", "))}; outputs=${escapeHtml(spec.outputs.join(", "))}</li>`);
       }
-      detail.push("");
+      detail.push("</ul>");
     }
-    detail.push("## Test Definitions");
-    detail.push("");
+    detail.push("<h2>Test Definitions</h2>");
+    detail.push("<ul>");
     for (const [key, value] of Object.entries(test.definedValues)) {
-      detail.push(`- ${humanize(key)}: ${escapeMarkdownCell(valueDisplay(value))}`);
+      detail.push(`<li><strong>${escapeHtml(humanize(key))}:</strong> ${escapeHtml(valueDisplay(value))}</li>`);
     }
-    detail.push("");
+    detail.push("</ul>");
     if (test.procedureSteps.length > 0) {
-      detail.push("## Procedure");
-      detail.push("");
-      detail.push("| Step | Instruction | Expected | Status | Notes |");
-      detail.push("|---|---|---|---|---|");
+      detail.push("<h2>Procedure</h2>");
+      detail.push("<table><thead><tr><th>Step</th><th>Instruction</th><th>Expected</th><th>Status</th><th>Notes</th></tr></thead><tbody>");
       for (const [index, step] of test.procedureSteps.entries()) {
         const stepResult = result.stepResultsById[step.id];
-        detail.push(`| ${index + 1}. ${escapeMarkdownCell(step.title)} | ${escapeMarkdownCell(step.instruction)} | ${escapeMarkdownCell(valueDisplay(step.expected))} | ${escapeMarkdownCell(stepStatusLabel(stepResult))} | ${escapeMarkdownCell(stepResult?.notes ?? "")} |`);
+        detail.push(`<tr><td>${index + 1}. ${escapeHtml(step.title)}</td><td>${escapeHtml(step.instruction)}</td><td>${escapeHtml(valueDisplay(step.expected))}</td><td>${escapeHtml(stepStatusLabel(stepResult))}</td><td>${escapeHtml(stepResult?.notes ?? "")}</td></tr>`);
       }
-      detail.push("");
+      detail.push("</tbody></table>");
     }
-    detail.push("## Runtime Inputs");
-    detail.push("");
+    detail.push("<h2>Runtime Inputs</h2>");
+    detail.push("<ul>");
     for (const [key, value] of Object.entries(result.inputValues)) {
-      detail.push(`- ${humanize(key)}: ${escapeMarkdownCell(valueDisplay(value))}`);
+      detail.push(`<li><strong>${escapeHtml(humanize(key))}:</strong> ${escapeHtml(valueDisplay(value))}</li>`);
     }
-    if (isMeaningful(result.notes)) detail.push(`- Notes: ${escapeMarkdownCell(result.notes)}`);
-    detail.push("");
+    if (isMeaningful(result.notes)) detail.push(`<li><strong>Notes:</strong> ${escapeHtml(result.notes)}</li>`);
+    detail.push("</ul>");
     if (Object.keys(result.typedArtifacts).length > 0) {
-      detail.push("## Runtime Files");
-      detail.push("");
+      detail.push("<h2>Runtime Files</h2>");
       for (const [fieldId, artifacts] of Object.entries(result.typedArtifacts)) {
-        detail.push(`### ${humanize(fieldId)}`);
+        detail.push(`<h3>${escapeHtml(humanize(fieldId))}</h3>`);
         for (const artifact of artifacts) {
-          detail.push(`- ${markdownArtifactLink(artifact.name, artifactHref({ test, fieldId, artifact }))}`);
+          detail.push(htmlArtifactBlock(artifact.name, artifactHref({ test, fieldId, artifact }), artifact.contentType, artifact.sizeBytes));
         }
-        detail.push("");
       }
     }
     if (result.supportingArtifacts.length > 0) {
-      detail.push("## Supporting Files");
-      detail.push("");
+      detail.push("<h2>Supporting Files</h2>");
       for (const artifact of result.supportingArtifacts) {
-        detail.push(`- ${markdownArtifactLink(artifact.name, artifactHref({ test, fieldId: null, artifact }))}`);
+        detail.push(htmlArtifactBlock(artifact.name, artifactHref({ test, fieldId: null, artifact }), artifact.contentType, artifact.sizeBytes));
       }
-      detail.push("");
     }
-    detail.push("## Navigation");
-    detail.push("");
-    detail.push(`- [Back to Report Summary](${backToSummaryHref})`);
-    detail.push("");
+    detail.push(...sessionsHtml);
+    detail.push("<h2>Navigation</h2>");
+    detail.push(`<p><a href="${escapeHtml(backToSummaryHref)}">Back to Report Summary</a></p>`);
     details[test.id] = detail.join("\n");
   }
 
+  summary.push("</tbody></table>");
   return { summary: summary.join("\n"), details, assets };
+}
+
+// Shared structural rules for generated report HTML (headings/lists/tables/media), light-themed —
+// used both for the standalone exported .html files and the in-app PDF/print view. Color values
+// are repeated rather than deduplicated with .report-doc-dark below since the two are meant to
+// diverge independently (print/export always reads as a light printable document).
+const REPORT_DOC_LIGHT_CSS = `
+  .report-doc { color: #111827; font-size: 1.02rem; line-height: 1.68; }
+  .report-doc h1 { margin: 0 0 0.75rem; font-size: 1.9rem; color: #0f172a; }
+  .report-doc h2 { margin: 1.5rem 0 0.6rem; font-size: 1.45rem; color: #0f172a; border-top: 1px solid #e5e7eb; padding-top: 1.1rem; }
+  .report-doc h2:first-of-type { border-top: none; padding-top: 0; }
+  .report-doc h3 { margin: 0.9rem 0 0.45rem; font-size: 1.18rem; color: #0f172a; }
+  .report-doc h4 { margin: 0.8rem 0 0.4rem; font-size: 1.02rem; color: #0f172a; }
+  .report-doc p, .report-doc ul, .report-doc ol { margin: 0.45rem 0; }
+  .report-doc ul, .report-doc ol { padding-left: 1.2rem; }
+  .report-doc li { margin: 0.2rem 0; }
+  .report-doc pre { background: #f8fafc; color: #0f172a; border: 1px solid #cbd5e1; border-radius: 8px; padding: 0.9rem 1rem; overflow-x: auto; font-size: 0.92rem; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  .report-doc table { width: 100%; border-collapse: collapse; margin: 0.7rem 0; }
+  .report-doc th { text-align: left; border-bottom: 1px solid #94a3b8; padding: 0.55rem 0.6rem; color: #0f172a; font-size: 0.95rem; }
+  .report-doc td { border-bottom: 1px solid #cbd5e1; padding: 0.55rem 0.6rem; vertical-align: top; font-size: 0.95rem; }
+  .report-doc a { color: #0f766e; }
+  .report-doc .report-note { white-space: pre-wrap; line-height: 1.7; }
+  .report-doc .report-error { color: #b91c1c; font-weight: 600; margin: 0.45rem 0; }
+  .report-doc .report-file { margin: 0.35rem 0; }
+  .report-doc .report-media { margin: 0.75rem 0; border: 1px solid #e5e7eb; border-radius: 8px; padding: 0.6rem; background: #f8fafc; max-width: 640px; }
+  .report-doc .report-media img, .report-doc .report-media video { max-width: 100%; display: block; border-radius: 6px; }
+  .report-doc .report-media figcaption { margin-top: 0.45rem; font-size: 0.86rem; color: #64748b; }
+  .report-doc .report-session-jump { list-style: none; margin: 0.6rem 0 1.1rem; padding: 0.75rem 0.9rem; border: 1px solid #cbd5e1; border-radius: 8px; background: #f8fafc; display: grid; gap: 0.35rem; }
+  .report-doc .report-session-jump li { margin: 0; }
+  .report-doc .report-session-jump a { font-weight: 600; }
+  .report-doc .report-session-header { margin: 2rem 0 0.6rem; padding: 0.6rem 0.85rem; background: #f0fdfa; border-left: 4px solid #0f766e; border-radius: 6px; font-size: 1.18rem; color: #0f172a; scroll-margin-top: 1rem; }
+`;
+
+// Same structure as .report-doc above, dark-themed to match the in-app workspace for the live
+// report preview (not used for the print view or the ZIP export, which both stay light/printable).
+const REPORT_DOC_DARK_CSS = `
+  .report-doc-dark { color: ${C.text}; font-size: 0.92rem; line-height: 1.65; }
+  .report-doc-dark h1 { margin: 0 0 0.7rem; font-size: 1.35rem; }
+  .report-doc-dark h2 { margin: 1.2rem 0 0.6rem; font-size: 1.1rem; border-top: 1px solid ${C.border}; padding-top: 0.9rem; }
+  .report-doc-dark h2:first-of-type { border-top: none; padding-top: 0; }
+  .report-doc-dark h3 { margin: 0.9rem 0 0.45rem; font-size: 1rem; }
+  .report-doc-dark h4 { margin: 0.8rem 0 0.4rem; font-size: 0.94rem; }
+  .report-doc-dark p, .report-doc-dark ul, .report-doc-dark ol { margin: 0.45rem 0; }
+  .report-doc-dark ul, .report-doc-dark ol { padding-left: 1.2rem; }
+  .report-doc-dark li { margin: 0.2rem 0; }
+  .report-doc-dark pre { background: #07111e; border: 1px solid ${C.border}; border-radius: 12px; padding: 0.85rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+  .report-doc-dark table { width: 100%; border-collapse: collapse; margin: 0.7rem 0; }
+  .report-doc-dark th { text-align: left; border-bottom: 1px solid ${C.border}; padding: 0.45rem; }
+  .report-doc-dark td { border-bottom: 1px solid ${C.border}; padding: 0.45rem; vertical-align: top; }
+  .report-doc-dark a { color: ${C.accent}; }
+  .report-doc-dark .report-note { white-space: pre-wrap; line-height: 1.65; }
+  .report-doc-dark .report-error { color: ${C.danger}; font-weight: 600; margin: 0.45rem 0; }
+  .report-doc-dark .report-file { margin: 0.35rem 0; }
+  .report-doc-dark .report-media { margin: 0.75rem 0; border: 1px solid ${C.border}; border-radius: 12px; padding: 0.6rem; background: ${C.panel2}; max-width: 640px; }
+  .report-doc-dark .report-media img, .report-doc-dark .report-media video { max-width: 100%; display: block; border-radius: 8px; }
+  .report-doc-dark .report-media figcaption { margin-top: 0.45rem; font-size: 0.78rem; color: ${C.muted}; }
+  .report-doc-dark .report-session-jump { list-style: none; margin: 0.6rem 0 1.1rem; padding: 0.7rem 0.85rem; border: 1px solid ${C.border}; border-radius: 8px; background: ${C.panel2}; display: grid; gap: 0.3rem; }
+  .report-doc-dark .report-session-jump li { margin: 0; }
+  .report-doc-dark .report-session-jump a { font-weight: 700; }
+  .report-doc-dark .report-session-header { margin: 1.8rem 0 0.6rem; padding: 0.55rem 0.8rem; background: ${C.accentSoft}; border-left: 4px solid ${C.accent}; border-radius: 6px; font-size: 1.05rem; scroll-margin-top: 1rem; }
+`;
+
+// Wraps a generated report fragment (summary or a single test's detail page) as a standalone HTML
+// document for the ZIP export — these are opened directly from disk, with no app shell around them.
+function wrapReportHtmlDocument(docTitle: string, bodyHtml: string): string {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(docTitle)}</title>
+    <style>
+      body { margin: 0; padding: 1.75rem clamp(1rem, 4vw, 3rem); background: #eef2f7; font-family: "Segoe UI", "Aptos", Arial, sans-serif; }
+      .report-doc-page { max-width: 960px; margin: 0 auto; background: white; border: 1px solid #dbe4ee; border-radius: 8px; padding: 1.5rem 1.75rem; box-shadow: 0 8px 24px rgba(15,23,42,0.06); box-sizing: border-box; }
+      ${REPORT_DOC_LIGHT_CSS}
+    </style>
+  </head>
+  <body>
+    <div class="report-doc report-doc-page">
+${bodyHtml}
+    </div>
+  </body>
+</html>
+`;
 }
 
 function FieldInput({
@@ -3843,52 +3950,12 @@ function MarkdownBlock({ value }: { value: string }) {
   );
 }
 
-function reportAnchorForLink(href: string | undefined): string | undefined {
-  if (!href) return href;
-  if (href === "report.md" || href === "./report.md" || href === "../report.md") return "#report-summary";
-
-  const match = href.match(/(?:^|\/)tests\/([^/#?]+)\.md(?:[?#].*)?$/);
-  if (match) return `#test-${safeFileSegment(decodeURIComponent(match[1]))}`;
-
-  return href;
-}
-
-function PrintMarkdownBlock({ value, assets }: { value: string; assets: ReportPages["assets"] }) {
-  const assetUrls = useMemo(() => {
-    const urls = new Map<string, string>();
-    for (const [path, asset] of Object.entries(assets)) {
-      const encoded = btoa(unescape(encodeURIComponent(asset.content)));
-      urls.set(`../${path}`, `data:${asset.contentType};base64,${encoded}`);
-      urls.set(path, `data:${asset.contentType};base64,${encoded}`);
-    }
-    return urls;
-  }, [assets]);
-
-  return (
-    <div style={{ color: "#111827", lineHeight: 1.68, fontSize: "1.06rem" }}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          h1: ({ children }) => <h1 style={{ margin: "0 0 0.75rem", fontSize: "1.9rem", color: "#0f172a" }}>{children}</h1>,
-          h2: ({ children }) => <h2 style={{ margin: "1.15rem 0 0.6rem", fontSize: "1.45rem", color: "#0f172a" }}>{children}</h2>,
-          h3: ({ children }) => <h3 style={{ margin: "0.9rem 0 0.45rem", fontSize: "1.18rem", color: "#0f172a" }}>{children}</h3>,
-          p: ({ children }) => <p style={{ margin: "0.45rem 0", color: "#111827" }}>{children}</p>,
-          ul: ({ children }) => <ul style={{ margin: "0.45rem 0", paddingLeft: "1.2rem", color: "#111827" }}>{children}</ul>,
-          ol: ({ children }) => <ol style={{ margin: "0.45rem 0", paddingLeft: "1.2rem", color: "#111827" }}>{children}</ol>,
-          li: ({ children }) => <li style={{ margin: "0.2rem 0", color: "#111827" }}>{children}</li>,
-          code: ({ children }) => <code style={{ background: "#f1f5f9", color: "#0f172a", padding: "0.1rem 0.25rem", borderRadius: 4, fontSize: "0.98em" }}>{children}</code>,
-          pre: ({ children }) => <pre style={{ background: "#f8fafc", color: "#0f172a", border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.95rem 1rem", overflowX: "auto", fontSize: "0.98rem", lineHeight: 1.6 }}>{children}</pre>,
-          img: ({ src, alt }) => <img src={assetUrls.get(src ?? "") ?? src ?? ""} alt={alt ?? ""} style={{ maxWidth: "100%", borderRadius: 8, border: "1px solid #cbd5e1", background: "#f8fafc", padding: "0.35rem" }} />,
-          table: ({ children }) => <table style={{ width: "100%", borderCollapse: "collapse", margin: "0.7rem 0", color: "#111827" }}>{children}</table>,
-          th: ({ children }) => <th style={{ textAlign: "left", borderBottom: "1px solid #94a3b8", padding: "0.55rem 0.6rem", color: "#0f172a", fontSize: "0.98rem" }}>{children}</th>,
-          td: ({ children }) => <td style={{ borderBottom: "1px solid #cbd5e1", padding: "0.55rem 0.6rem", verticalAlign: "top", color: "#111827", fontSize: "0.98rem" }}>{children}</td>,
-          a: ({ href, children }) => <a href={reportAnchorForLink(href)} style={{ color: "#0f766e" }}>{children}</a>,
-        }}
-      >
-        {value}
-      </ReactMarkdown>
-    </div>
-  );
+// Renders an HTML fragment produced by generateReportPages. `className` selects which of the two
+// scoped stylesheets above (light doc vs dark in-app) applies; the fragment itself carries no
+// inline styling of its own. The content is our own generated markup (escaped via escapeHtml at
+// generation time), not arbitrary user HTML.
+function ReportHtmlBlock({ html, className }: { html: string; className: string }) {
+  return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 function PreTestAssetGallery({ assets }: { assets: PreTestAsset[] }) {
@@ -5550,6 +5617,7 @@ function TestManagerInner({ config }: ModuleProps) {
       notes: reportArtifacts.length > 0
         ? ["Evidence links in the live report and PDF are time-limited access URLs and may expire after about 7 days."]
         : undefined,
+      inlineAssets: true,
     });
   }, [activeRun, definition, includedTests, reportArtifactLinks, reportArtifacts.length]);
 
@@ -5567,6 +5635,9 @@ function TestManagerInner({ config }: ModuleProps) {
       notes: reportArtifacts.length > 0
         ? ["Evidence links in the live report and PDF are time-limited access URLs and may expire after about 7 days."]
         : undefined,
+      inlineAssets: true,
+      detailHref: (test) => `#test-${safeFileSegment(test.id)}`,
+      backToSummaryHref: "#report-summary",
     });
   }, [activeRun, definition, getS3Client, includedTests, reportArtifactLinks, reportArtifacts.length, storage.bucket]);
 
@@ -5584,9 +5655,10 @@ function TestManagerInner({ config }: ModuleProps) {
       instrumentSessionArtifactHref: ({ session, artifact }) => `../${getInstrumentSessionArchivePath(session, artifact)}`,
       overviewArtifactHref: (artifact) => overviewArtifactArchivePath(artifact),
     });
+    const programTitle = getProgramTitle(definition, config);
     const files: Record<string, ZipFileContent> = {
-      "report.md": zipPages.summary,
-      ...Object.fromEntries(Object.entries(zipPages.details).map(([testId, content]) => [`tests/${safeFileSegment(testId)}.md`, content])),
+      "report.html": wrapReportHtmlDocument(`${programTitle} Report`, zipPages.summary),
+      ...Object.fromEntries(Object.entries(zipPages.details).map(([testId, content]) => [`tests/${safeFileSegment(testId)}.html`, wrapReportHtmlDocument(`${programTitle} - ${testId}`, content)])),
       ...Object.fromEntries(Object.entries(zipPages.assets).map(([path, asset]) => [path, asset.content])),
       "definition.yaml": activeRun.definitionSnapshot ?? definition.sourceText,
       "workspace.json": JSON.stringify(workspace, null, 2),
@@ -5690,7 +5762,7 @@ function TestManagerInner({ config }: ModuleProps) {
     onProgress?.({ stage: "Packaging ZIP...", completed: totalArtifactCount, total: totalArtifactCount });
     files["evidence/manifest.json"] = JSON.stringify(manifest, null, 2);
     return files;
-  }, [activeRun, definition, getS3Client, includedTests, storage.bucket, testsById, user?.email, workspace]);
+  }, [activeRun, config, definition, getS3Client, includedTests, storage.bucket, testsById, user?.email, workspace]);
 
   const downloadReportZip = useCallback(() => {
     setReportDialogOpen(false);
@@ -5736,6 +5808,8 @@ function TestManagerInner({ config }: ModuleProps) {
           0% { transform: translateX(-60%); }
           100% { transform: translateX(220%); }
         }
+        ${REPORT_DOC_LIGHT_CSS}
+        ${REPORT_DOC_DARK_CSS}
         @media print {
           @page {
             size: auto;
@@ -6478,7 +6552,9 @@ function TestManagerInner({ config }: ModuleProps) {
                     <button onClick={() => setReportDialogOpen(true)} style={buttonStyle("primary")} disabled={!reportPages}>Generate Report</button>
                   </div>
                   <div style={{ margin: "0.95rem 0 0", padding: "0.95rem", borderRadius: 12, background: "#07111e", border: `1px solid ${C.border}` }}>
-                    <MarkdownBlock value={reportPages?.summary || "Upload a YAML definition to generate the report preview."} />
+                    {reportPages
+                      ? <ReportHtmlBlock html={reportPages.summary} className="report-doc-dark" />
+                      : <div style={{ color: C.muted }}>Upload a YAML definition to generate the report preview.</div>}
                   </div>
               </section>
 
@@ -6588,12 +6664,12 @@ function TestManagerInner({ config }: ModuleProps) {
             ) : null}
             <section id="report-summary">
               <h2>Summary</h2>
-              <PrintMarkdownBlock value={printReportPages.summary} assets={printReportPages.assets} />
+              <ReportHtmlBlock html={printReportPages.summary} className="report-doc" />
             </section>
-            {Object.entries(printReportPages.details).map(([testId, markdown]) => (
+            {Object.entries(printReportPages.details).map(([testId, html]) => (
               <section key={testId} id={`test-${safeFileSegment(testId)}`} className="test-manager-print-page">
                 <h2>{testId}</h2>
-                <PrintMarkdownBlock value={markdown} assets={printReportPages.assets} />
+                <ReportHtmlBlock html={html} className="report-doc" />
               </section>
             ))}
           </article>
@@ -6637,9 +6713,10 @@ export async function onExport(ctx: ExportContext): Promise<void> {
       artifactHref: ({ test, fieldId, artifact }) => `../${artifactArchivePath(test.id, artifact, fieldId)}`,
       overviewArtifactHref: (artifact) => overviewArtifactArchivePath(artifact),
     });
-    await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}report.md`, pages.summary, "text/markdown;charset=utf-8");
+    const programTitle = getProgramTitle(definition, ctx.config);
+    await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}report.html`, wrapReportHtmlDocument(`${programTitle} Report`, pages.summary), "text/html;charset=utf-8");
     for (const [testId, detail] of Object.entries(pages.details)) {
-      await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}tests/${testId}.md`, detail, "text/markdown;charset=utf-8");
+      await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}tests/${testId}.html`, wrapReportHtmlDocument(`${programTitle} - ${testId}`, detail), "text/html;charset=utf-8");
     }
     for (const [path, asset] of Object.entries(pages.assets)) {
       await writeText(ctx.s3Client as S3Client, storage.bucket, `${exportPrefix}${path}`, asset.content, asset.contentType);
