@@ -4,8 +4,8 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { parse as parseYaml } from "yaml";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { ExportContext, ModuleProps } from "module-core";
-import { useAwsS3Client, useUserProfile } from "module-core";
+import type { ExportContext, ModuleProps, AgentModuleSkills } from "module-core";
+import { useAwsS3Client, useUserProfile, useRegisterAgentSkills } from "module-core";
 import { executeHttpDeviceCommand } from "http-device-client";
 
 type Scalar = string | number | boolean | null;
@@ -4230,6 +4230,124 @@ function TestManagerInner({ config }: ModuleProps) {
   const storage = useMemo(() => getStorageInfo(config), [config]);
   const importRef = useRef<HTMLInputElement>(null);
   const overviewImportRef = useRef<HTMLInputElement>(null);
+
+  // Pilot for the agent skill registry (see core's useRegisterAgentSkills): these 5 tool defs used
+  // to live permanently in agent-chat's always-on tool list. They only exist for the agent now while
+  // this instance is mounted, and only reach the model's active tool set once it calls use_skill —
+  // see agent-chat's list_agent_skills/use_skill tools.
+  const agentSkills = useMemo<AgentModuleSkills>(() => ({
+    instanceId: config.id,
+    moduleName: "module-test-manager",
+    displayName: "Test Manager",
+    description: "Schema-driven test execution workspace backed by a YAML definition and per-run JSON results.",
+    skills: [
+      {
+        id: "manage-test-spec",
+        description: "Read, validate, and rewrite this test manager's YAML spec, and check run progress.",
+        prompt: [
+          "Start with summarize_test_manager_spec or get_test_manager_spec to understand the current YAML, linked values, and procedure definitions before proposing any change.",
+          "Use get_test_manager_run_summary to understand test progress before suggesting what to add or run next.",
+          "Always call validate_test_manager_spec on a candidate rewrite before calling set_test_manager_spec — it returns parse/structure issues and a compact summary so problems surface before anything is written.",
+          "Only call set_test_manager_spec after discussing the proposed change with the user and getting explicit confirmation; it replaces the entire spec, and the module reflects changes on next reload.",
+          "Never edit this module's backing files directly through the workspace bridge — these tools are the only supported way to change a test spec.",
+          `This skill was offered by the test manager instance with slot_id "${config.id}" — use that unless the user points you at a different slotPath.`,
+        ].join(" "),
+        tools: [
+          {
+            type: "function",
+            name: "get_test_manager_spec",
+            description: "Read the YAML test specification for a test-manager slot. Returns the raw YAML text. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Call this before proposing changes so you understand the existing structure, linked values, and procedure definitions.",
+            parameters: {
+              type: "object",
+              properties: {
+                slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+                slotPath: {
+                  type: ["array", "null"],
+                  items: { type: "string" },
+                  minItems: 1,
+                  description: "Full slot path to the test-manager instance, or null when using slot_id.",
+                },
+              },
+              required: ["slot_id", "slotPath"],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: "function",
+            name: "summarize_test_manager_spec",
+            description: "Inspect the current YAML spec for a test-manager slot and return a structured summary with counts, key IDs, and structural issues. Use this before editing when you need to understand the shape of the spec rather than reading the raw YAML directly.",
+            parameters: {
+              type: "object",
+              properties: {
+                slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+                slotPath: {
+                  type: ["array", "null"],
+                  items: { type: "string" },
+                  minItems: 1,
+                  description: "Full slot path to the test-manager instance, or null when using slot_id.",
+                },
+              },
+              required: ["slot_id", "slotPath"],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: "function",
+            name: "validate_test_manager_spec",
+            description: "Validate and summarize a candidate YAML test-manager spec before writing it. Returns parse/structure issues and a compact summary so you can catch problems before calling set_test_manager_spec.",
+            parameters: {
+              type: "object",
+              properties: {
+                yaml: { type: "string", description: "The candidate full YAML content of the test specification." },
+              },
+              required: ["yaml"],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: "function",
+            name: "set_test_manager_spec",
+            description: "Write a complete YAML test specification for a test-manager slot, replacing the current spec. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Only call this after discussing the proposed changes with the user and receiving explicit confirmation. The test-manager module reflects changes on next reload.",
+            parameters: {
+              type: "object",
+              properties: {
+                slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+                slotPath: {
+                  type: ["array", "null"],
+                  items: { type: "string" },
+                  minItems: 1,
+                  description: "Full slot path to the test-manager instance, or null when using slot_id.",
+                },
+                yaml: { type: "string", description: "The full YAML content of the test specification." },
+              },
+              required: ["slot_id", "slotPath", "yaml"],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: "function",
+            name: "get_test_manager_run_summary",
+            description: "Read the current run state for a test-manager slot: active run, test status counts, and excluded test counts across all runs. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Use this to understand progress before suggesting what to add or run next.",
+            parameters: {
+              type: "object",
+              properties: {
+                slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+                slotPath: {
+                  type: ["array", "null"],
+                  items: { type: "string" },
+                  minItems: 1,
+                  description: "Full slot path to the test-manager instance, or null when using slot_id.",
+                },
+              },
+              required: ["slot_id", "slotPath"],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+    ],
+  }), [config.id]);
+  useRegisterAgentSkills(agentSkills);
 
   const [definition, setDefinition] = useState<TestDefinition | null>(null);
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);

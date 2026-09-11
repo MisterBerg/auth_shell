@@ -1,12 +1,13 @@
-import { useContext, useCallback } from "react";
+import { useContext, useCallback, useEffect } from "react";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import {
   AuthContext,
   ResourceRegistryContext,
+  AgentSkillRegistryContext,
   EditModeContext,
 } from "./context.tsx";
 import { SlotContext } from "./SlotContext.tsx";
-import type { ModuleConfig, ModuleRegistryEntry, Resource } from "./types.ts";
+import type { ModuleConfig, ModuleRegistryEntry, Resource, AgentModuleSkills } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Auth hooks
@@ -86,6 +87,37 @@ export function useAllResources(): ReadonlyMap<string, Resource> {
  */
 export function useRegisterResources() {
   return useContext(ResourceRegistryContext).registerResources;
+}
+
+// ---------------------------------------------------------------------------
+// Agent skill registry hooks
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns every currently-mounted module instance's registered agent skills. Used by agent-chat
+ * to build the always-on skill index (see AgentModuleSkills for the two-tier rationale).
+ */
+export function useAllAgentSkills(): ReadonlyMap<string, AgentModuleSkills> {
+  return useContext(AgentSkillRegistryContext).registry;
+}
+
+/**
+ * Registers this component's agent skills for as long as it stays mounted, and unregisters them
+ * on unmount. Call this directly in a module's top-level component — pass null to register nothing
+ * (e.g. while a skill list is still being computed).
+ *
+ * Only re-registers when `registration?.instanceId` changes, not on every render: skill lists are
+ * expected to be static per module (defined in code, not derived from live state). If a module ever
+ * needs its skills to change shape at runtime, this will need a deeper equality check instead.
+ */
+export function useRegisterAgentSkills(registration: AgentModuleSkills | null): void {
+  const { registerModuleSkills, unregisterModuleSkills } = useContext(AgentSkillRegistryContext);
+  useEffect(() => {
+    if (!registration) return;
+    registerModuleSkills(registration);
+    return () => unregisterModuleSkills(registration.instanceId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see doc comment: keyed on instanceId only
+  }, [registration?.instanceId]);
 }
 
 // ---------------------------------------------------------------------------

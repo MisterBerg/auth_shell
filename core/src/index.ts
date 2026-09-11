@@ -12,6 +12,9 @@ export type {
   UserProfile,
   ModuleCategory,
   ModuleRegistryEntry,
+  AgentSkillToolDefinition,
+  AgentSkill,
+  AgentModuleSkills,
 } from "./types.ts";
 
 // Contexts & providers
@@ -20,10 +23,12 @@ export {
   AuthProvider,
   ResourceRegistryContext,
   ResourceRegistryProvider,
+  AgentSkillRegistryContext,
+  AgentSkillRegistryProvider,
   EditModeContext,
   EditModeProvider,
 } from "./context.tsx";
-export type { AuthContextValue, ResourceRegistryValue, EditModeContextValue } from "./context.tsx";
+export type { AuthContextValue, ResourceRegistryValue, AgentSkillRegistryValue, EditModeContextValue } from "./context.tsx";
 
 // Hooks
 export {
@@ -37,6 +42,8 @@ export {
   useResource,
   useAllResources,
   useRegisterResources,
+  useAllAgentSkills,
+  useRegisterAgentSkills,
   useEditMode,
   useUpdateSlotMeta,
   useUpdateSlotChildren,

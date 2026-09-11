@@ -1,7 +1,7 @@
 import React, { createContext, useState, useCallback } from "react";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import type { AwsCredentials, UserProfile, Resource } from "./types.ts";
+import type { AwsCredentials, UserProfile, Resource, AgentModuleSkills } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Auth context
@@ -70,6 +70,53 @@ export function ResourceRegistryProvider({ children }: { children: React.ReactNo
     <ResourceRegistryContext value={{ registry, registerResources }}>
       {children}
     </ResourceRegistryContext>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Agent skill registry context
+// Aggregates AgentModuleSkills from every currently-mounted module instance that opts in via
+// useRegisterAgentSkills. Unlike the resource registry above, entries come and go with actual
+// mount/unmount (a module removed from its slot should stop offering skills the agent can no
+// longer act on), so this is register/unregister rather than register-only.
+// ---------------------------------------------------------------------------
+
+export type AgentSkillRegistryValue = {
+  registry: ReadonlyMap<string, AgentModuleSkills>;
+  registerModuleSkills: (registration: AgentModuleSkills) => void;
+  unregisterModuleSkills: (instanceId: string) => void;
+};
+
+export const AgentSkillRegistryContext = createContext<AgentSkillRegistryValue>({
+  registry: new Map(),
+  registerModuleSkills: () => {},
+  unregisterModuleSkills: () => {},
+});
+
+export function AgentSkillRegistryProvider({ children }: { children: React.ReactNode }) {
+  const [registry, setRegistry] = useState<Map<string, AgentModuleSkills>>(new Map());
+
+  const registerModuleSkills = useCallback((registration: AgentModuleSkills) => {
+    setRegistry((prev) => {
+      const next = new Map(prev);
+      next.set(registration.instanceId, registration);
+      return next;
+    });
+  }, []);
+
+  const unregisterModuleSkills = useCallback((instanceId: string) => {
+    setRegistry((prev) => {
+      if (!prev.has(instanceId)) return prev;
+      const next = new Map(prev);
+      next.delete(instanceId);
+      return next;
+    });
+  }, []);
+
+  return (
+    <AgentSkillRegistryContext value={{ registry, registerModuleSkills, unregisterModuleSkills }}>
+      {children}
+    </AgentSkillRegistryContext>
   );
 }
 

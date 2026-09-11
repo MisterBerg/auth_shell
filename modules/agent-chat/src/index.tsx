@@ -11,6 +11,9 @@ import type {
   ModuleProps,
   ModuleRegistryEntry,
   Resource,
+  AgentModuleSkills,
+  AgentSkill,
+  AgentSkillToolDefinition,
 } from "module-core";
 import {
   buildAssetVersionKey,
@@ -22,6 +25,8 @@ import {
   getAssetSearchText,
   getCurrentAssetVersion,
   listAssets,
+  useAllAgentSkills,
+  useRegisterAgentSkills,
   useAllResources,
   useAwsDdbClient,
   useAwsS3Client,
@@ -123,6 +128,9 @@ type ToolExecutionResult = {
   output: string;
   toolMessage?: string;
   mutatedWorkspace?: boolean;
+  // Set by use_skill: tool definitions to add to the active set for the rest of this run. See
+  // runAgentSession, which merges these into its per-turn tools array after each tool result.
+  unlockedTools?: ToolDefinition[];
 };
 
 type ToolDefinition = {
@@ -580,8 +588,8 @@ const DEFAULT_PROMPT = [
   "Use the provided workspace tools whenever project structure, assets, resources, or modules are relevant.",
   "By default, treat 'the app', 'the webapp', 'app data', 'documentation here', and similar phrases as referring to the active project configuration, project assets, and registered resources inside the web app.",
   "Prefer project assets, registered resources, and root-config information before searching the local bridge workspace unless the user explicitly says workspace, local files, repo, filesystem, or disk, or recent conversation is clearly about local workspace operations.",
-  "Prefer module-native tools for task tracker, work manager, test manager, documentation, markdown, document-viewer, links, and webview data when they are available instead of editing their backing files indirectly.",
-  "For test manager slots: start with summarize_test_manager_spec or get_test_manager_spec to understand the current YAML, use get_test_manager_run_summary to understand test progress, use validate_test_manager_spec on any proposed rewrite before writing, and only then use set_test_manager_spec after the user confirms. Never edit test spec files indirectly through the bridge.",
+  "Prefer module-native tools for task tracker, work manager, documentation, markdown, document-viewer, links, and webview data when they are available instead of editing their backing files indirectly.",
+  "Some modules (e.g. test manager) expose their own agent skills instead of static tools. Call list_agent_skills whenever the request concerns a specific mounted module you don't already have a loaded skill for, then use_skill before acting on that module's data — do not guess at its file format or edit its backing files indirectly through the bridge.",
   "Use shell commands only when no better dedicated tool is available, and pay attention to command failures.",
   "Prefer the managed Python tools for parsing, transformations, text extraction, and small file-oriented programs instead of shell-embedded Python.",
   "Only install Python packages through the dedicated dependency installer, and only when a missing dependency blocks the task.",
@@ -784,7 +792,11 @@ const ORGANIZER_TIMING_STATE_SCHEMA = {
   enum: ["overdue", "upcoming", "no-dates"],
 } as const;
 
-const TOOL_DEFINITIONS: ToolDefinition[] = [
+// Always sent to the model on every request, regardless of what's mounted in the project. Keep
+// this to genuinely generic, module-agnostic capabilities (workspace structure, local runtime,
+// project assets) — anything specific to one kind of module's data belongs in that module's own
+// registered AgentSkill instead (see useRegisterAgentSkills), surfaced on demand via use_skill.
+const CORE_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     name: "get_workspace_summary",
@@ -818,6 +830,263 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
     strict: true,
   },
+  {
+    type: "function",
+    name: "list_registered_resources",
+    description: "List resources currently registered across the loaded module tree.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_available_modules",
+    description: "List published modules available in the picker so the agent can choose a module to add or swap in.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_workspace_files",
+    description: "List files and directories from the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        recursive: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 1000 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_workspace_file",
+    description: "Read a file from the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        encoding: { type: "string", enum: ["utf8", "base64"] },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "write_workspace_file",
+    description: "Write a file through the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        content: { type: "string" },
+        encoding: { type: "string", enum: ["utf8", "base64"] },
+        mode: { type: "string", enum: ["overwrite", "append"] },
+      },
+      required: ["path", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "run_workspace_command",
+    description: "Run a shell command through the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string" },
+        cwd: { type: "string" },
+        timeoutMs: { type: "integer", minimum: 100, maximum: 600000 },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "execute_tcp_command",
+    description: "Open a raw TCP connection through the local workspace bridge, optionally send a command, and read the response. Useful for SCPI/LAN instruments such as oscilloscopes and power supplies.",
+    parameters: {
+      type: "object",
+      properties: {
+        host: { type: "string" },
+        port: { type: "integer", minimum: 1, maximum: 65535 },
+        command: { type: "string" },
+        appendNewline: { type: "boolean" },
+        newline: { type: "string", enum: ["lf", "crlf", "none"] },
+        readMode: { type: "string", enum: ["once", "until-timeout", "until-marker"] },
+        readUntil: { type: "string" },
+        timeoutMs: { type: "integer", minimum: 100, maximum: 600000 },
+        quietMs: { type: "integer", minimum: 50, maximum: 10000 },
+        sendDelayMs: { type: "integer", minimum: 0, maximum: 10000 },
+        encoding: { type: "string", enum: ["utf8", "base64", "hex"] },
+      },
+      required: ["host"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "execute_http_request",
+    description: "Make an HTTP request through the local workspace bridge. Useful for local HTTP-mode instrument adapters (e.g. a camera or capture server listening on 127.0.0.1) that don't speak raw SCPI/TCP.",
+    parameters: {
+      type: "object",
+      properties: {
+        method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] },
+        url: { type: "string" },
+        headers: { type: "object", additionalProperties: { type: "string" } },
+        body: { type: "string" },
+        timeoutMs: { type: "integer", minimum: 1, maximum: 120000 },
+        encoding: { type: "string", enum: ["utf8", "base64"] },
+      },
+      required: ["url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "get_python_environment",
+    description: "Inspect the managed local Python environment and its approved dependency allowlist.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "check_python_dependencies",
+    description: "Check whether approved Python packages are already installed in the managed environment.",
+    parameters: {
+      type: "object",
+      properties: {
+        packages: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+          maxItems: 20,
+        },
+      },
+      required: ["packages"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "install_python_dependencies",
+    description: "Install approved, pinned Python packages into the managed environment. Fails for packages outside the allowlist.",
+    parameters: {
+      type: "object",
+      properties: {
+        packages: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+          maxItems: 20,
+        },
+      },
+      required: ["packages"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "run_python_script",
+    description: "Run a Python script through the managed local Python environment.",
+    parameters: {
+      type: "object",
+      properties: {
+        script: { type: "string" },
+        cwd: { type: "string" },
+        timeoutMs: { type: "integer", minimum: 100, maximum: 600000 },
+      },
+      required: ["script"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "extract_pdf_text",
+    description: "Extract text from a PDF file through the local workspace bridge.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        maxPages: { type: "integer", minimum: 1, maximum: 500 },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_slot_tree",
+    description: "Return the active app-space slot tree with full slot paths, module bundle keys, metadata, resources, and child counts.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "focus_slot",
+    description: "Navigate the browser to a project if needed, then scroll to and highlight a specific slot path in the current app-space.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        bucket: { type: "string" },
+        configPath: { type: "string" },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_agent_skills",
+    description: "List the agent skills currently on offer, one entry per mounted module instance that has registered any. Each skill is just an id and a one-line description here — call use_skill to get its full instructions and the specific tools it unlocks before acting on that module's data. Call this whenever the user's request concerns a specific mounted module (test manager, task tracker, etc.) and you don't already know which skill applies.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "use_skill",
+    description: "Fetch full instructions and the tool definitions for one skill returned by list_agent_skills. The returned tools become callable for the rest of this run.",
+    parameters: {
+      type: "object",
+      properties: {
+        instanceId: { type: "string", description: "The instanceId from list_agent_skills identifying which mounted module instance offers this skill." },
+        skillId: { type: "string", description: "The skill's id from list_agent_skills." },
+      },
+      required: ["instanceId", "skillId"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+];
+
+const PROJECT_ASSETS_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   {
     type: "function",
     name: "list_project_assets",
@@ -894,6 +1163,9 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+];
+
+const CONTENT_SLOTS_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   {
     type: "function",
     name: "create_markdown_file_set",
@@ -973,85 +1245,169 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     type: "function",
-    name: "create_task_tracker_slot",
-    description: "Create a task-tracker slot and optionally seed it with initial tasks in one operation.",
+    name: "read_markdown_slot",
+    description: "Read the current markdown-viewer slot content, including its file-set manifest and truncated file contents.",
     parameters: {
       type: "object",
       properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        tasks: {
+        slotPath: {
           type: "array",
-          items: {
-            type: "object",
-            properties: {
-              title: { type: "string" },
-              description: { type: "string" },
-              notes: { type: "string" },
-              status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
-              priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
-              assignee: { type: "string" },
-              tags: { type: "array", items: { type: "string" } },
-              repeatable: { type: "boolean" },
-            },
-            required: ["title"],
-            additionalProperties: false,
-          },
+          items: { type: "string" },
+          minItems: 1,
         },
+        maxCharsPerFile: { type: "integer", minimum: 200, maximum: 50000 },
       },
-      required: ["slotId", "title"],
+      required: ["slotPath"],
       additionalProperties: false,
     },
   },
   {
     type: "function",
-    name: "create_documentation_slot",
-    description: "Create a documentation-viewer slot and initialize it with starter pages and content in one operation.",
+    name: "replace_markdown_slot_content",
+    description: "Replace a markdown-viewer slot's backing file set in one operation by creating a fresh asset version and rewiring the slot.",
     parameters: {
       type: "object",
       properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        pages: {
+        slotPath: {
           type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        title: { type: "string" },
+        entryPath: { type: "string" },
+        files: {
+          type: "array",
+          minItems: 1,
           items: {
             type: "object",
             properties: {
-              title: { type: "string" },
+              path: { type: "string" },
               content: { type: "string" },
-              action: { type: "string", enum: ["child", "sibling"] },
-              afterDocTitle: { type: "string" },
+              mimeType: { type: "string" },
             },
-            required: ["title"],
+            required: ["path", "content"],
             additionalProperties: false,
           },
         },
       },
-      required: ["slotId", "title"],
+      required: ["slotPath", "entryPath", "files"],
       additionalProperties: false,
     },
   },
   {
     type: "function",
-    name: "create_work_manager_slot",
-    description: "Create a work-manager slot and optionally seed it with schedule items, milestones, dependencies, lanes, dates, and progress.",
+    name: "replace_document_viewer_asset",
+    description: "Replace the configured document in a document-viewer slot using either an existing asset or a local workspace file import.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        assetId: { type: "string" },
+        workspacePath: { type: "string" },
+        filename: { type: "string" },
+        label: { type: "string" },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_links_slot",
+    description: "Create a links module slot with an initial set of links.",
     parameters: {
       type: "object",
       properties: {
         parentSlotPath: { type: "array", items: { type: "string" } },
         slotId: { type: "string" },
         title: { type: "string" },
-        items: {
+        links: {
           type: "array",
-          items: WORK_ITEM_INPUT_SCHEMA,
+          items: {
+            type: "object",
+            properties: {
+              text: { type: "string" },
+              url: { type: "string" },
+            },
+            required: ["text", "url"],
+            additionalProperties: false,
+          },
         },
       },
-      required: ["slotId", "title"],
+      required: ["slotId", "title", "links"],
       additionalProperties: false,
     },
   },
+  {
+    type: "function",
+    name: "set_links_slot_items",
+    description: "Replace the configured links inside a links module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        links: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              text: { type: "string" },
+              url: { type: "string" },
+            },
+            required: ["text", "url"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotPath", "links"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_webview_slot",
+    description: "Create a webview slot with an initial URL.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        url: { type: "string" },
+      },
+      required: ["slotId", "title", "url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "set_webview_url",
+    description: "Update the URL inside a webview slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        url: { type: "string" },
+      },
+      required: ["slotPath", "url"],
+      additionalProperties: false,
+    },
+  },
+];
+
+const ORGANIZER_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   {
     type: "function",
     name: "get_organizer_overview",
@@ -1359,6 +1715,28 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+];
+
+const WORK_MANAGER_SKILL_TOOLS: AgentSkillToolDefinition[] = [
+  {
+    type: "function",
+    name: "create_work_manager_slot",
+    description: "Create a work-manager slot and optionally seed it with schedule items, milestones, dependencies, lanes, dates, and progress.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        items: {
+          type: "array",
+          items: WORK_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
   {
     type: "function",
     name: "list_work_manager_items",
@@ -1478,442 +1856,39 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+];
+
+const TASK_TRACKER_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   {
     type: "function",
-    name: "read_markdown_slot",
-    description: "Read the current markdown-viewer slot content, including its file-set manifest and truncated file contents.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        maxCharsPerFile: { type: "integer", minimum: 200, maximum: 50000 },
-      },
-      required: ["slotPath"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "replace_markdown_slot_content",
-    description: "Replace a markdown-viewer slot's backing file set in one operation by creating a fresh asset version and rewiring the slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        title: { type: "string" },
-        entryPath: { type: "string" },
-        files: {
-          type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            properties: {
-              path: { type: "string" },
-              content: { type: "string" },
-              mimeType: { type: "string" },
-            },
-            required: ["path", "content"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["slotPath", "entryPath", "files"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "create_links_slot",
-    description: "Create a links module slot with an initial set of links.",
+    name: "create_task_tracker_slot",
+    description: "Create a task-tracker slot and optionally seed it with initial tasks in one operation.",
     parameters: {
       type: "object",
       properties: {
         parentSlotPath: { type: "array", items: { type: "string" } },
         slotId: { type: "string" },
         title: { type: "string" },
-        links: {
+        tasks: {
           type: "array",
           items: {
             type: "object",
             properties: {
-              text: { type: "string" },
-              url: { type: "string" },
+              title: { type: "string" },
+              description: { type: "string" },
+              notes: { type: "string" },
+              status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
+              priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+              assignee: { type: "string" },
+              tags: { type: "array", items: { type: "string" } },
+              repeatable: { type: "boolean" },
             },
-            required: ["text", "url"],
+            required: ["title"],
             additionalProperties: false,
           },
         },
       },
-      required: ["slotId", "title", "links"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "set_links_slot_items",
-    description: "Replace the configured links inside a links module slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        links: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              text: { type: "string" },
-              url: { type: "string" },
-            },
-            required: ["text", "url"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["slotPath", "links"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "create_webview_slot",
-    description: "Create a webview slot with an initial URL.",
-    parameters: {
-      type: "object",
-      properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        url: { type: "string" },
-      },
-      required: ["slotId", "title", "url"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "set_webview_url",
-    description: "Update the URL inside a webview slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        url: { type: "string" },
-      },
-      required: ["slotPath", "url"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "replace_document_viewer_asset",
-    description: "Replace the configured document in a document-viewer slot using either an existing asset or a local workspace file import.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        assetId: { type: "string" },
-        workspacePath: { type: "string" },
-        filename: { type: "string" },
-        label: { type: "string" },
-      },
-      required: ["slotPath"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "list_registered_resources",
-    description: "List resources currently registered across the loaded module tree.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        limit: { type: "integer", minimum: 1, maximum: 100 },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "list_available_modules",
-    description: "List published modules available in the picker so the agent can choose a module to add or swap in.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        limit: { type: "integer", minimum: 1, maximum: 100 },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "list_workspace_files",
-    description: "List files and directories from the local workspace bridge.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        recursive: { type: "boolean" },
-        limit: { type: "integer", minimum: 1, maximum: 1000 },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "read_workspace_file",
-    description: "Read a file from the local workspace bridge.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        encoding: { type: "string", enum: ["utf8", "base64"] },
-      },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "write_workspace_file",
-    description: "Write a file through the local workspace bridge.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        content: { type: "string" },
-        encoding: { type: "string", enum: ["utf8", "base64"] },
-        mode: { type: "string", enum: ["overwrite", "append"] },
-      },
-      required: ["path", "content"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "run_workspace_command",
-    description: "Run a shell command through the local workspace bridge.",
-    parameters: {
-      type: "object",
-      properties: {
-        command: { type: "string" },
-        cwd: { type: "string" },
-        timeoutMs: { type: "integer", minimum: 100, maximum: 600000 },
-      },
-      required: ["command"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "execute_tcp_command",
-    description: "Open a raw TCP connection through the local workspace bridge, optionally send a command, and read the response. Useful for SCPI/LAN instruments such as oscilloscopes and power supplies.",
-    parameters: {
-      type: "object",
-      properties: {
-        host: { type: "string" },
-        port: { type: "integer", minimum: 1, maximum: 65535 },
-        command: { type: "string" },
-        appendNewline: { type: "boolean" },
-        newline: { type: "string", enum: ["lf", "crlf", "none"] },
-        readMode: { type: "string", enum: ["once", "until-timeout", "until-marker"] },
-        readUntil: { type: "string" },
-        timeoutMs: { type: "integer", minimum: 100, maximum: 600000 },
-        quietMs: { type: "integer", minimum: 50, maximum: 10000 },
-        sendDelayMs: { type: "integer", minimum: 0, maximum: 10000 },
-        encoding: { type: "string", enum: ["utf8", "base64", "hex"] },
-      },
-      required: ["host"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "get_python_environment",
-    description: "Inspect the managed local Python environment and its approved dependency allowlist.",
-    parameters: {
-      type: "object",
-      properties: {},
-      additionalProperties: false,
-    },
-    strict: true,
-  },
-  {
-    type: "function",
-    name: "check_python_dependencies",
-    description: "Check whether approved Python packages are already installed in the managed environment.",
-    parameters: {
-      type: "object",
-      properties: {
-        packages: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-          maxItems: 20,
-        },
-      },
-      required: ["packages"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "install_python_dependencies",
-    description: "Install approved, pinned Python packages into the managed environment. Fails for packages outside the allowlist.",
-    parameters: {
-      type: "object",
-      properties: {
-        packages: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-          maxItems: 20,
-        },
-      },
-      required: ["packages"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "run_python_script",
-    description: "Run a Python script through the managed local Python environment.",
-    parameters: {
-      type: "object",
-      properties: {
-        script: { type: "string" },
-        cwd: { type: "string" },
-        timeoutMs: { type: "integer", minimum: 100, maximum: 600000 },
-      },
-      required: ["script"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "extract_pdf_text",
-    description: "Extract text from a PDF file through the local workspace bridge.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        maxPages: { type: "integer", minimum: 1, maximum: 500 },
-      },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "upsert_root_slot",
-    description: "Create or update a top-level child slot in the active root config using a published module.",
-    parameters: {
-      type: "object",
-      properties: {
-        moduleName: { type: "string" },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        meta: { type: "object", additionalProperties: true },
-        resources: {
-          type: "array",
-          items: RESOURCE_SCHEMA,
-        },
-      },
-      required: ["moduleName", "slotId"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "remove_root_slot",
-    description: "Remove a top-level child slot from the active root config.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotId: { type: "string" },
-      },
-      required: ["slotId"],
-      additionalProperties: false,
-    },
-    strict: true,
-  },
-  {
-    type: "function",
-    name: "list_slot_tree",
-    description: "Return the active app-space slot tree with full slot paths, module bundle keys, metadata, resources, and child counts.",
-    parameters: {
-      type: "object",
-      properties: {},
-      additionalProperties: false,
-    },
-    strict: true,
-  },
-  {
-    type: "function",
-    name: "focus_slot",
-    description: "Navigate the browser to a project if needed, then scroll to and highlight a specific slot path in the current app-space.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        bucket: { type: "string" },
-        configPath: { type: "string" },
-      },
-      required: ["slotPath"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "upsert_slot",
-    description: "Create or update a slot anywhere in the active app-space tree using the framework's ChildSlot structure. Parent path defaults to the root.",
-    parameters: {
-      type: "object",
-      properties: {
-        parentSlotPath: {
-          type: "array",
-          items: { type: "string" },
-        },
-        slotId: { type: "string" },
-        moduleName: { type: "string" },
-        title: { type: "string" },
-        meta: { type: "object", additionalProperties: true },
-        resources: {
-          type: "array",
-          items: RESOURCE_SCHEMA,
-        },
-        children: {
-          type: "array",
-          items: { type: "object", additionalProperties: true },
-        },
-        replaceChildren: { type: "boolean" },
-      },
-      required: ["slotId"],
+      required: ["slotId", "title"],
       additionalProperties: false,
     },
   },
@@ -2036,6 +2011,38 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         assetId: { type: "string" },
       },
       required: ["slotPath", "taskId", "assetId"],
+      additionalProperties: false,
+    },
+  },
+];
+
+const DOCUMENTATION_SKILL_TOOLS: AgentSkillToolDefinition[] = [
+  {
+    type: "function",
+    name: "create_documentation_slot",
+    description: "Create a documentation-viewer slot and initialize it with starter pages and content in one operation.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        pages: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              content: { type: "string" },
+              action: { type: "string", enum: ["child", "sibling"] },
+              afterDocTitle: { type: "string" },
+            },
+            required: ["title"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotId", "title"],
       additionalProperties: false,
     },
   },
@@ -2197,6 +2204,72 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+];
+
+const SLOT_MANAGEMENT_SKILL_TOOLS: AgentSkillToolDefinition[] = [
+  {
+    type: "function",
+    name: "upsert_root_slot",
+    description: "Create or update a top-level child slot in the active root config using a published module.",
+    parameters: {
+      type: "object",
+      properties: {
+        moduleName: { type: "string" },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        meta: { type: "object", additionalProperties: true },
+        resources: {
+          type: "array",
+          items: RESOURCE_SCHEMA,
+        },
+      },
+      required: ["moduleName", "slotId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "remove_root_slot",
+    description: "Remove a top-level child slot from the active root config.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotId: { type: "string" },
+      },
+      required: ["slotId"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "upsert_slot",
+    description: "Create or update a slot anywhere in the active app-space tree using the framework's ChildSlot structure. Parent path defaults to the root.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: {
+          type: "array",
+          items: { type: "string" },
+        },
+        slotId: { type: "string" },
+        moduleName: { type: "string" },
+        title: { type: "string" },
+        meta: { type: "object", additionalProperties: true },
+        resources: {
+          type: "array",
+          items: RESOURCE_SCHEMA,
+        },
+        children: {
+          type: "array",
+          items: { type: "object", additionalProperties: true },
+        },
+        replaceChildren: { type: "boolean" },
+      },
+      required: ["slotId"],
+      additionalProperties: false,
+    },
+  },
   {
     type: "function",
     name: "remove_slot",
@@ -2241,100 +2314,57 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+];
+
+// Built-in agent skills for capabilities that aren't owned by any mountable module (organizer
+// memory, work-manager/task-tracker/documentation data access, project assets, generic content
+// slots, and app-space slot management). Registered by this component itself via
+// useRegisterAgentSkills, same as a real module would — see the registration call below. Kept
+// gated behind list_agent_skills/use_skill rather than always-on for the same reason a module's
+// own tools are: these ~62 tool schemas are the bulk of what used to be sent on every single
+// message regardless of relevance.
+const BUILTIN_AGENT_SKILLS: AgentSkill[] = [
   {
-    type: "function",
-    name: "get_test_manager_spec",
-    description: "Read the YAML test specification for a test-manager slot. Returns the raw YAML text. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Call this before proposing changes so you understand the existing structure, linked values, and procedure definitions.",
-    parameters: {
-      type: "object",
-      properties: {
-        slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
-        slotPath: {
-          type: ["array", "null"],
-          items: { type: "string" },
-          minItems: 1,
-          description: "Full slot path to the test-manager instance, or null when using slot_id.",
-        },
-      },
-      required: ["slot_id", "slotPath"],
-      additionalProperties: false,
-    },
-    strict: true,
+    id: "project-assets",
+    description: "List, read, create, import, and export the project's central asset store (text-like files, images, PDFs, etc. shared across modules).",
+    prompt: "Use these tools to work with the project's central asset store — a shared, versioned file store separate from any one module's own data. list_project_assets/read_project_asset for lookup and reading text-like assets; create_text_asset for new inline text content; import_workspace_file_as_asset to pull a local bridge file in; export_project_asset_to_workspace to write one back out to disk for local inspection. Prefer this store over the local bridge workspace for anything meant to persist as part of the project rather than the developer's machine.",
+    tools: PROJECT_ASSETS_SKILL_TOOLS,
   },
   {
-    type: "function",
-    name: "summarize_test_manager_spec",
-    description: "Inspect the current YAML spec for a test-manager slot and return a structured summary with counts, key IDs, and structural issues. Use this before editing when you need to understand the shape of the spec rather than reading the raw YAML directly.",
-    parameters: {
-      type: "object",
-      properties: {
-        slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
-        slotPath: {
-          type: ["array", "null"],
-          items: { type: "string" },
-          minItems: 1,
-          description: "Full slot path to the test-manager instance, or null when using slot_id.",
-        },
-      },
-      required: ["slot_id", "slotPath"],
-      additionalProperties: false,
-    },
-    strict: true,
+    id: "content-slots",
+    description: "Create and edit markdown, document-viewer, links, and webview module slots.",
+    prompt: "Use these tools to create or edit simple content-display slots: markdown file sets (create_markdown_file_set/create_markdown_slot_from_content/read_markdown_slot/replace_markdown_slot_content), document-viewer PDF slots (create_document_viewer_slot/replace_document_viewer_asset), links slots (create_links_slot/set_links_slot_items), and webview slots (create_webview_slot/set_webview_url). These are generic display modules, not data-owning ones — for task tracker, work manager, documentation, or test manager data, use that module's own skill instead.",
+    tools: CONTENT_SLOTS_SKILL_TOOLS,
   },
   {
-    type: "function",
-    name: "validate_test_manager_spec",
-    description: "Validate and summarize a candidate YAML test-manager spec before writing it. Returns parse/structure issues and a compact summary so you can catch problems before calling set_test_manager_spec.",
-    parameters: {
-      type: "object",
-      properties: {
-        yaml: { type: "string", description: "The candidate full YAML content of the test specification." },
-      },
-      required: ["yaml"],
-      additionalProperties: false,
-    },
-    strict: true,
+    id: "organizer",
+    description: "Read and manage the project's organizer memory: work scopes (the durable graph layer), work objectives, and organizer items (notes, todos, follow-ups, reminders, waiting-on).",
+    prompt: "Work scopes are the durable graph layer for broad-to-narrow work context; each scope can have an upstream parentScopeId and downstream child scopes. With little context, start with list_work_scope_index or search_work_scope_graph, then call get_work_scope_context on the best candidate — or get_organizer_overview for one coherent snapshot of the whole board. Use scopes for work context, work objectives for larger multi-step efforts, and organizer items for small notes/todos/reminders/follow-ups/waiting-on entries. Prefer the targeted update tools (update_organizer_item, update_work_scope, batch_update_organizer_items, mark_organizer_items_complete) over replace_organizer_store, which is only for explicit reset/import requests.",
+    tools: ORGANIZER_SKILL_TOOLS,
   },
   {
-    type: "function",
-    name: "set_test_manager_spec",
-    description: "Write a complete YAML test specification for a test-manager slot, replacing the current spec. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Only call this after discussing the proposed changes with the user and receiving explicit confirmation. The test-manager module reflects changes on next reload.",
-    parameters: {
-      type: "object",
-      properties: {
-        slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
-        slotPath: {
-          type: ["array", "null"],
-          items: { type: "string" },
-          minItems: 1,
-          description: "Full slot path to the test-manager instance, or null when using slot_id.",
-        },
-        yaml: { type: "string", description: "The full YAML content of the test specification." },
-      },
-      required: ["slot_id", "slotPath", "yaml"],
-      additionalProperties: false,
-    },
-    strict: true,
+    id: "work-manager",
+    description: "Create and manage schedule items, milestones, and dependencies inside a work-manager module slot.",
+    prompt: "Use these tools for a work-manager module slot's schedule: list_work_manager_items/create_work_manager_items/update_work_manager_item/delete_work_manager_item for day-to-day edits, attach_project_asset_to_work_item to link a central asset, and replace_work_manager_items only when intentionally replacing the whole schedule (replaceExisting=true). Dependencies can be given by id or by title. Every call needs the slot's full slotPath — use list_slot_tree first if you don't already have it.",
+    tools: WORK_MANAGER_SKILL_TOOLS,
   },
   {
-    type: "function",
-    name: "get_test_manager_run_summary",
-    description: "Read the current run state for a test-manager slot: active run, test status counts, and excluded test counts across all runs. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Use this to understand progress before suggesting what to add or run next.",
-    parameters: {
-      type: "object",
-      properties: {
-        slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
-        slotPath: {
-          type: ["array", "null"],
-          items: { type: "string" },
-          minItems: 1,
-          description: "Full slot path to the test-manager instance, or null when using slot_id.",
-        },
-      },
-      required: ["slot_id", "slotPath"],
-      additionalProperties: false,
-    },
-    strict: true,
+    id: "task-tracker",
+    description: "Create and manage tasks inside a task-tracker module slot.",
+    prompt: "Use these tools for a task-tracker module slot: list_task_tracker_tasks/create_task_tracker_tasks/update_task_tracker_task/delete_task_tracker_task, and attach_project_asset_to_task to link a central asset. Every call needs the slot's full slotPath — use list_slot_tree first if you don't already have it.",
+    tools: TASK_TRACKER_SKILL_TOOLS,
+  },
+  {
+    id: "documentation",
+    description: "Read, search, and edit pages inside a documentation-viewer module slot.",
+    prompt: "Use read_documentation_tree for the page manifest, search_documentation_content or read_documentation_pages before editing anything so you understand what's there, then create_documentation_page/update_documentation_page/rename_documentation_page/move_documentation_page/delete_documentation_page to change it. Every call needs the slot's full slotPath — use list_slot_tree first if you don't already have it.",
+    tools: DOCUMENTATION_SKILL_TOOLS,
+  },
+  {
+    id: "slot-management",
+    description: "Create, update, or remove slots anywhere in the app-space tree, and edit root-level app-space settings.",
+    prompt: "These tools change the app's structure itself — adding/removing/reconfiguring slots (upsert_slot/upsert_root_slot/remove_slot/remove_root_slot) and root-level settings like title, resources, and theme (update_root_config). This is different from operating on a module's own data once it's already in place; only reach for these when the user is explicitly asking to add, remove, or reconfigure a module in the layout, not when they just want to read or edit what a mounted module already holds.",
+    tools: SLOT_MANAGEMENT_SKILL_TOOLS,
   },
 ];
 
@@ -4466,6 +4496,22 @@ function compactInputItems(inputItems: Array<InputMessageItem | ResponsesApiOutp
   };
 }
 
+// Local-only, fire-and-forget mirror of every OpenAI call to a tiny standalone log server (see
+// scripts/agent-log-server.ts) so it can be watched in a terminal. Deliberately independent of the
+// agent-bridge/local-runtime: no filesystem/shell capability is required for this to work, and
+// nothing here is awaited or allowed to throw — if the log server isn't running, the fetch just
+// fails silently and chat behaves exactly as if this didn't exist. Never routes the real call
+// through it; this only ever observes, so an outage here can't break chat.
+const AGENT_LOG_SERVER_URL = "http://127.0.0.1:4318";
+
+function mirrorToLogServer(entry: Record<string, unknown>): void {
+  void fetch(`${AGENT_LOG_SERVER_URL}/log`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(entry),
+  }).catch(() => {});
+}
+
 async function createOpenAiResponse(args: {
   apiKey: string;
   input: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>;
@@ -4491,6 +4537,16 @@ async function createOpenAiResponse(args: {
   });
 
   const payload = (await response.json()) as ResponsesApiResponse;
+  mirrorToLogServer({
+    at: new Date().toISOString(),
+    model: args.model,
+    instructions: args.instructions,
+    tools: args.tools.map((tool) => tool.name),
+    input: args.input,
+    status: response.status,
+    ok: response.ok,
+    response: payload,
+  });
   if (!response.ok) {
     throw new Error(payload.error?.message || `OpenAI request failed with status ${response.status}.`);
   }
@@ -4532,7 +4588,7 @@ function parentPath(path: string): string {
   return normalized.slice(0, slash);
 }
 
-async function callBridge<T>(bridge: BridgeConfig, method: string, params: Record<string, unknown> = {}): Promise<T> {
+async function callBridge<T>(bridge: BridgeConfig, method: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
@@ -4544,6 +4600,7 @@ async function callBridge<T>(bridge: BridgeConfig, method: string, params: Recor
     method: "POST",
     headers,
     body: JSON.stringify({ method, params }),
+    signal,
   });
 
   const payload = (await response.json()) as { ok?: boolean; result?: T; error?: string };
@@ -4597,6 +4654,7 @@ async function buildAppspaceContextSnapshot(args: {
   assetsTable?: string;
   loadedResources: ReadonlyMap<string, Resource>;
   registryEntries: ModuleRegistryEntry[];
+  moduleSkills: ReadonlyMap<string, AgentModuleSkills>;
   bridgeWorkspaceRoot?: string;
 }) {
   const syncWarnings: string[] = [];
@@ -4711,11 +4769,15 @@ async function buildAppspaceContextSnapshot(args: {
       bridgeCanQueueAppspaceOperations: true,
       bridgeCanReadSyncedAppspaceContext: true,
     },
-    appspaceOperations: TOOL_DEFINITIONS.map((tool) => ({
+    appspaceOperations: CORE_TOOL_DEFINITIONS.map((tool) => ({
       name: tool.name,
       description: tool.description,
       parameters: tool.parameters,
     })),
+    // Full agent-skill registrations (not just the id/description pair the model sees by default —
+    // see AgentModuleSkills) so a CLI agent hitting the bridge cold, with no browser/OpenAI loop of
+    // its own, still gets the complete prompt+tools for every mounted module's skills in one read.
+    agentModuleSkills: [...args.moduleSkills.values()],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -4794,6 +4856,7 @@ async function executeTool(args: {
   assetsTable?: string;
   loadedResources: ReadonlyMap<string, Resource>;
   registryEntries: ModuleRegistryEntry[];
+  moduleSkills: ReadonlyMap<string, AgentModuleSkills>;
   bridge: BridgeConfig | null;
 }): Promise<ToolExecutionResult> {
   const {
@@ -4808,6 +4871,7 @@ async function executeTool(args: {
     assetsTable,
     loadedResources,
     registryEntries,
+    moduleSkills,
     bridge,
   } = args;
 
@@ -4846,6 +4910,7 @@ async function executeTool(args: {
         assetsTable,
         loadedResources,
         registryEntries,
+        moduleSkills,
       });
       return {
         output: JSON.stringify(snapshot, null, 2),
@@ -6475,6 +6540,28 @@ async function executeTool(args: {
       };
     }
 
+    // Was declared as a tool with no matching case here — every call fell through to the
+    // "Unsupported tool" error below despite the bridge fully supporting it.
+    case "execute_tcp_command": {
+      if (!bridge) throw new Error("Local agent bridge is not configured.");
+      const parsed = parseToolArgs<Record<string, unknown>>(toolCall.arguments);
+      const result = await callBridge<unknown>(bridge, "execute_tcp_command", parsed);
+      return {
+        output: JSON.stringify(result, null, 2),
+        toolMessage: `Sent TCP command to ${parsed["host"]}:${parsed["port"] ?? "?"}.`,
+      };
+    }
+
+    case "execute_http_request": {
+      if (!bridge) throw new Error("Local agent bridge is not configured.");
+      const parsed = parseToolArgs<Record<string, unknown>>(toolCall.arguments);
+      const result = await callBridge<unknown>(bridge, "execute_http_request", parsed);
+      return {
+        output: JSON.stringify(result, null, 2),
+        toolMessage: `${parsed["method"] ?? "GET"} ${parsed["url"]}`,
+      };
+    }
+
     case "get_python_environment": {
       if (!bridge) throw new Error("Local agent bridge is not configured.");
       const result = await callBridge<unknown>(bridge, "get_python_environment");
@@ -7403,6 +7490,34 @@ async function executeTool(args: {
       };
     }
 
+    case "list_agent_skills": {
+      const modules = [...moduleSkills.values()].map((entry) => ({
+        instanceId: entry.instanceId,
+        moduleName: entry.moduleName,
+        displayName: entry.displayName,
+        description: entry.description,
+        skills: entry.skills.map((skill) => ({ id: skill.id, description: skill.description })),
+      }));
+      return {
+        output: JSON.stringify({ modules }, null, 2),
+        toolMessage: `Listed ${modules.reduce((sum, m) => sum + m.skills.length, 0)} skill(s) across ${modules.length} mounted module instance(s).`,
+      };
+    }
+
+    case "use_skill": {
+      const parsed = parseToolArgs<{ instanceId: string; skillId: string }>(toolCall.arguments);
+      const moduleEntry = moduleSkills.get(parsed.instanceId);
+      const skill = moduleEntry?.skills.find((candidate) => candidate.id === parsed.skillId);
+      if (!moduleEntry || !skill) {
+        throw new Error(`No skill "${parsed.skillId}" found for instanceId "${parsed.instanceId}". Call list_agent_skills first.`);
+      }
+      return {
+        output: JSON.stringify({ prompt: skill.prompt, tools: skill.tools.map((tool) => tool.name) }, null, 2),
+        toolMessage: `Loaded skill "${skill.id}" from ${moduleEntry.displayName}: ${skill.tools.map((tool) => tool.name).join(", ") || "(no tools)"}.`,
+        unlockedTools: skill.tools as ToolDefinition[],
+      };
+    }
+
     default:
       throw new Error(`Unsupported tool: ${toolCall.name}`);
   }
@@ -7429,6 +7544,22 @@ export default function AgentChatModule({ config }: ModuleProps) {
   const { assets: assetsTable } = useTableNames();
   const resources = useAllResources();
   const { entries: registryEntries } = useModuleRegistry();
+  const moduleSkills = useAllAgentSkills();
+  // agent-chat registers its own built-in skills into the same registry a real module would, for
+  // capabilities that aren't owned by any mountable module — see BUILTIN_AGENT_SKILLS. This makes
+  // list_agent_skills/use_skill the uniform discovery path for everything, module-owned or not.
+  useRegisterAgentSkills(
+    useMemo(
+      () => ({
+        instanceId: config.id,
+        moduleName: "module-agent-chat",
+        displayName: "Agent Chat (built-in)",
+        description: "Cross-cutting capabilities not tied to a specific mounted module: organizer memory, work manager, task tracker, documentation, project assets, content slots, and app-space slot management.",
+        skills: BUILTIN_AGENT_SKILLS,
+      }),
+      [config.id],
+    ),
+  );
 
   const params = new URLSearchParams(window.location.search);
   const configBucket = params.get("bucket") ?? "";
@@ -7821,6 +7952,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
       assetsTable,
       loadedResources: resources,
       registryEntries,
+      moduleSkills,
       bridgeWorkspaceRoot,
     });
     await callBridge(bridge, "sync_appspace_context", {
@@ -7853,6 +7985,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
       assetsTable,
       loadedResources: resources,
       registryEntries,
+      moduleSkills,
       bridge,
     });
   }
@@ -8185,6 +8318,10 @@ export default function AgentChatModule({ config }: ModuleProps) {
     let assistantText = "";
     let lastToolMessages: string[] = [];
     let shouldNavigate = false;
+    // Starts at just the always-on core tools; grows as use_skill calls unlock more for the rest
+    // of this run. Deliberately not persisted beyond this one runAgentSession call — the next user
+    // submission starts fresh from core again, same as contextBits already does.
+    const activeTools: ToolDefinition[] = [...CORE_TOOL_DEFINITIONS];
 
     for (let i = 0; i < TOOL_ITERATION_LIMIT; i++) {
       if (args.signal.aborted) {
@@ -8211,7 +8348,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
           input: compacted.inputItems,
           model,
           instructions,
-          tools: TOOL_DEFINITIONS,
+          tools: activeTools,
           signal: args.signal,
         });
       } catch (error) {
@@ -8299,6 +8436,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
             assetsTable,
             loadedResources: resources,
             registryEntries,
+            moduleSkills,
             bridge: args.bridge,
           });
         } catch (error) {
@@ -8310,6 +8448,14 @@ export default function AgentChatModule({ config }: ModuleProps) {
           call_id: call.call_id,
           output: result.output,
         });
+
+        if (result.unlockedTools?.length) {
+          for (const tool of result.unlockedTools) {
+            const existingIndex = activeTools.findIndex((candidate) => candidate.name === tool.name);
+            if (existingIndex >= 0) activeTools[existingIndex] = tool;
+            else activeTools.push(tool);
+          }
+        }
 
         console.debug("[agent-chat] tool result", {
           name: call.name,
@@ -8393,9 +8539,9 @@ export default function AgentChatModule({ config }: ModuleProps) {
           ? `Local runtime is enabled with workspace root ${bridgeWorkspaceRoot || "unknown"}.`
           : "Local runtime is disabled for this project/module. Do not use local filesystem, shell, Python, or PDF bridge tools unless the user enables it in settings.",
         organizerSummary,
-        "Work scopes are the durable graph layer for broad-to-narrow work context. Each scope can have an upstream parentScopeId and downstream child scopes. With little context, start with list_work_scope_index or search_work_scope_graph, then call get_work_scope_context on the best candidate.",
-        "Organizer memory is available through get_organizer_overview, list_work_scope_index, search_work_scope_graph, get_work_scope_context, list_work_scopes, create_work_scopes, update_work_scope, archive_work_scope, list_organizer_items, create_organizer_items, update_organizer_item, delete_organizer_item, batch_update_organizer_items, mark_organizer_items_complete, and upsert_sweep_review. Use scopes for work context and organizer items for small notes, todos, reminders, follow-ups, and waiting-on items.",
-        "Test manager data is available through five callable tools: summarize_test_manager_spec (inspect the current spec shape), get_test_manager_spec (read the raw YAML), validate_test_manager_spec (check a proposed YAML rewrite before writing), set_test_manager_spec (write a replacement spec after user confirmation), and get_test_manager_run_summary (read run progress and status counts). Prefer summarize plus validate before any rewrite. Prefer the full slotPath array like other module APIs; slot_id is still accepted as a shortcut. These are direct callable functions — not metadata — invoke them by name.",
+        moduleSkills.size > 0
+          ? `${[...moduleSkills.values()].reduce((sum, m) => sum + m.skills.length, 0)} agent skill(s) are on offer from ${moduleSkills.size} mounted module instance(s) right now. Call list_agent_skills to see them, then use_skill before acting on that module's data — do not guess at its tools or file format.`
+          : "No mounted module instance has registered any agent skills for this project right now.",
         user?.email ? `Signed-in user: ${user.email}.` : undefined,
       ].filter((value): value is string => Boolean(value));
 

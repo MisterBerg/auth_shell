@@ -104,6 +104,41 @@ export type ModuleBundle = {
 };
 
 // ---------------------------------------------------------------------------
+// Agent skills — live, mount-time self-description for the built-in agent (see agent-chat).
+// A module that wants the agent to operate on it well registers one of these (useRegisterAgentSkills)
+// while mounted. Unlike ModuleRegistryEntry below, this is never persisted — it only exists in
+// browser memory for as long as the module instance is on the page, keyed by ModuleConfig.id.
+//
+// Deliberately two-tier: `description` on the skill itself is the only thing shown to the model
+// by default (via the agent's list_agent_skills tool) so a chat with many modules mounted doesn't
+// balloon the prompt. `prompt` and `tools` only reach the model once it calls use_skill for that
+// specific skill — see agent-chat's runAgentSession for how the active tool set grows from there.
+// ---------------------------------------------------------------------------
+
+export type AgentSkillToolDefinition = {
+  type: "function";
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  strict?: boolean;
+};
+
+export type AgentSkill = {
+  id: string;              // unique within this module instance, e.g. "generate-report"
+  description: string;     // one-liner; the only part shown before the skill is selected
+  prompt: string;          // full instructions, revealed once use_skill(instanceId, id) is called
+  tools: AgentSkillToolDefinition[];  // tool defs unlocked alongside the prompt
+};
+
+export type AgentModuleSkills = {
+  instanceId: string;      // ModuleConfig.id of the mounted instance offering these skills
+  moduleName: string;      // published module name, e.g. "module-test-manager"
+  displayName: string;
+  description: string;     // one-liner about the module instance overall
+  skills: AgentSkill[];
+};
+
+// ---------------------------------------------------------------------------
 // Module registry — describes a published module available in the picker.
 // Matches the DynamoDB module-registry table's "latest" pointer records.
 // ---------------------------------------------------------------------------

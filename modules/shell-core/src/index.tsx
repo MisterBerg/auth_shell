@@ -13,6 +13,7 @@ import {
   AuthProvider,
   EditModeProvider,
   ResourceRegistryProvider,
+  AgentSkillRegistryProvider,
   loadModule,
   useEditMode,
   useRegisterResources,
@@ -518,11 +519,13 @@ function ShellCoreApp({
 export default function ProtectedShellCore(props: ProtectedShellCoreProps) {
   return (
     <ResourceRegistryProvider>
-      <EditModeProvider>
-        <ShellAuthProvider {...props}>
-          <ShellCoreApp shellConfig={props.shellConfig} runtimeEnv={props.runtimeEnv} />
-        </ShellAuthProvider>
-      </EditModeProvider>
+      <AgentSkillRegistryProvider>
+        <EditModeProvider>
+          <ShellAuthProvider {...props}>
+            <ShellCoreApp shellConfig={props.shellConfig} runtimeEnv={props.runtimeEnv} />
+          </ShellAuthProvider>
+        </EditModeProvider>
+      </AgentSkillRegistryProvider>
     </ResourceRegistryProvider>
   );
 }

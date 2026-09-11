@@ -22,6 +22,7 @@ const SHELL_DIR = join(ROOT, "apps", "shell");
 const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
 const SHELL_PORT = 5173;
 const BRIDGE_PORT = 4317;
+const LOG_SERVER_PORT = 4318;
 const require = createRequire(import.meta.url);
 const TSX_CLI = require.resolve("tsx/cli");
 
@@ -30,6 +31,7 @@ function main() {
 
   killPort(SHELL_PORT);
   killPort(BRIDGE_PORT);
+  killPort(LOG_SERVER_PORT);
 
   runTsx("scripts/compose-up.ts");
   run(NPM_COMMAND, ["install", "--include=optional"]);
@@ -46,9 +48,19 @@ function main() {
     },
   });
 
+  // Independent of the bridge above — see agent-log-server.ts's doc comment for why this is a
+  // separate process rather than another bridge RPC method. Its only job is printing agent-chat's
+  // OpenAI traffic here; chat works fine whether or not this is running.
+  const logServerChild = spawn(process.execPath, [TSX_CLI, "scripts/agent-log-server.ts"], {
+    cwd: ROOT,
+    stdio: "inherit",
+    env: { ...process.env, AGENT_LOG_SERVER_PORT: String(LOG_SERVER_PORT) },
+  });
+
   console.log("\nStarting shell dev server...");
   console.log(`Project URL: http://localhost:${SHELL_PORT}/?bucket=hep-dev-modules&config=projects/${developer}-dev/config.json\n`);
   console.log(`Agent bridge: http://127.0.0.1:${BRIDGE_PORT}\n`);
+  console.log(`Agent log server: http://127.0.0.1:${LOG_SERVER_PORT} (agent-chat's OpenAI traffic prints here)\n`);
 
   const child = spawnCommand(NPM_COMMAND, ["run", "dev", "--", "--host", "0.0.0.0", "--port", String(SHELL_PORT)], {
     cwd: SHELL_DIR,
@@ -60,6 +72,7 @@ function main() {
 
   child.on("exit", (code, signal) => {
     bridgeChild.kill();
+    logServerChild.kill();
     if (signal) process.kill(process.pid, signal);
     process.exit(code ?? 0);
   });
