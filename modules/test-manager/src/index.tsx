@@ -3038,6 +3038,31 @@ function renderInstrumentSessionWindowShellHtml(): string {
         function engineeringSample(value) {
           return typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "0.00";
         }
+        // Axis/readout precision has to follow the zoom level: a fixed 3-decimal ms label reads
+        // identically on every gridline once the visible window is a few microseconds wide. The unit
+        // is picked from the visible span, and decimals from the gap between adjacent gridlines
+        // (span / 10) so neighbouring labels always differ. "extra" adds precision for cursor and
+        // measurement readouts, which need to resolve finer than the gridline spacing.
+        function niceDecimals(step, extra) {
+          const base = (typeof step === "number" && isFinite(step) && step > 0) ? Math.ceil(-Math.log10(step)) + 1 : 3;
+          return Math.max(0, Math.min(12, base + (extra || 0)));
+        }
+        function timeUnitFor(spanSeconds) {
+          const span = Math.abs(spanSeconds);
+          if (!isFinite(span) || span === 0 || span >= 1) return { scale: 1, suffix: "s" };
+          if (span >= 1e-3) return { scale: 1e3, suffix: "ms" };
+          if (span >= 1e-6) return { scale: 1e6, suffix: "\u00b5s" };
+          return { scale: 1e9, suffix: "ns" };
+        }
+        function formatTimeValue(seconds, refSpanSeconds, extra) {
+          const unit = timeUnitFor(refSpanSeconds);
+          const decimals = niceDecimals((refSpanSeconds / 10) * unit.scale, extra);
+          return (seconds * unit.scale).toFixed(decimals) + " " + unit.suffix;
+        }
+        function formatVoltValue(volts, ySpanVolts, extra) {
+          if (typeof volts !== "number" || !Number.isFinite(volts)) return "0.00";
+          return volts.toFixed(Math.max(2, niceDecimals(ySpanVolts / 10, extra)));
+        }
         function renderWaveformChart(host, entry) {
           const samples = Array.isArray(entry.preview && entry.preview.samples) ? entry.preview.samples.slice() : [];
           if (samples.length < 2) {
@@ -3078,6 +3103,7 @@ function renderInstrumentSessionWindowShellHtml(): string {
             const yMax = Math.max(state.yRange[0], state.yRange[1]);
             const ySpan = Math.max(1e-6, yMax - yMin);
             const xSpan = Math.max(1, range[1] - range[0] - 1);
+            const visibleSpanSeconds = (entry.preview && typeof entry.preview.intervalSeconds === "number") ? xSpan * entry.preview.intervalSeconds : null;
             const plotLeft = 64, plotTop = 12, plotWidth = 916, plotHeight = 320, plotRight = plotLeft + plotWidth, plotBottom = plotTop + plotHeight;
             const points = sampled.map(function(point, idx) {
               const sourceIndex = point.sourceIndex;
@@ -3096,17 +3122,18 @@ function renderInstrumentSessionWindowShellHtml(): string {
               const dx = b.index - a.index;
               const dy = b.sample - a.sample;
               const dtSeconds = (entry.preview && typeof entry.preview.intervalSeconds === "number") ? dx * entry.preview.intervalSeconds : null;
-              if (row.op === "dx") return { id: row.id, label: (dtSeconds === null ? dx + " samples" : "Dt " + (dtSeconds * 1e3).toFixed(3) + " ms") + " / Dv " + engineeringSample(dy) + " V" };
-              if (row.op === "dy") return { id: row.id, label: "Dt " + (dtSeconds === null ? (dx + " samples") : ((dtSeconds * 1e3).toFixed(3) + " ms")) + " / Dv " + engineeringSample(dy) + " V" };
-              if (row.op === "abs-dy") return { id: row.id, label: "Dt " + (dtSeconds === null ? (dx + " samples") : ((dtSeconds * 1e3).toFixed(3) + " ms")) + " / |Dv| " + engineeringSample(Math.abs(dy)) + " V" };
-              return { id: row.id, label: "Dt " + (dtSeconds === null ? (dx + " samples") : ((dtSeconds * 1e3).toFixed(3) + " ms")) + " / dV/dt " + (dy / Math.max(dtSeconds === null ? 1 : 1e-12, Math.abs(dtSeconds ?? dx))).toFixed(4) + (dtSeconds === null ? " V/sample" : " V/s") };
+              const dtText = dtSeconds === null ? (dx + " samples") : formatTimeValue(dtSeconds, visibleSpanSeconds, 2);
+              if (row.op === "dx") return { id: row.id, label: (dtSeconds === null ? dtText : "Dt " + dtText) + " / Dv " + formatVoltValue(dy, ySpan, 2) + " V" };
+              if (row.op === "dy") return { id: row.id, label: "Dt " + dtText + " / Dv " + formatVoltValue(dy, ySpan, 2) + " V" };
+              if (row.op === "abs-dy") return { id: row.id, label: "Dt " + dtText + " / |Dv| " + formatVoltValue(Math.abs(dy), ySpan, 2) + " V" };
+              return { id: row.id, label: "Dt " + dtText + " / dV/dt " + (dy / Math.max(dtSeconds === null ? 1 : 1e-12, Math.abs(dtSeconds ?? dx))).toFixed(4) + (dtSeconds === null ? " V/sample" : " V/s") };
             });
             host.innerHTML =
               '<div class="wave-toolbar">' +
                 '<button type="button" data-action="full">Full View</button>' +
                 '<button type="button" data-action="cursor" class="' + (state.cursorMode ? 'active' : '') + '">' + (state.cursorMode ? 'Click Chart To Place Cursor' : 'Add Cursors') + '</button>' +
                 '<button type="button" data-action="math"' + (cursorDetails.length < 2 ? ' disabled' : '') + '>Add Math</button>' +
-                '<span>' + samples.length.toLocaleString() + ' samples / ' + ((entry.preview && typeof entry.preview.intervalSeconds === "number") ? (((range[1] - range[0]) * entry.preview.intervalSeconds * 1e3).toFixed(3) + ' ms visible') : ((range[1] - range[0]) + ' visible')) + '</span>' +
+                '<span>' + samples.length.toLocaleString() + ' samples / ' + (visibleSpanSeconds !== null ? (formatTimeValue((range[1] - range[0]) * entry.preview.intervalSeconds, visibleSpanSeconds, 1) + ' visible') : ((range[1] - range[0]) + ' visible')) + '</span>' +
               '</div>' +
               '<svg class="wave-chart-svg" viewBox="0 0 1000 360" data-action="chart">' +
                 '<rect x="0" y="0" width="1000" height="360" fill="#ffffff"></rect>' +
@@ -3116,7 +3143,7 @@ function renderInstrumentSessionWindowShellHtml(): string {
                   const y = plotBottom - (plotHeight * fraction);
                   const value = yMin + (ySpan * fraction);
                   return '<line x1="' + plotLeft + '" x2="' + plotRight + '" y1="' + y + '" y2="' + y + '" stroke="#c9d6e4" stroke-width="1"></line>' +
-                    '<text x="6" y="' + Math.max(plotTop + 10, Math.min(plotBottom, y - 4)) + '" fill="#5b6b7f" font-size="11">' + engineeringSample(value) + '</text>';
+                    '<text x="6" y="' + Math.max(plotTop + 10, Math.min(plotBottom, y - 4)) + '" fill="#5b6b7f" font-size="11">' + formatVoltValue(value, ySpan, 0) + '</text>';
                 }).join('') +
                 Array.from({ length: 11 }, function(_, index) {
                   const fraction = index / 10;
@@ -3125,7 +3152,7 @@ function renderInstrumentSessionWindowShellHtml(): string {
                     ? (entry.preview.startTimeSeconds + ((range[0] + (xSpan * fraction)) * entry.preview.intervalSeconds))
                     : Math.round(range[0] + (xSpan * fraction));
                   return '<line x1="' + x + '" x2="' + x + '" y1="' + plotTop + '" y2="' + plotBottom + '" stroke="#d4deea" stroke-width="1"></line>' +
-                    '<text x="' + Math.max(plotLeft, Math.min(plotRight - 72, x + 4)) + '" y="352" fill="#5b6b7f" font-size="11">' + (typeof value === "number" && Math.abs(value) < 1 ? (value * 1e3).toFixed(3) + ' ms' : value) + '</text>';
+                    '<text x="' + Math.max(plotLeft, Math.min(plotRight - 72, x + 4)) + '" y="352" fill="#5b6b7f" font-size="11">' + (visibleSpanSeconds !== null && entry.preview && typeof entry.preview.startTimeSeconds === "number" ? formatTimeValue(value, visibleSpanSeconds, 0) : value) + '</text>';
                 }).join('') +
                 '<path d="' + points + '" fill="none" stroke="#0f766e" stroke-width="2"></path>' +
                 cursorDetails.map(function(cursor) {
@@ -3138,7 +3165,7 @@ function renderInstrumentSessionWindowShellHtml(): string {
               '</svg>' +
               '<input class="wave-slider" type="range" min="0" max="' + Math.max(0, samples.length - (range[1] - range[0])) + '" step="0.01" value="' + Math.min(Math.max(0, samples.length - (range[1] - range[0])), range[0]) + '" data-action="xslider" />' +
               (cursorDetails.length ? '<div class="wave-cursor-list">' + cursorDetails.map(function(cursor) {
-                return '<div class="wave-card"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center;"><div><strong>' + cursor.label + '</strong> <span style="color:#475569;font-size:12px;">' + (((entry.preview && typeof entry.preview.startTimeSeconds === "number" && typeof entry.preview.intervalSeconds === "number") ? (((entry.preview.startTimeSeconds + (cursor.index * entry.preview.intervalSeconds)) * 1e3).toFixed(3) + ' ms') : ('index ' + cursor.index)) + ' · ' + engineeringSample(cursor.sample) + ' V') + '</span></div><button type="button" data-remove-cursor="' + cursor.id + '">Remove</button></div></div>';
+                return '<div class="wave-card"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center;"><div><strong>' + cursor.label + '</strong> <span style="color:#475569;font-size:12px;">' + (((entry.preview && typeof entry.preview.startTimeSeconds === "number" && typeof entry.preview.intervalSeconds === "number") ? formatTimeValue(entry.preview.startTimeSeconds + (cursor.index * entry.preview.intervalSeconds), visibleSpanSeconds, 2) : ('index ' + cursor.index)) + ' · ' + formatVoltValue(cursor.sample, ySpan, 2) + ' V') + '</span></div><button type="button" data-remove-cursor="' + cursor.id + '">Remove</button></div></div>';
               }).join('') + '</div>' : '') +
               (mathRows.length ? '<div class="wave-math-list">' + mathRows.map(function(row) {
                 return '<div class="wave-card">' + row.label + '</div>';
@@ -6035,7 +6062,7 @@ function TestManagerInner({ config }: ModuleProps) {
       <main style={{ minHeight: 0, display: "grid", gridTemplateColumns: section === "run" ? "360px 1fr" : "1fr", gap: "1px", background: C.border, overflow: "hidden" }}>
         {section === "run" ? (
           <>
-            <aside style={{ minHeight: 0, overflowY: "auto", background: C.panel }}>
+            <aside style={{ minHeight: 0, overflowY: "auto", overflowX: "hidden", background: C.panel }}>
               {!definition ? (
                 <div style={{ padding: "1rem", color: C.muted, lineHeight: 1.6 }}>
                   Upload the master YAML test definition to start.
@@ -6047,7 +6074,7 @@ function TestManagerInner({ config }: ModuleProps) {
                     <div style={{ fontWeight: 700, fontSize: "0.92rem", color: "#dbe7f3" }}>{group.title}</div>
                     {group.description ? <div style={{ color: C.muted, fontSize: "0.8rem", marginTop: "0.3rem", lineHeight: 1.45 }}>{group.description}</div> : null}
                   </div>
-                  <div style={{ padding: "0.5rem 0.15rem 0 0.9rem", display: "grid", gap: "0.45rem" }}>
+                  <div style={{ padding: "0.5rem 0.15rem 0 0.9rem", display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: "0.45rem" }}>
                     {group.tests.map((test) => {
                       const resolved = testsById.get(test.id);
                       if (!resolved || !activeRun) return null;
@@ -6062,7 +6089,7 @@ function TestManagerInner({ config }: ModuleProps) {
                           onClick={() => setSelectedTestId(test.id)}
                           onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") setSelectedTestId(test.id); }}
                           style={{
-                            width: "100%",
+                            minWidth: 0,
                             textAlign: "left",
                             border: `1px solid ${selectedTestId === test.id ? C.accent : C.border}`,
                             background: selectedTestId === test.id ? C.accentSoft : "transparent",
