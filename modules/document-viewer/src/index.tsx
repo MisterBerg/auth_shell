@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
-import type { AssetRecord, ModuleProps } from "module-core";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import type { AssetRecord, ModuleProps, AgentModuleSkills } from "module-core";
 import {
   assetMatchesSearch,
   buildAssetVersionKey,
@@ -12,6 +12,7 @@ import {
   useAwsDdbClient,
   useAwsS3Client,
   useEditMode,
+  useRegisterAgentSkills,
   useTableNames,
   useUpdateSlotMeta,
 } from "module-core";
@@ -271,6 +272,63 @@ export default function DocumentViewer({ config }: ModuleProps) {
   const getS3Client    = useAwsS3Client();
   const getDdbClient    = useAwsDdbClient();
   const { assets: assetsTable } = useTableNames();
+
+  const agentSkills = useMemo<AgentModuleSkills>(() => ({
+    instanceId: config.id,
+    moduleName: "module-document-viewer",
+    displayName: "Document Viewer",
+    description: "Swap the PDF document shown in this slot.",
+    skills: [
+      {
+        id: "manage-document",
+        description: "Create a document-viewer slot or replace the PDF it displays.",
+        prompt: "Use create_document_viewer_slot to add a new PDF viewer slot from an existing asset or a local workspace file import, and replace_document_viewer_asset to swap the document in an existing one. Every call needs the slot's full slotPath \u2014 use list_slot_tree (from module-core's workspace skill) if you do not already have it.",
+        tools: [
+  {
+    type: "function",
+    name: "create_document_viewer_slot",
+    description: "Create a document-viewer slot wired either to an existing PDF asset or by importing a local workspace PDF.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        assetId: { type: "string" },
+        workspacePath: { type: "string" },
+        filename: { type: "string" },
+        label: { type: "string" },
+      },
+      required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "replace_document_viewer_asset",
+    description: "Replace the configured document in a document-viewer slot using either an existing asset or a local workspace file import.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        assetId: { type: "string" },
+        workspacePath: { type: "string" },
+        filename: { type: "string" },
+        label: { type: "string" },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  }
+        ],
+      },
+    ],
+  }), [config.id]);
+  useRegisterAgentSkills(agentSkills);
 
   const params       = new URLSearchParams(window.location.search);
   const bucket       = params.get("bucket") ?? "";

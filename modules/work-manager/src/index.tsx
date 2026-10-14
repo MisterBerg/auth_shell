@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ExportContext, ModuleProps } from "module-core";
-import { useAuthContext, useAwsDdbClient, useAwsS3Client, useUserProfile } from "module-core";
+import type { ExportContext, ModuleProps, AgentModuleSkills } from "module-core";
+import { useAuthContext, useAwsDdbClient, useAwsS3Client, useUserProfile, useRegisterAgentSkills } from "module-core";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { ScanCommand } from "@aws-sdk/lib-dynamodb";
 
@@ -748,6 +748,60 @@ function readSavedLayout(): Pick<Filters, "viewMode" | "orientation"> & { splitP
   }
 }
 
+// Shared by the agent-facing tool schemas below — these used to live only in agent-chat, referenced
+// by name from its own tool definitions. Now that this module owns its own skill registration (see
+// useRegisterAgentSkills below), it needs its own copy; agent-chat still executes these tools, this
+// is purely the schema this module advertises for them.
+const WORK_ITEM_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    kind: { type: "string", enum: ["task", "event", "task-event", "milestone"] },
+    title: { type: "string" },
+    description: { type: "string" },
+    notes: { type: "string" },
+    status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
+    priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+    assignee: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    repeatable: { type: "boolean" },
+    startAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date." },
+    durationDays: { type: "integer", minimum: 0 },
+    allDay: { type: "boolean" },
+    location: { type: "string" },
+    progress: { type: "number", minimum: 0, maximum: 100 },
+    dependencies: { type: "array", items: { type: "string" }, description: "Work item ids this item depends on." },
+    dependencyTitles: { type: "array", items: { type: "string" }, description: "Dependency titles to resolve to ids during this operation." },
+    lane: { type: "string" },
+  },
+  required: ["title"],
+  additionalProperties: false,
+} as const;
+
+const WORK_ITEM_PATCH_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: { type: "string", enum: ["task", "event", "task-event", "milestone"] },
+    title: { type: "string" },
+    description: { type: "string" },
+    notes: { type: "string" },
+    status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
+    priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+    assignee: { type: "string" },
+    tags: { type: "array", items: { type: "string" } },
+    repeatable: { type: "boolean" },
+    startAt: { type: "string", description: "ISO timestamp or YYYY-MM-DD date. Empty string clears the date." },
+    durationDays: { type: "integer", minimum: 0 },
+    allDay: { type: "boolean" },
+    location: { type: "string" },
+    progress: { type: "number", minimum: 0, maximum: 100 },
+    dependencies: { type: "array", items: { type: "string" } },
+    dependencyTitles: { type: "array", items: { type: "string" } },
+    lane: { type: "string" },
+  },
+  additionalProperties: false,
+} as const;
+
 export default function WorkManager({ config }: ModuleProps) {
   const user = useUserProfile();
   const auth = useAuthContext();
@@ -755,6 +809,161 @@ export default function WorkManager({ config }: ModuleProps) {
   const getDdbClient = useAwsDdbClient();
   const project = useMemo(() => getProjectInfo(config), [config]);
   const savedLayout = useMemo(() => readSavedLayout(), []);
+
+  const agentSkills = useMemo<AgentModuleSkills>(() => ({
+    instanceId: config.id,
+    moduleName: "module-work-manager",
+    displayName: "Work Manager",
+    description: "Schedule items, milestones, and dependencies for a project timeline.",
+    skills: [
+      {
+        id: "manage-work-items",
+        description: "Create and manage schedule items, milestones, and dependencies inside this work-manager slot.",
+        prompt: "Use list_work_manager_items/create_work_manager_items/update_work_manager_item/delete_work_manager_item for day-to-day edits, attach_project_asset_to_work_item to link a central asset, and replace_work_manager_items only when intentionally replacing the whole schedule (replaceExisting=true). Dependencies can be given by id or by title. Every call needs the slot's full slotPath \u2014 use list_slot_tree (from module-core's workspace skill) if you do not already have it.",
+        tools: [
+  {
+    type: "function",
+    name: "create_work_manager_slot",
+    description: "Create a work-manager slot and optionally seed it with schedule items, milestones, dependencies, lanes, dates, and progress.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        items: {
+          type: "array",
+          items: WORK_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "list_work_manager_items",
+    description: "List work items from a work-manager module slot by its full slot path. Supports text filtering over titles, notes, tags, lanes, assignees, and dependencies.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        query: { type: "string" },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_work_manager_items",
+    description: "Create one or more work-manager schedule items. Dependencies can be provided by id or by title.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        items: {
+          type: "array",
+          minItems: 1,
+          items: WORK_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["slotPath", "items"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_work_manager_item",
+    description: "Update a work-manager item by id. Dependencies can be provided by id or by title.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        itemId: { type: "string" },
+        patch: WORK_ITEM_PATCH_SCHEMA,
+      },
+      required: ["slotPath", "itemId", "patch"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "delete_work_manager_item",
+    description: "Delete a work-manager item by id and remove that id from other items' dependency lists. Set deleteAttachments to also delete attached S3 objects.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        itemId: { type: "string" },
+        deleteAttachments: { type: "boolean" },
+      },
+      required: ["slotPath", "itemId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "attach_project_asset_to_work_item",
+    description: "Attach an existing central project asset version to a work-manager item.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        itemId: { type: "string" },
+        assetId: { type: "string" },
+      },
+      required: ["slotPath", "itemId", "assetId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "replace_work_manager_items",
+    description: "Replace or upsert the complete work-manager schedule from structured items. Use replaceExisting=true only when intentionally replacing the whole schedule.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        replaceExisting: { type: "boolean" },
+        items: {
+          type: "array",
+          items: WORK_ITEM_INPUT_SCHEMA,
+        },
+      },
+      required: ["slotPath", "items"],
+      additionalProperties: false,
+    },
+  }
+        ],
+      },
+    ],
+  }), [config.id]);
+  useRegisterAgentSkills(agentSkills);
 
   const [store, setStore] = useState<WorkStore>({ version: 1, projectId: project.projectId, items: [] });
   const [members, setMembers] = useState<ProjectMember[]>([]);

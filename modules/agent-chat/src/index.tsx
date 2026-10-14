@@ -1,9 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { parse as parseYaml } from "yaml";
+// Authoring guide for module-test-manager's YAML schema, including a full worked example (the
+// fire-hazard test program) — see get_test_manager_schema_guide. Sourced from test-manager's own
+// module directory so there's one copy of the schema documentation, not one per module that needs it.
+import testManagerSchemaGuideMd from "../../test-manager/test-manager-instructions.md?raw";
 import type {
   AssetRecord,
   ChildSlot,
@@ -131,6 +135,9 @@ type ToolExecutionResult = {
   // Set by use_skill: tool definitions to add to the active set for the rest of this run. See
   // runAgentSession, which merges these into its per-turn tools array after each tool result.
   unlockedTools?: ToolDefinition[];
+  // Set alongside unlockedTools by use_skill — identifies which skill they came from, so
+  // runAgentSession can track it as a WarmSkillEntry for future turns (see mergeWarmSkills).
+  unlockedSkillKey?: { moduleName: string; skillId: string };
 };
 
 type ToolDefinition = {
@@ -164,7 +171,7 @@ type GenericSlotToolArgs = {
   meta?: Record<string, unknown>;
   resources?: Resource[];
   title?: string;
-  children?: ChildSlot[];
+  children?: ChildSlotInput[];
   replaceChildren?: boolean;
 };
 
@@ -220,10 +227,23 @@ type PendingContinuation = {
   lastToolMessages: string[];
 };
 
+// A skill whose tools were unlocked via use_skill within the last SKILL_WARM_TURN_WINDOW turns,
+// kept active without needing to re-discover it — see pruneWarmSkills/mergeWarmSkills. lastUsedTurn
+// is the message-history length (see submitUserPrompt) at the point it was last actually unlocked,
+// used as a cheap monotonic turn counter rather than tracking a separate one.
+type WarmSkillEntry = {
+  moduleName: string;
+  skillId: string;
+  tools: ToolDefinition[];
+  lastUsedTurn: number;
+};
+
 type PersistedChatSession = {
   messages: ChatMessage[];
   composer: string;
   pendingContinuation: PendingContinuation | null;
+  // Optional so older persisted sessions (saved before this existed) still parse fine.
+  warmSkills?: WarmSkillEntry[];
 };
 
 type OrganizerItemKind = "note" | "todo" | "follow-up" | "waiting-on" | "idea" | "reminder";
@@ -393,6 +413,9 @@ type AgentRunResult = {
   lastToolMessages: string[];
   pending: PendingContinuation | null;
   shouldNavigate: boolean;
+  // Skills unlocked (via use_skill) at any point during this run — submitUserPrompt folds these
+  // into the persisted warm-skill cache. See mergeWarmSkills/pruneWarmSkills.
+  usedSkills: Array<{ moduleName: string; skillId: string; tools: ToolDefinition[] }>;
 };
 
 type AgentProgressEvent =
@@ -432,41 +455,6 @@ type MarkdownFileInput = {
   mimeType?: string;
 };
 
-type TaskStatus = "open" | "in-progress" | "blocked" | "done" | "archived";
-type TaskPriority = "low" | "normal" | "high" | "urgent";
-
-type TaskAttachment = {
-  id: string;
-  name: string;
-  bucket: string;
-  key: string;
-  size: number;
-  contentType?: string;
-  uploadedAt: string;
-  uploadedBy?: string;
-};
-
-type TaskRecord = {
-  id: string;
-  title: string;
-  description: string;
-  notes: string;
-  status: TaskStatus;
-  priority: TaskPriority;
-  assignee?: string;
-  tags: string[];
-  repeatable: boolean;
-  createdAt: string;
-  updatedAt: string;
-  createdBy?: string;
-  attachments: TaskAttachment[];
-};
-
-type TaskStore = {
-  version: 1;
-  projectId: string;
-  tasks: TaskRecord[];
-};
 
 type WorkKind = "task" | "event" | "task-event" | "milestone";
 type WorkStatus = "open" | "in-progress" | "blocked" | "done" | "archived";
@@ -580,25 +568,48 @@ const MODEL_OPTIONS: Array<{ group: string; options: ModelOption[] }> = [
 const FLAT_MODEL_OPTIONS = MODEL_OPTIONS.flatMap((group) => group.options);
 const DEFAULT_TITLE = "Agent Chat";
 const TOOL_ITERATION_LIMIT = 20;
-const BROWSER_CONTEXT_ITEM_LIMIT = 18;
-const BROWSER_CONTEXT_CHAR_BUDGET = 24000;
-const BROWSER_CONTEXT_SUMMARY_LIMIT = 2800;
+// Raised from 18/24000/2800 after log inspection showed real sessions hitting the old item cap on
+// essentially every single turn — even a few back-and-forth exchanges plus one skill discovery
+// cycle (list_skills/use_skill/get_*_spec) blew past 18 items, so compaction fired constantly and
+// kept re-summarizing the same older turns down to ~240-char lines. That buried a user instruction
+// containing the actual content they wanted written (e.g. "create tests for an ESD spec with 3
+// modules") behind terse restated status updates, and the agent kept re-discovering the skill
+// from scratch each turn instead of ever reaching the write step. These are generous enough to
+// hold a full read-modify-write cycle against a real test-manager YAML spec (which can run tens of
+// KB) without truncating mid-task.
+const BROWSER_CONTEXT_ITEM_LIMIT = 80;
+const BROWSER_CONTEXT_CHAR_BUDGET = 160000;
+const BROWSER_CONTEXT_SUMMARY_LIMIT = 6000;
+// A skill stays "warm" (its tools stay in the active set without re-discovery) for this many turns
+// since it was last actually used, capped to this many skills at once so a long, topically varied
+// session can't just regrow back into "every tool always loaded." Starting guesses — worth tuning
+// against real usage (e.g. via the agent-harness/log-server) rather than treating as final.
+const SKILL_WARM_TURN_WINDOW = 12;
+const SKILL_WARM_MAX_COUNT = 4;
 const DEFAULT_PROMPT = [
-  "You are helping build and evolve this workspace.",
-  "Use the provided workspace tools whenever project structure, assets, resources, or modules are relevant.",
-  "By default, treat 'the app', 'the webapp', 'app data', 'documentation here', and similar phrases as referring to the active project configuration, project assets, and registered resources inside the web app.",
-  "Prefer project assets, registered resources, and root-config information before searching the local bridge workspace unless the user explicitly says workspace, local files, repo, filesystem, or disk, or recent conversation is clearly about local workspace operations.",
-  "Prefer module-native tools for task tracker, work manager, documentation, markdown, document-viewer, links, and webview data when they are available instead of editing their backing files indirectly.",
-  "Some modules (e.g. test manager) expose their own agent skills instead of static tools. Call list_agent_skills whenever the request concerns a specific mounted module you don't already have a loaded skill for, then use_skill before acting on that module's data — do not guess at its file format or edit its backing files indirectly through the bridge.",
-  "Use shell commands only when no better dedicated tool is available, and pay attention to command failures.",
-  "Prefer the managed Python tools for parsing, transformations, text extraction, and small file-oriented programs instead of shell-embedded Python.",
-  "Only install Python packages through the dedicated dependency installer, and only when a missing dependency blocks the task.",
-  "When using run_workspace_command, provide the shell body only. Do not prefix it with powershell, pwsh, cmd, or sh.",
-  "On Windows, assume the bridge will run the command inside PowerShell; set $ErrorActionPreference='Stop' and ensure parent directories exist first when needed.",
-  "If a tool returns an error, read it carefully, explain what failed if asked, and change approach instead of pretending the tool succeeded.",
-  "When changing the workspace, explain what you changed and why.",
-  "Do not claim a change happened unless the tool call succeeded.",
+  "You are the agent for a browser-based project workspace. Help the user build, inspect, and operate it.",
+  "Act through tools. Never claim a change happened unless the tool call succeeded; read errors and change approach.",
+  "Each loaded module below has an exact name in backticks — that exact string is the moduleName argument to list_skills and use_skill, never its display name. Example: list_skills(\"module-work-manager\") returns its skills and mounted instance ids; use_skill(\"module-work-manager\", \"manage-work-items\") then returns the full prompt and tools for that one skill.",
+  "Never edit a module's backing files directly through the shell — go through its own skill instead.",
+  "For anything outside this workspace (general knowledge, \"find a site for X\"), use use_skill(\"module-core\", \"web-search\") rather than searching project data that was never meant to contain it.",
+  "If a skill says something isn't available, tell the user why instead of pretending it worked.",
+  "When your answer relies on a web search result, name or link the source. Keep answers concise.",
+  "Explain what you changed and why.",
 ].join(" ");
+
+// Dedupes the live skill registry down to one entry per module *type* for display — a module can
+// have several mounted instances (two Work Manager slots, say), but its skill descriptions are a
+// property of the code, identical across instances, so listing it once with `module-core` pinned
+// first keeps the always-on prompt from repeating itself as more instances get added.
+function uniqueModuleSkillEntries(moduleSkills: ReadonlyMap<string, AgentModuleSkills>): AgentModuleSkills[] {
+  const byModuleName = new Map<string, AgentModuleSkills>();
+  for (const entry of moduleSkills.values()) {
+    if (!byModuleName.has(entry.moduleName)) byModuleName.set(entry.moduleName, entry);
+  }
+  return [...byModuleName.values()].sort((a, b) =>
+    a.moduleName === "module-core" ? -1 : b.moduleName === "module-core" ? 1 : a.moduleName.localeCompare(b.moduleName)
+  );
+}
 
 const WORK_ITEM_INPUT_SCHEMA = {
   type: "object",
@@ -799,6 +810,36 @@ const ORGANIZER_TIMING_STATE_SCHEMA = {
 const CORE_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
+    name: "list_skills",
+    description: "List the skills one loaded module offers and which mounted instances currently provide them. moduleName must be one of the exact names given in the loaded-modules list (e.g. \"module-work-manager\"), not its display name. Call this before use_skill whenever you're about to act on something specific.",
+    parameters: {
+      type: "object",
+      properties: { moduleName: { type: "string", description: "The exact moduleName from the loaded-modules list, e.g. \"module-core\" or \"module-work-manager\"." } },
+      required: ["moduleName"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "use_skill",
+    description: "Fetch the full prompt and tool definitions for one skill id returned by list_skills for that same moduleName. The returned tools become callable for the rest of this run. Example: use_skill(\"module-core\", \"web-search\").",
+    parameters: {
+      type: "object",
+      properties: {
+        moduleName: { type: "string", description: "The same moduleName passed to list_skills." },
+        skillId: { type: "string", description: "A skill id from list_skills(moduleName)." },
+      },
+      required: ["moduleName", "skillId"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+];
+
+const WORKSPACE_SKILL_TOOLS: AgentSkillToolDefinition[] = [
+  {
+    type: "function",
     name: "get_workspace_summary",
     description: "Read the active project's root config, slot tree, and high-level workspace status.",
     parameters: {
@@ -856,6 +897,39 @@ const CORE_TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    type: "function",
+    name: "list_slot_tree",
+    description: "Return the active app-space slot tree with full slot paths, module bundle keys, metadata, resources, and child counts.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "focus_slot",
+    description: "Navigate the browser to a project if needed, then scroll to and highlight a specific slot path in the current app-space.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        bucket: { type: "string" },
+        configPath: { type: "string" },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+];
+
+const LOCAL_RUNTIME_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   {
     type: "function",
     name: "list_workspace_files",
@@ -1032,58 +1106,6 @@ const CORE_TOOL_DEFINITIONS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
-  {
-    type: "function",
-    name: "list_slot_tree",
-    description: "Return the active app-space slot tree with full slot paths, module bundle keys, metadata, resources, and child counts.",
-    parameters: {
-      type: "object",
-      properties: {},
-      additionalProperties: false,
-    },
-    strict: true,
-  },
-  {
-    type: "function",
-    name: "focus_slot",
-    description: "Navigate the browser to a project if needed, then scroll to and highlight a specific slot path in the current app-space.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        bucket: { type: "string" },
-        configPath: { type: "string" },
-      },
-      required: ["slotPath"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "list_agent_skills",
-    description: "List the agent skills currently on offer, one entry per mounted module instance that has registered any. Each skill is just an id and a one-line description here — call use_skill to get its full instructions and the specific tools it unlocks before acting on that module's data. Call this whenever the user's request concerns a specific mounted module (test manager, task tracker, etc.) and you don't already know which skill applies.",
-    parameters: { type: "object", properties: {}, additionalProperties: false },
-    strict: true,
-  },
-  {
-    type: "function",
-    name: "use_skill",
-    description: "Fetch full instructions and the tool definitions for one skill returned by list_agent_skills. The returned tools become callable for the rest of this run.",
-    parameters: {
-      type: "object",
-      properties: {
-        instanceId: { type: "string", description: "The instanceId from list_agent_skills identifying which mounted module instance offers this skill." },
-        skillId: { type: "string", description: "The skill's id from list_agent_skills." },
-      },
-      required: ["instanceId", "skillId"],
-      additionalProperties: false,
-    },
-    strict: true,
-  },
 ];
 
 const PROJECT_ASSETS_SKILL_TOOLS: AgentSkillToolDefinition[] = [
@@ -1165,88 +1187,74 @@ const PROJECT_ASSETS_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   },
 ];
 
-const CONTENT_SLOTS_SKILL_TOOLS: AgentSkillToolDefinition[] = [
+const SLOT_MANAGEMENT_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   {
     type: "function",
-    name: "create_markdown_file_set",
-    description: "Create a markdown-viewer compatible file set asset and child file assets from provided markdown/text files.",
+    name: "upsert_root_slot",
+    description: "Create or update ONE top-level child slot in the active root config using a published module. Has no children of its own — to nest something under the slot this creates, call upsert_slot separately with parentSlotPath: [slotId].",
     parameters: {
       type: "object",
       properties: {
-        label: { type: "string" },
-        entryPath: { type: "string" },
-        files: {
-          type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            properties: {
-              path: { type: "string" },
-              content: { type: "string" },
-              mimeType: { type: "string" },
-            },
-            required: ["path", "content"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["label", "entryPath", "files"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "create_markdown_slot_from_content",
-    description: "Create a markdown-viewer slot and its backing markdown file-set asset in one operation.",
-    parameters: {
-      type: "object",
-      properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
+        moduleName: { type: "string" },
         slotId: { type: "string" },
         title: { type: "string" },
-        entryPath: { type: "string" },
-        files: {
+        meta: { type: "object", additionalProperties: true },
+        resources: {
           type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            properties: {
-              path: { type: "string" },
-              content: { type: "string" },
-              mimeType: { type: "string" },
-            },
-            required: ["path", "content"],
-            additionalProperties: false,
-          },
+          items: RESOURCE_SCHEMA,
         },
       },
-      required: ["slotId", "title", "entryPath", "files"],
+      required: ["moduleName", "slotId"],
       additionalProperties: false,
     },
   },
   {
     type: "function",
-    name: "create_document_viewer_slot",
-    description: "Create a document-viewer slot wired either to an existing PDF asset or by importing a local workspace PDF.",
+    name: "remove_root_slot",
+    description: "Remove a top-level child slot from the active root config.",
     parameters: {
       type: "object",
       properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
         slotId: { type: "string" },
-        title: { type: "string" },
-        assetId: { type: "string" },
-        workspacePath: { type: "string" },
-        filename: { type: "string" },
-        label: { type: "string" },
       },
-      required: ["slotId", "title"],
+      required: ["slotId"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  {
+    type: "function",
+    name: "upsert_slot",
+    description: "Create or update a slot anywhere in the active app-space tree. Parent path defaults to the root. Each entry in children needs its own moduleName (or an already-resolved app.bucket/app.key) and gets resolved the same way this call's own moduleName does — a multi-level tree can be built in one call this way, one moduleName per level, no need to look up bucket/key yourself.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: {
+          type: "array",
+          items: { type: "string" },
+        },
+        slotId: { type: "string" },
+        moduleName: { type: "string" },
+        title: { type: "string" },
+        meta: { type: "object", additionalProperties: true },
+        resources: {
+          type: "array",
+          items: RESOURCE_SCHEMA,
+        },
+        children: {
+          type: "array",
+          items: { type: "object", additionalProperties: true },
+        },
+        replaceChildren: { type: "boolean" },
+      },
+      required: ["slotId"],
       additionalProperties: false,
     },
   },
   {
     type: "function",
-    name: "read_markdown_slot",
-    description: "Read the current markdown-viewer slot content, including its file-set manifest and truncated file contents.",
+    name: "remove_slot",
+    description: "Remove a slot anywhere in the active app-space tree by its full slot path.",
     parameters: {
       type: "object",
       properties: {
@@ -1255,156 +1263,44 @@ const CONTENT_SLOTS_SKILL_TOOLS: AgentSkillToolDefinition[] = [
           items: { type: "string" },
           minItems: 1,
         },
-        maxCharsPerFile: { type: "integer", minimum: 200, maximum: 50000 },
       },
       required: ["slotPath"],
       additionalProperties: false,
     },
+    strict: true,
   },
   {
     type: "function",
-    name: "replace_markdown_slot_content",
-    description: "Replace a markdown-viewer slot's backing file set in one operation by creating a fresh asset version and rewiring the slot.",
+    name: "update_root_config",
+    description: "Update root-level app-space settings like title/meta, resources, and theme using the existing ModuleConfig contract.",
     parameters: {
       type: "object",
       properties: {
-        slotPath: {
+        moduleName: { type: "string" },
+        meta: { type: "object", additionalProperties: true },
+        resources: {
           type: "array",
-          items: { type: "string" },
-          minItems: 1,
+          items: RESOURCE_SCHEMA,
         },
-        title: { type: "string" },
-        entryPath: { type: "string" },
-        files: {
-          type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            properties: {
-              path: { type: "string" },
-              content: { type: "string" },
-              mimeType: { type: "string" },
-            },
-            required: ["path", "content"],
-            additionalProperties: false,
+        replaceResources: { type: "boolean" },
+        theme: {
+          type: "object",
+          properties: {
+            cssKey: { type: "string" },
+            cssBucket: { type: "string" },
           },
+          additionalProperties: false,
         },
       },
-      required: ["slotPath", "entryPath", "files"],
       additionalProperties: false,
     },
   },
+];
+
+const WEB_SEARCH_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   {
-    type: "function",
-    name: "replace_document_viewer_asset",
-    description: "Replace the configured document in a document-viewer slot using either an existing asset or a local workspace file import.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        assetId: { type: "string" },
-        workspacePath: { type: "string" },
-        filename: { type: "string" },
-        label: { type: "string" },
-      },
-      required: ["slotPath"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "create_links_slot",
-    description: "Create a links module slot with an initial set of links.",
-    parameters: {
-      type: "object",
-      properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        links: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              text: { type: "string" },
-              url: { type: "string" },
-            },
-            required: ["text", "url"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["slotId", "title", "links"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "set_links_slot_items",
-    description: "Replace the configured links inside a links module slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        links: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              text: { type: "string" },
-              url: { type: "string" },
-            },
-            required: ["text", "url"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["slotPath", "links"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "create_webview_slot",
-    description: "Create a webview slot with an initial URL.",
-    parameters: {
-      type: "object",
-      properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        url: { type: "string" },
-      },
-      required: ["slotId", "title", "url"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "set_webview_url",
-    description: "Update the URL inside a webview slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        url: { type: "string" },
-      },
-      required: ["slotPath", "url"],
-      additionalProperties: false,
-    },
-  },
+    type: "web_search",
+  } as unknown as AgentSkillToolDefinition,
 ];
 
 const ORGANIZER_SKILL_TOOLS: AgentSkillToolDefinition[] = [
@@ -1575,65 +1471,6 @@ const ORGANIZER_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   },
   {
     type: "function",
-    name: "list_work_objectives",
-    description: "List larger work objectives that group notes, todos, work-manager tasks, assets, and project subjects into an overarching scope.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        status: { type: "string", enum: ["open", "active", "blocked", "done", "archived"] },
-        includeArchived: { type: "boolean" },
-        limit: { type: "integer", minimum: 1, maximum: 100 },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "create_work_objectives",
-    description: "Create one or more larger work objectives. Use objectives for durable context such as hardware validation scope, vendor testing scope, document procurement scope, or investigation scope.",
-    parameters: {
-      type: "object",
-      properties: {
-        objectives: {
-          type: "array",
-          minItems: 1,
-          items: WORK_OBJECTIVE_INPUT_SCHEMA,
-        },
-      },
-      required: ["objectives"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "update_work_objective",
-    description: "Update a larger work objective by id, including its scope, status, subjects, notes, and links to organizer items, work-manager items, or assets.",
-    parameters: {
-      type: "object",
-      properties: {
-        objectiveId: { type: "string" },
-        patch: WORK_OBJECTIVE_PATCH_SCHEMA,
-      },
-      required: ["objectiveId", "patch"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "archive_work_objective",
-    description: "Archive a larger work objective by id.",
-    parameters: {
-      type: "object",
-      properties: {
-        objectiveId: { type: "string" },
-      },
-      required: ["objectiveId"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
     name: "update_organizer_item",
     description: "Update an existing organizer memory item by id.",
     parameters: {
@@ -1717,656 +1554,60 @@ const ORGANIZER_SKILL_TOOLS: AgentSkillToolDefinition[] = [
   },
 ];
 
-const WORK_MANAGER_SKILL_TOOLS: AgentSkillToolDefinition[] = [
+// Platform capabilities that aren't owned by any mountable module — workspace/slot introspection,
+// local-runtime device access, the project's central asset store, slot/root-config management, and
+// web search. Registered under moduleName "module-core" (the real npm package name every module
+// already depends on) rather than a made-up identifier, and kept separate from this component's own
+// "module-agent-chat" registration below — see the registration call further down for why both live
+// here even though only one of them is actually about this module.
+const MODULE_CORE_SKILLS: AgentSkill[] = [
   {
-    type: "function",
-    name: "create_work_manager_slot",
-    description: "Create a work-manager slot and optionally seed it with schedule items, milestones, dependencies, lanes, dates, and progress.",
-    parameters: {
-      type: "object",
-      properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        items: {
-          type: "array",
-          items: WORK_ITEM_INPUT_SCHEMA,
-        },
-      },
-      required: ["slotId", "title"],
-      additionalProperties: false,
-    },
+    id: "workspace",
+    description: "Inspect the project's structure — slot tree, root config, registered resources, published modules.",
+    prompt: "Use get_workspace_summary for a quick orientation, get_root_config for the exact JSON, list_slot_tree for full slot paths and bundle keys before calling any tool that needs a slotPath, list_registered_resources/list_available_modules to see what's registered or installable, and get_appspace_context for the same snapshot also published to the local bridge.",
+    tools: WORKSPACE_SKILL_TOOLS,
   },
   {
-    type: "function",
-    name: "list_work_manager_items",
-    description: "List work items from a work-manager module slot by its full slot path. Supports text filtering over titles, notes, tags, lanes, assignees, and dependencies.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        query: { type: "string" },
-      },
-      required: ["slotPath"],
-      additionalProperties: false,
-    },
+    id: "local-runtime",
+    description: "Local file/shell/Python/TCP/HTTP access on the developer's machine.",
+    prompt: "These tools only work once the user has turned on local runtime in Settings — check get_workspace_summary or just try a call; if it fails because local runtime is disabled, tell the user rather than pretending it worked. Use run_workspace_command for shell (body only, no powershell/sh prefix — on Windows the bridge runs it in PowerShell) and the managed Python tools instead of shell-embedded Python — the raw shell here is not guaranteed to have python/python3 on PATH even when the managed Python environment does. Use execute_tcp_command for SCPI/LAN instruments. To download anything from a URL (a sample file, a PDF, an image), call execute_http_request directly rather than shell/curl/python one-liners — it fetches the URL itself (local device adapters and plain internet URLs alike) and hands back the bytes, which you can then pass to write_workspace_file or import_workspace_file_as_asset.",
+    tools: LOCAL_RUNTIME_SKILL_TOOLS,
   },
   {
-    type: "function",
-    name: "create_work_manager_items",
-    description: "Create one or more work-manager schedule items. Dependencies can be provided by id or by title.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        items: {
-          type: "array",
-          minItems: 1,
-          items: WORK_ITEM_INPUT_SCHEMA,
-        },
-      },
-      required: ["slotPath", "items"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "update_work_manager_item",
-    description: "Update a work-manager item by id. Dependencies can be provided by id or by title.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        itemId: { type: "string" },
-        patch: WORK_ITEM_PATCH_SCHEMA,
-      },
-      required: ["slotPath", "itemId", "patch"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "delete_work_manager_item",
-    description: "Delete a work-manager item by id and remove that id from other items' dependency lists. Set deleteAttachments to also delete attached S3 objects.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        itemId: { type: "string" },
-        deleteAttachments: { type: "boolean" },
-      },
-      required: ["slotPath", "itemId"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "attach_project_asset_to_work_item",
-    description: "Attach an existing central project asset version to a work-manager item.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        itemId: { type: "string" },
-        assetId: { type: "string" },
-      },
-      required: ["slotPath", "itemId", "assetId"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "replace_work_manager_items",
-    description: "Replace or upsert the complete work-manager schedule from structured items. Use replaceExisting=true only when intentionally replacing the whole schedule.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        replaceExisting: { type: "boolean" },
-        items: {
-          type: "array",
-          items: WORK_ITEM_INPUT_SCHEMA,
-        },
-      },
-      required: ["slotPath", "items"],
-      additionalProperties: false,
-    },
-  },
-];
-
-const TASK_TRACKER_SKILL_TOOLS: AgentSkillToolDefinition[] = [
-  {
-    type: "function",
-    name: "create_task_tracker_slot",
-    description: "Create a task-tracker slot and optionally seed it with initial tasks in one operation.",
-    parameters: {
-      type: "object",
-      properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        tasks: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              title: { type: "string" },
-              description: { type: "string" },
-              notes: { type: "string" },
-              status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
-              priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
-              assignee: { type: "string" },
-              tags: { type: "array", items: { type: "string" } },
-              repeatable: { type: "boolean" },
-            },
-            required: ["title"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["slotId", "title"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "list_task_tracker_tasks",
-    description: "List tasks from a task-tracker module slot by its full slot path.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-      },
-      required: ["slotPath"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "create_task_tracker_tasks",
-    description: "Create one or more tasks inside a task-tracker module slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        tasks: {
-          type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            properties: {
-              title: { type: "string" },
-              description: { type: "string" },
-              notes: { type: "string" },
-              status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
-              priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
-              assignee: { type: "string" },
-              tags: { type: "array", items: { type: "string" } },
-              repeatable: { type: "boolean" },
-            },
-            required: ["title"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["slotPath", "tasks"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "update_task_tracker_task",
-    description: "Update an existing task inside a task-tracker module slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        taskId: { type: "string" },
-        patch: {
-          type: "object",
-          properties: {
-            title: { type: "string" },
-            description: { type: "string" },
-            notes: { type: "string" },
-            status: { type: "string", enum: ["open", "in-progress", "blocked", "done", "archived"] },
-            priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
-            assignee: { type: "string" },
-            tags: { type: "array", items: { type: "string" } },
-            repeatable: { type: "boolean" },
-          },
-          additionalProperties: false,
-        },
-      },
-      required: ["slotPath", "taskId", "patch"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "delete_task_tracker_task",
-    description: "Delete a task from a task-tracker module slot by id.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        taskId: { type: "string" },
-      },
-      required: ["slotPath", "taskId"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "attach_project_asset_to_task",
-    description: "Attach an existing central project asset version to a task-tracker task.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        taskId: { type: "string" },
-        assetId: { type: "string" },
-      },
-      required: ["slotPath", "taskId", "assetId"],
-      additionalProperties: false,
-    },
-  },
-];
-
-const DOCUMENTATION_SKILL_TOOLS: AgentSkillToolDefinition[] = [
-  {
-    type: "function",
-    name: "create_documentation_slot",
-    description: "Create a documentation-viewer slot and initialize it with starter pages and content in one operation.",
-    parameters: {
-      type: "object",
-      properties: {
-        parentSlotPath: { type: "array", items: { type: "string" } },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        pages: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              title: { type: "string" },
-              content: { type: "string" },
-              action: { type: "string", enum: ["child", "sibling"] },
-              afterDocTitle: { type: "string" },
-            },
-            required: ["title"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["slotId", "title"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "read_documentation_tree",
-    description: "Read the manifest and page summaries for a documentation-viewer module slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        includeContent: { type: "boolean" },
-        maxCharsPerDoc: { type: "integer", minimum: 200, maximum: 50000 },
-      },
-      required: ["slotPath"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "search_documentation_content",
-    description: "Search titles and markdown content inside a documentation-viewer module slot and return matching pages with snippets.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        query: { type: "string" },
-        limit: { type: "integer", minimum: 1, maximum: 100 },
-        maxSnippetChars: { type: "integer", minimum: 80, maximum: 4000 },
-      },
-      required: ["slotPath", "query"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "read_documentation_pages",
-    description: "Read specific documentation-viewer pages by doc id, including full or truncated content.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        docIds: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        maxCharsPerDoc: { type: "integer", minimum: 200, maximum: 50000 },
-      },
-      required: ["slotPath", "docIds"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "create_documentation_page",
-    description: "Create a child or sibling page in a documentation-viewer module slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        currentDocId: { type: "string" },
-        title: { type: "string" },
-        action: { type: "string", enum: ["child", "sibling"] },
-        content: { type: "string" },
-      },
-      required: ["slotPath", "currentDocId", "title", "action"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "update_documentation_page",
-    description: "Replace the markdown content of a documentation-viewer page.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        docId: { type: "string" },
-        content: { type: "string" },
-      },
-      required: ["slotPath", "docId", "content"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "rename_documentation_page",
-    description: "Rename a documentation-viewer page title.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        docId: { type: "string" },
-        title: { type: "string" },
-      },
-      required: ["slotPath", "docId", "title"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "move_documentation_page",
-    description: "Reorder or reparent a documentation-viewer page using the module's native move directions.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        docId: { type: "string" },
-        direction: { type: "string", enum: ["up", "down", "promote", "demote"] },
-      },
-      required: ["slotPath", "docId", "direction"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "delete_documentation_page",
-    description: "Delete a page from a documentation-viewer module slot.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-        docId: { type: "string" },
-      },
-      required: ["slotPath", "docId"],
-      additionalProperties: false,
-    },
-  },
-];
-
-const SLOT_MANAGEMENT_SKILL_TOOLS: AgentSkillToolDefinition[] = [
-  {
-    type: "function",
-    name: "upsert_root_slot",
-    description: "Create or update a top-level child slot in the active root config using a published module.",
-    parameters: {
-      type: "object",
-      properties: {
-        moduleName: { type: "string" },
-        slotId: { type: "string" },
-        title: { type: "string" },
-        meta: { type: "object", additionalProperties: true },
-        resources: {
-          type: "array",
-          items: RESOURCE_SCHEMA,
-        },
-      },
-      required: ["moduleName", "slotId"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "remove_root_slot",
-    description: "Remove a top-level child slot from the active root config.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotId: { type: "string" },
-      },
-      required: ["slotId"],
-      additionalProperties: false,
-    },
-    strict: true,
-  },
-  {
-    type: "function",
-    name: "upsert_slot",
-    description: "Create or update a slot anywhere in the active app-space tree using the framework's ChildSlot structure. Parent path defaults to the root.",
-    parameters: {
-      type: "object",
-      properties: {
-        parentSlotPath: {
-          type: "array",
-          items: { type: "string" },
-        },
-        slotId: { type: "string" },
-        moduleName: { type: "string" },
-        title: { type: "string" },
-        meta: { type: "object", additionalProperties: true },
-        resources: {
-          type: "array",
-          items: RESOURCE_SCHEMA,
-        },
-        children: {
-          type: "array",
-          items: { type: "object", additionalProperties: true },
-        },
-        replaceChildren: { type: "boolean" },
-      },
-      required: ["slotId"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "remove_slot",
-    description: "Remove a slot anywhere in the active app-space tree by its full slot path.",
-    parameters: {
-      type: "object",
-      properties: {
-        slotPath: {
-          type: "array",
-          items: { type: "string" },
-          minItems: 1,
-        },
-      },
-      required: ["slotPath"],
-      additionalProperties: false,
-    },
-    strict: true,
-  },
-  {
-    type: "function",
-    name: "update_root_config",
-    description: "Update root-level app-space settings like title/meta, resources, and theme using the existing ModuleConfig contract.",
-    parameters: {
-      type: "object",
-      properties: {
-        moduleName: { type: "string" },
-        meta: { type: "object", additionalProperties: true },
-        resources: {
-          type: "array",
-          items: RESOURCE_SCHEMA,
-        },
-        replaceResources: { type: "boolean" },
-        theme: {
-          type: "object",
-          properties: {
-            cssKey: { type: "string" },
-            cssBucket: { type: "string" },
-          },
-          additionalProperties: false,
-        },
-      },
-      additionalProperties: false,
-    },
-  },
-];
-
-// Built-in agent skills for capabilities that aren't owned by any mountable module (organizer
-// memory, work-manager/task-tracker/documentation data access, project assets, generic content
-// slots, and app-space slot management). Registered by this component itself via
-// useRegisterAgentSkills, same as a real module would — see the registration call below. Kept
-// gated behind list_agent_skills/use_skill rather than always-on for the same reason a module's
-// own tools are: these ~62 tool schemas are the bulk of what used to be sent on every single
-// message regardless of relevance.
-const BUILTIN_AGENT_SKILLS: AgentSkill[] = [
-  {
-    id: "project-assets",
-    description: "List, read, create, import, and export the project's central asset store (text-like files, images, PDFs, etc. shared across modules).",
+    id: "assets",
+    description: "The project's central asset store — list, read, create, import, export.",
     prompt: "Use these tools to work with the project's central asset store — a shared, versioned file store separate from any one module's own data. list_project_assets/read_project_asset for lookup and reading text-like assets; create_text_asset for new inline text content; import_workspace_file_as_asset to pull a local bridge file in; export_project_asset_to_workspace to write one back out to disk for local inspection. Prefer this store over the local bridge workspace for anything meant to persist as part of the project rather than the developer's machine.",
     tools: PROJECT_ASSETS_SKILL_TOOLS,
   },
   {
-    id: "content-slots",
-    description: "Create and edit markdown, document-viewer, links, and webview module slots.",
-    prompt: "Use these tools to create or edit simple content-display slots: markdown file sets (create_markdown_file_set/create_markdown_slot_from_content/read_markdown_slot/replace_markdown_slot_content), document-viewer PDF slots (create_document_viewer_slot/replace_document_viewer_asset), links slots (create_links_slot/set_links_slot_items), and webview slots (create_webview_slot/set_webview_url). These are generic display modules, not data-owning ones — for task tracker, work manager, documentation, or test manager data, use that module's own skill instead.",
-    tools: CONTENT_SLOTS_SKILL_TOOLS,
-  },
-  {
-    id: "organizer",
-    description: "Read and manage the project's organizer memory: work scopes (the durable graph layer), work objectives, and organizer items (notes, todos, follow-ups, reminders, waiting-on).",
-    prompt: "Work scopes are the durable graph layer for broad-to-narrow work context; each scope can have an upstream parentScopeId and downstream child scopes. With little context, start with list_work_scope_index or search_work_scope_graph, then call get_work_scope_context on the best candidate — or get_organizer_overview for one coherent snapshot of the whole board. Use scopes for work context, work objectives for larger multi-step efforts, and organizer items for small notes/todos/reminders/follow-ups/waiting-on entries. Prefer the targeted update tools (update_organizer_item, update_work_scope, batch_update_organizer_items, mark_organizer_items_complete) over replace_organizer_store, which is only for explicit reset/import requests.",
-    tools: ORGANIZER_SKILL_TOOLS,
-  },
-  {
-    id: "work-manager",
-    description: "Create and manage schedule items, milestones, and dependencies inside a work-manager module slot.",
-    prompt: "Use these tools for a work-manager module slot's schedule: list_work_manager_items/create_work_manager_items/update_work_manager_item/delete_work_manager_item for day-to-day edits, attach_project_asset_to_work_item to link a central asset, and replace_work_manager_items only when intentionally replacing the whole schedule (replaceExisting=true). Dependencies can be given by id or by title. Every call needs the slot's full slotPath — use list_slot_tree first if you don't already have it.",
-    tools: WORK_MANAGER_SKILL_TOOLS,
-  },
-  {
-    id: "task-tracker",
-    description: "Create and manage tasks inside a task-tracker module slot.",
-    prompt: "Use these tools for a task-tracker module slot: list_task_tracker_tasks/create_task_tracker_tasks/update_task_tracker_task/delete_task_tracker_task, and attach_project_asset_to_task to link a central asset. Every call needs the slot's full slotPath — use list_slot_tree first if you don't already have it.",
-    tools: TASK_TRACKER_SKILL_TOOLS,
-  },
-  {
-    id: "documentation",
-    description: "Read, search, and edit pages inside a documentation-viewer module slot.",
-    prompt: "Use read_documentation_tree for the page manifest, search_documentation_content or read_documentation_pages before editing anything so you understand what's there, then create_documentation_page/update_documentation_page/rename_documentation_page/move_documentation_page/delete_documentation_page to change it. Every call needs the slot's full slotPath — use list_slot_tree first if you don't already have it.",
-    tools: DOCUMENTATION_SKILL_TOOLS,
-  },
-  {
     id: "slot-management",
-    description: "Create, update, or remove slots anywhere in the app-space tree, and edit root-level app-space settings.",
-    prompt: "These tools change the app's structure itself — adding/removing/reconfiguring slots (upsert_slot/upsert_root_slot/remove_slot/remove_root_slot) and root-level settings like title, resources, and theme (update_root_config). This is different from operating on a module's own data once it's already in place; only reach for these when the user is explicitly asking to add, remove, or reconfigure a module in the layout, not when they just want to read or edit what a mounted module already holds.",
+    description: "Add, remove, or reconfigure slots anywhere in the layout, and root-level settings.",
+    prompt: "These tools change the app's structure itself — adding/removing/reconfiguring slots (upsert_slot/upsert_root_slot/remove_slot/remove_root_slot) and root-level settings like title, resources, and theme (update_root_config). This is different from operating on a module's own data once it's already in place; only reach for these when the user is explicitly asking to add, remove, or reconfigure a module in the layout, not when they just want to read or edit what a mounted module already holds. upsert_root_slot creates exactly one top-level slot and nothing else — it does not accept children. To build a multi-level tree under it: first create the root slot with upsert_root_slot, then one upsert_slot(parentSlotPath: [rootSlotId], children: [...]) call — every entry in children, and anything nested inside those (arbitrarily deep), can give its own moduleName instead of a resolved app.bucket/app.key, resolved the same way the call's own top-level moduleName is. So a whole subtree can be populated in that one call; only the root slot itself needs its own separate upsert_root_slot call first. A slot's moduleName must be a real published module (check list_available_modules if unsure) — documentation pages, task items, and similar content are not slots at all; create the one slot for that module once, then use its own skill's tools to populate content inside it.",
     tools: SLOT_MANAGEMENT_SKILL_TOOLS,
   },
+  {
+    id: "web-search",
+    description: "OpenAI's hosted web search — use for anything outside this workspace.",
+    prompt: "Use this for anything outside this workspace — general knowledge, finding an external site, current information. Don't search project data (assets, organizer, module content) for something that was never meant to be there. When your answer relies on a result from this, name or link the source.",
+    tools: WEB_SEARCH_SKILL_TOOLS,
+  },
 ];
+
+// This component's own skill — everything else it used to claim (project assets, content slots,
+// work manager, task tracker, documentation, slot management) has moved to MODULE_CORE_SKILLS or to
+// each owning module's own registration (see useRegisterAgentSkills in work-manager,
+// documentation-viewer, document-viewer, links, and webview). Organizer memory is genuinely this
+// module instance's own data — a work-scope graph and item list scoped to this chat instance — so
+// it's the one thing that actually belongs here.
+const AGENT_CHAT_SKILLS: AgentSkill[] = [
+  {
+    id: "organizer",
+    description: "Read and manage this instance's organizer memory: work scopes (the durable graph layer) and organizer items (notes, todos, follow-ups, reminders, waiting-on).",
+    prompt: "Work scopes are the durable graph layer for broad-to-narrow work context; each scope can have an upstream parentScopeId and downstream child scopes. With little context, start with list_work_scope_index or search_work_scope_graph, then call get_work_scope_context on the best candidate — or get_organizer_overview for one coherent snapshot of the whole board. Use scopes for work context and organizer items for small notes/todos/reminders/follow-ups/waiting-on entries. Prefer the targeted update tools (update_organizer_item, update_work_scope, batch_update_organizer_items, mark_organizer_items_complete) over replace_organizer_store, which is only for explicit reset/import requests. Before starting a task that will take several steps, record a work scope or a few organizer items naming the plan, and mark each item done as you complete it — if this run is interrupted or picked up again later (by you or the user), check here first instead of assuming nothing has happened.",
+    tools: ORGANIZER_SKILL_TOOLS,
+  },
+];
+
 
 const C = {
   bg: "#07111f",
@@ -2501,22 +1742,48 @@ function normalizeResources(resources: Resource[] | undefined, contextLabel: str
   });
 }
 
-function normalizeChildSlots(children: ChildSlot[] | undefined, contextLabel: string): ChildSlot[] | undefined {
+// What a model actually sends for a nested child is usually shaped like the *top-level* arguments
+// to upsert_slot itself (moduleName + meta, not a resolved app.bucket/app.key) — every level down a
+// tree it builds in one call. ChildSlot itself has no moduleName field, so this widens the accepted
+// input shape to include it.
+type ChildSlotInput = Omit<ChildSlot, "app" | "children"> & {
+  app?: ChildSlot["app"];
+  moduleName?: string;
+  children?: ChildSlotInput[];
+};
+
+function normalizeChildSlots(
+  children: ChildSlotInput[] | undefined,
+  contextLabel: string,
+  registryEntries: ModuleRegistryEntry[],
+): ChildSlot[] | undefined {
   if (!children) return undefined;
   return children.map((child, index) => {
     if (!child?.slotId?.trim()) {
       throw new Error(`${contextLabel} child ${index + 1} is missing slotId.`);
     }
-    if (!child.app?.bucket?.trim() || !child.app?.key?.trim()) {
-      throw new Error(
-        `${contextLabel} child ${child.slotId} is missing app.bucket/app.key. ` +
-        `Nested children must already be full ChildSlot objects.`,
-      );
+    // Resolved the same way upsert_slot/upsert_root_slot resolve their own top-level moduleName —
+    // done recursively here so a multi-level tree can be built in one call using moduleName at every
+    // level, not just the outermost slot.
+    let app = child.app;
+    if (!app?.bucket?.trim() || !app?.key?.trim()) {
+      if (!child.moduleName?.trim()) {
+        throw new Error(
+          `${contextLabel} child ${child.slotId} needs either app.bucket/app.key or moduleName so it can be resolved to a published module.`,
+        );
+      }
+      const entry = findModuleEntry(registryEntries, child.moduleName);
+      if (!entry) {
+        throw new Error(`${contextLabel} child ${child.slotId}: published module not found: ${child.moduleName}`);
+      }
+      app = { bucket: entry.bundleBucket, key: entry.bundlePath };
     }
     return {
-      ...child,
+      slotId: child.slotId,
+      app,
+      meta: child.meta,
       resources: normalizeResources(child.resources, `${contextLabel} child ${child.slotId}`),
-      children: normalizeChildSlots(child.children, `${contextLabel} child ${child.slotId}`),
+      children: normalizeChildSlots(child.children, `${contextLabel} child ${child.slotId}`, registryEntries),
     };
   });
 }
@@ -2596,11 +1863,6 @@ function arrayBufferToBase64(bytes: Uint8Array): string {
 
 function nowIso(): string {
   return new Date().toISOString();
-}
-
-function makeTaskId(): string {
-  const cryptoId = globalThis.crypto?.randomUUID?.();
-  return cryptoId ? `task-${cryptoId}` : `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function makeAttachmentId(): string {
@@ -3550,6 +2812,118 @@ function resolveTestManagerSlotRef(
   return { slotId, slotPath: [slotId] };
 }
 
+function extractDiagramEdgePairs(rawEdges: unknown): Array<{ from: string; to: string }> {
+  if (!Array.isArray(rawEdges)) return [];
+  const pairs: Array<{ from: string; to: string }> = [];
+  for (const edge of rawEdges) {
+    if (Array.isArray(edge)) {
+      const from = typeof edge[0] === "string" ? edge[0] : undefined;
+      const to = typeof edge[1] === "string" ? edge[1] : undefined;
+      if (from && to) pairs.push({ from, to });
+    } else if (edge && typeof edge === "object") {
+      const record = edge as Record<string, unknown>;
+      const from = typeof record["from"] === "string" ? record["from"] : undefined;
+      const to = typeof record["to"] === "string" ? record["to"] : undefined;
+      if (from && to) pairs.push({ from, to });
+    }
+  }
+  return pairs;
+}
+
+// DFS cycle detection. A real cycle here isn't just a validation nitpick: module-test-manager's
+// diagram layout does longest-path leveling with no cycle guard built in originally (since fixed to
+// at least not hang forever on one), so a cyclic graph degrades into nodes scattered arbitrarily far
+// apart instead of a clean flow — exactly the "far left connected to far right" symptom this exists
+// to catch before it's ever written.
+function findGraphCycle(nodeIds: Set<string>, edges: Array<{ from: string; to: string }>): string[] | null {
+  const outgoing = new Map<string, string[]>();
+  for (const edge of edges) {
+    if (!nodeIds.has(edge.from) || !nodeIds.has(edge.to)) continue;
+    outgoing.set(edge.from, [...(outgoing.get(edge.from) ?? []), edge.to]);
+  }
+  const state = new Map<string, 1 | 2>();
+  const stack: string[] = [];
+  const visit = (nodeId: string): string[] | null => {
+    const current = state.get(nodeId);
+    if (current === 1) return [...stack.slice(stack.indexOf(nodeId)), nodeId];
+    if (current === 2) return null;
+    state.set(nodeId, 1);
+    stack.push(nodeId);
+    for (const next of outgoing.get(nodeId) ?? []) {
+      const found = visit(next);
+      if (found) return found;
+    }
+    stack.pop();
+    state.set(nodeId, 2);
+    return null;
+  };
+  for (const nodeId of nodeIds) {
+    const found = visit(nodeId);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Computes the effective node-id set and edge list for a single pre_test_assets entry (type
+// "diagram" or "diagram_ref"), applying add_nodes/update_nodes/nodes/remove_nodes/edges/add_edges
+// from its patch (if any) on top of the referenced base diagram — mirrors applyDiagramPatch in
+// test-manager's own renderer closely enough to catch a cycle a patch introduces on top of an
+// otherwise-fine base diagram, which is exactly how this class of bug reached a live spec once
+// already. remove_edges is intentionally not modeled: skipping an edge removal can only make this
+// check more conservative (flag a cycle that patch would've actually removed), never miss a real one.
+function effectiveDiagramGraph(
+  entry: Record<string, unknown>,
+  diagrams: Record<string, unknown>,
+): { nodeIds: Set<string>; edges: Array<{ from: string; to: string }> } | null {
+  const type = typeof entry["type"] === "string" ? entry["type"] : "";
+  if (type !== "diagram" && type !== "diagram_ref") return null;
+
+  let baseNodeIds = new Set<string>();
+  let baseEdges: Array<{ from: string; to: string }> = [];
+  const baseRecord: Record<string, unknown> | null = type === "diagram_ref"
+    ? (() => {
+        const diagramId = typeof entry["diagram"] === "string" ? entry["diagram"] : "";
+        const base = diagramId ? diagrams[diagramId] : undefined;
+        return (base && typeof base === "object" && !Array.isArray(base)) ? base as Record<string, unknown> : null;
+      })()
+    : (() => {
+        const inlineDiagram = entry["diagram"];
+        return (inlineDiagram && typeof inlineDiagram === "object" && !Array.isArray(inlineDiagram)) ? inlineDiagram as Record<string, unknown> : null;
+      })();
+  if (!baseRecord) return null;
+  const nodesValue = baseRecord["nodes"];
+  if (nodesValue && typeof nodesValue === "object" && !Array.isArray(nodesValue)) {
+    baseNodeIds = new Set(Object.keys(nodesValue as Record<string, unknown>));
+  }
+  baseEdges = extractDiagramEdgePairs(baseRecord["edges"]);
+
+  const patch = entry["patch"];
+  const patchRecord = (patch && typeof patch === "object" && !Array.isArray(patch)) ? patch as Record<string, unknown> : null;
+  if (!patchRecord) return { nodeIds: baseNodeIds, edges: baseEdges };
+
+  const nodeIds = new Set(baseNodeIds);
+  for (const key of ["add_nodes", "update_nodes", "nodes"]) {
+    const value = patchRecord[key];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const id of Object.keys(value as Record<string, unknown>)) nodeIds.add(id);
+    }
+  }
+  if (Array.isArray(patchRecord["remove_nodes"])) {
+    for (const id of patchRecord["remove_nodes"] as unknown[]) {
+      if (typeof id === "string") nodeIds.delete(id);
+    }
+  }
+
+  const edges = Array.isArray(patchRecord["edges"])
+    ? extractDiagramEdgePairs(patchRecord["edges"])
+    : [...baseEdges];
+  if (Array.isArray(patchRecord["add_edges"])) {
+    edges.push(...extractDiagramEdgePairs(patchRecord["add_edges"]));
+  }
+
+  return { nodeIds, edges };
+}
+
 function inspectTestManagerYaml(text: string) {
   const issues: string[] = [];
   const warnings: string[] = [];
@@ -3604,9 +2978,105 @@ function inspectTestManagerYaml(text: string) {
     issues.push("Missing top-level 'test_groups' array.");
   }
 
+  // `diagrams` renders from a mapping of id -> definition (Object.entries at parse time); a list
+  // here silently becomes an empty diagram set with no error from the actual parser, so this is
+  // caught explicitly rather than relying on the lenient runtime normalizer to say anything.
+  if (root["diagrams"] !== undefined && (typeof root["diagrams"] !== "object" || root["diagrams"] === null || Array.isArray(root["diagrams"]))) {
+    issues.push("'diagrams' must be a mapping of diagram id -> definition (e.g. \"diagrams:\\n  my-diagram:\\n    title: ...\\n    layout: left-to-right\\n    nodes: {...}\\n    edges: [...]\"), not a list. Each key becomes the id referenced by pre_test_assets/diagram_ref and by a test's own pre_test_assets patch. Call get_test_manager_schema_guide for the real shape and a worked example.");
+  } else {
+    for (const [diagramId, diagramValue] of Object.entries(diagrams)) {
+      const diagram = (diagramValue && typeof diagramValue === "object" && !Array.isArray(diagramValue)) ? diagramValue as Record<string, unknown> : null;
+      if (!diagram) {
+        issues.push(`diagrams.${diagramId} must be an object with nodes/edges, not a list or scalar.`);
+        continue;
+      }
+      if (diagram["nodes"] !== undefined && (typeof diagram["nodes"] !== "object" || diagram["nodes"] === null || Array.isArray(diagram["nodes"]))) {
+        issues.push(`diagrams.${diagramId}.nodes must be a mapping of node id -> { label, note, tone, badge }, not a list.`);
+      }
+      if (diagram["edges"] !== undefined && !Array.isArray(diagram["edges"])) {
+        issues.push(`diagrams.${diagramId}.edges must be a list.`);
+      } else if (Array.isArray(diagram["edges"])) {
+        (diagram["edges"] as unknown[]).forEach((edge, edgeIndex) => {
+          const isTuple = Array.isArray(edge) && edge.length >= 2;
+          const isObject = edge && typeof edge === "object" && !Array.isArray(edge) && "from" in (edge as Record<string, unknown>) && "to" in (edge as Record<string, unknown>);
+          if (!isTuple && !isObject) {
+            issues.push(`diagrams.${diagramId}.edges[${edgeIndex}] must be either [from, to, label?] or { from, to, label?, tone? }.`);
+          }
+        });
+      }
+
+      const diagramNodeIds = (diagram["nodes"] && typeof diagram["nodes"] === "object" && !Array.isArray(diagram["nodes"]))
+        ? new Set(Object.keys(diagram["nodes"] as Record<string, unknown>))
+        : new Set<string>();
+      const diagramCycle = findGraphCycle(diagramNodeIds, extractDiagramEdgePairs(diagram["edges"]));
+      if (diagramCycle) {
+        issues.push(`diagrams.${diagramId} has a cycle (${diagramCycle.join(" -> ")}) — diagrams must be a DAG. A loop makes the layout degrade badly (nodes end up scattered arbitrarily far apart instead of a clean flow) rather than erroring, so this has to be caught here. Remove the edge that closes the loop, or represent repetition/retry semantics with a label or annotation instead of an edge back to an earlier node.`);
+      }
+    }
+  }
+
+  const checkDiagramCycles = (value: unknown, source: string) => {
+    if (!Array.isArray(value)) return;
+    value.forEach((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return;
+      const graph = effectiveDiagramGraph(entry as Record<string, unknown>, diagrams);
+      if (!graph) return;
+      const cycle = findGraphCycle(graph.nodeIds, graph.edges);
+      if (cycle) {
+        issues.push(`${source}.pre_test_assets[${index}] resolves to a cyclic diagram (${cycle.join(" -> ")}) — a patch's add_edges (or an inline diagram's own edges) created a path back to an earlier node. Diagrams must be a DAG, or the layout degrades into nodes scattered arbitrarily far apart instead of a clean flow. Remove the edge that closes the loop, or represent repetition/retry semantics with a label or annotation instead of an actual edge back to an earlier node.`);
+      }
+    });
+  };
+  checkDiagramCycles(program?.["pre_test_assets"], "program");
+
+  // program is meant to be small (name/title/description/pre_test_assets/instruments) — other
+  // metadata (module inventories, fault modes, etc.) belongs in linked_values or a diagram, since
+  // nothing else in program is read anywhere in the module.
+  if (program) {
+    const knownProgramKeys = new Set(["id", "name", "title", "system_name", "description", "pre_test_assets", "instruments"]);
+    for (const key of Object.keys(program)) {
+      if (!knownProgramKeys.has(key)) {
+        warnings.push(`program.${key} is not read anywhere in the module and will be silently ignored — module/component inventories belong in linked_values, not program.`);
+      }
+    }
+  }
+
+  const knownRootKeys = new Set(["program", "diagrams", "instruments", "steps", "procedures", "linked_values", "input_fields", "test_defined_fields", "test_groups"]);
+  for (const key of Object.keys(root)) {
+    if (!knownRootKeys.has(key)) {
+      warnings.push(`Top-level key "${key}" is not part of the schema and will be ignored (recognized keys: ${[...knownRootKeys].join(", ")}).`);
+    }
+  }
+
   const groupIds = new Set<string>();
   const testIds = new Set<string>();
   let totalTests = 0;
+  let testsMissingProcedureSteps = 0;
+  const knownStepOrProcedureIds = new Set([...Object.keys(steps), ...Object.keys(procedures)]);
+
+  const checkProcedureRefs = (value: unknown, source: string) => {
+    if (value === undefined) return;
+    if (typeof value === "string") {
+      if (!knownStepOrProcedureIds.has(value)) {
+        issues.push(`${source} references unknown step or procedure "${value}".`);
+      }
+      return;
+    }
+    if (!Array.isArray(value)) {
+      issues.push(`${source} must be a list of step/procedure refs (strings, or { ref: <id> } objects).`);
+      return;
+    }
+    for (const entry of value) {
+      const ref = typeof entry === "string" ? entry : (entry && typeof entry === "object" && !Array.isArray(entry)) ? (entry as Record<string, unknown>)["ref"] : undefined;
+      if (typeof ref === "string" && ref) {
+        if (!knownStepOrProcedureIds.has(ref)) {
+          issues.push(`${source} references unknown step or procedure "${ref}".`);
+        }
+      } else if (!(entry && typeof entry === "object" && !Array.isArray(entry) && "step" in (entry as Record<string, unknown>))) {
+        issues.push(`${source} has an entry that is neither a step/procedure ref nor an inline { step: {...} } definition.`);
+      }
+    }
+  };
 
   for (const [groupIndex, groupValue] of testGroups.entries()) {
     const group = (groupValue && typeof groupValue === "object" && !Array.isArray(groupValue))
@@ -3624,6 +3094,9 @@ function inspectTestManagerYaml(text: string) {
       if (groupIds.has(groupId)) issues.push(`Duplicate test group id "${groupId}".`);
       groupIds.add(groupId);
     }
+    const groupProcedureRef = group["test_steps"] ?? group["procedure"];
+    if (groupProcedureRef !== undefined) checkProcedureRefs(groupProcedureRef, `test_groups[${groupIndex}] (${groupId || "?"}).test_steps`);
+    checkDiagramCycles(group["pre_test_assets"], `test_groups[${groupIndex}] (${groupId || "?"})`);
 
     const tests = Array.isArray(group["tests"]) ? group["tests"] as unknown[] : [];
     if (!Array.isArray(group["tests"])) {
@@ -3648,6 +3121,20 @@ function inspectTestManagerYaml(text: string) {
         if (testIds.has(testId)) issues.push(`Duplicate test id "${testId}".`);
         testIds.add(testId);
       }
+
+      const testProcedureRef = test["test_steps"] ?? test["procedure"];
+      const label = testId || testTitle || `${groupIndex}.${testIndex}`;
+      checkDiagramCycles(test["pre_test_assets"], `test "${label}"`);
+      if (testProcedureRef !== undefined) {
+        checkProcedureRefs(testProcedureRef, `test "${label}".test_steps`);
+      } else if (groupProcedureRef === undefined) {
+        testsMissingProcedureSteps += 1;
+        if (test["steps"] !== undefined) {
+          issues.push(`test "${label}" has a "steps" field, which the renderer never reads — procedure content must be under "test_steps" (a list of { ref: <id> } pointing into the top-level steps/procedures maps), not inline "steps"/"expected" text. See get_test_manager_schema_guide.`);
+        } else {
+          warnings.push(`test "${label}" has no test_steps (on itself or its group) — it will show with an empty procedure checklist. Reference reusable entries via test_steps: [{ref: <step_or_procedure_id>}].`);
+        }
+      }
     }
   }
 
@@ -3670,6 +3157,9 @@ function inspectTestManagerYaml(text: string) {
   }
 
   const programAssets = Array.isArray(program?.["pre_test_assets"]) ? program?.["pre_test_assets"] as unknown[] : [];
+  if (programAssets.length > 0) {
+    warnings.push(`program.pre_test_assets has ${programAssets.length} entr${programAssets.length === 1 ? "y" : "ies"} — these render ONLY on the program overview page, never on an individual test. If any of them were meant to illustrate a specific test, move that entry to that test's own pre_test_assets (or its group's, for a shared default) instead.`);
+  }
 
   return {
     ok: issues.length === 0,
@@ -3687,6 +3177,7 @@ function inspectTestManagerYaml(text: string) {
         programAssets: programAssets.length,
         testGroups: testGroups.length,
         tests: totalTests,
+        testsMissingProcedureSteps,
       },
       groupIds: [...groupIds],
       testIdsSample: [...testIds].slice(0, 20),
@@ -3695,58 +3186,81 @@ function inspectTestManagerYaml(text: string) {
   };
 }
 
-function getTaskTrackerStorage(slotConfig: ModuleConfig, configBucket: string, configPath: string, projectId: string) {
-  const projectDir = dirnamePath(configPath);
-  const basePrefix = projectDir ? `${projectDir}/tasks/${slotConfig.id}` : `tasks/${slotConfig.id}`;
-  return {
-    bucket: configBucket,
-    projectId,
-    basePrefix,
-    tasksKey: `${basePrefix}/tasks.json`,
-    attachmentsPrefix: `${basePrefix}/attachments`,
-  };
+const TEST_MANAGER_STATUS_OPTIONS = ["not-run", "in-progress", "pass", "fail", "blocked"];
+
+type TestManagerCaseInfo = {
+  testId: string;
+  groupId: string;
+  groupTitle: string;
+  testTitle: string;
+  description?: string;
+};
+
+function listTestManagerCasesFromYaml(text: string): TestManagerCaseInfo[] {
+  const root = parseYaml(text) as Record<string, unknown> | null;
+  const testGroups = Array.isArray(root?.["test_groups"]) ? root!["test_groups"] as unknown[] : [];
+  const cases: TestManagerCaseInfo[] = [];
+  for (const groupValue of testGroups) {
+    const group = (groupValue && typeof groupValue === "object" && !Array.isArray(groupValue)) ? groupValue as Record<string, unknown> : null;
+    if (!group) continue;
+    const groupId = typeof group["id"] === "string" ? group["id"] : "";
+    const groupTitle = typeof group["title"] === "string" ? group["title"] : groupId;
+    const tests = Array.isArray(group["tests"]) ? group["tests"] as unknown[] : [];
+    for (const testValue of tests) {
+      const test = (testValue && typeof testValue === "object" && !Array.isArray(testValue)) ? testValue as Record<string, unknown> : null;
+      const testId = typeof test?.["id"] === "string" ? test["id"] as string : "";
+      if (!testId) continue;
+      cases.push({
+        testId,
+        groupId,
+        groupTitle,
+        testTitle: typeof test?.["title"] === "string" ? test["title"] as string : testId,
+        description: typeof test?.["description"] === "string" ? test["description"] as string : undefined,
+      });
+    }
+  }
+  return cases;
 }
 
-function defaultTaskRecord(userEmail?: string, partial?: Partial<TaskRecord>): TaskRecord {
-  const at = nowIso();
-  return {
-    id: partial?.id ?? makeTaskId(),
-    title: partial?.title ?? "New task",
-    description: partial?.description ?? "",
-    notes: partial?.notes ?? "",
-    status: partial?.status ?? "open",
-    priority: partial?.priority ?? "normal",
-    assignee: partial?.assignee,
-    tags: partial?.tags ?? [],
-    repeatable: partial?.repeatable ?? false,
-    createdAt: partial?.createdAt ?? at,
-    updatedAt: partial?.updatedAt ?? at,
-    createdBy: partial?.createdBy ?? userEmail,
-    attachments: partial?.attachments ?? [],
-  };
-}
+type TestManagerResultRecord = {
+  status: string;
+  inputValues?: Record<string, unknown>;
+  notes?: string;
+  stepResultsById?: Record<string, unknown>;
+  typedArtifacts?: Record<string, unknown>;
+  supportingArtifacts?: unknown[];
+  startedAt?: string;
+  updatedAt?: string;
+  updatedBy?: string;
+  inputFingerprint?: string;
+};
 
-async function loadTaskTrackerStore(
-  getS3Client: ReturnType<typeof useAwsS3Client>,
-  slotConfig: ModuleConfig,
-  configBucket: string,
-  configPath: string,
-  projectId: string,
-): Promise<{ storage: ReturnType<typeof getTaskTrackerStorage>; store: TaskStore }> {
-  const storage = getTaskTrackerStorage(slotConfig, configBucket, configPath, projectId);
-  const store = await readOptionalJsonObject<TaskStore>(getS3Client, storage.bucket, storage.tasksKey);
-  return {
-    storage,
-    store: store ?? { version: 1, projectId: storage.projectId, tasks: [] },
-  };
-}
+type TestManagerRun = {
+  id: string;
+  label?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  overviewNotes?: string;
+  overviewArtifacts?: unknown[];
+  instrumentSessions?: unknown[];
+  resultsByTestId?: Record<string, TestManagerResultRecord>;
+  excludedTestIds?: string[];
+  excludedTestReasons?: Record<string, string>;
+  definitionSnapshot?: string;
+};
 
-async function saveTaskTrackerStore(
-  getS3Client: ReturnType<typeof useAwsS3Client>,
-  storage: ReturnType<typeof getTaskTrackerStorage>,
-  store: TaskStore,
-): Promise<void> {
-  await writeJsonObject(getS3Client, storage.bucket, storage.tasksKey, store);
+type TestManagerWorkspace = {
+  version?: number;
+  projectId?: string;
+  activeRunId?: string;
+  runs: TestManagerRun[];
+};
+
+function resolveTestManagerRun(workspace: TestManagerWorkspace, runId?: string | null): TestManagerRun {
+  const targetId = runId?.trim() || workspace.activeRunId;
+  const run = (targetId ? workspace.runs.find((r) => r.id === targetId) : undefined) ?? workspace.runs[0];
+  if (!run) throw new Error("This test-manager slot has no runs yet. Create one with create_test_manager_run first.");
+  return run;
 }
 
 function getWorkManagerStorage(slotConfig: ModuleConfig, configBucket: string, configPath: string, projectId: string) {
@@ -3979,196 +3493,6 @@ async function createProjectAssetFromBytes(args: {
   return { assetId, versionId, bucket: args.bucket, key, mimeType: args.mimeType, sizeBytes: args.bytes.byteLength };
 }
 
-async function createMarkdownFileSetAsset(args: {
-  getS3Client: ReturnType<typeof useAwsS3Client>;
-  getDdbClient: ReturnType<typeof useAwsDdbClient>;
-  assetsTable: string;
-  projectId: string;
-  bucket: string;
-  label: string;
-  entryPath: string;
-  files: MarkdownFileInput[];
-  moduleInstanceId: string;
-}) {
-  const fileSetAssetId = createAssetId();
-  const fileSetVersionId = createAssetVersionId();
-  const versionRoot = [
-    "projects",
-    encodeURIComponent(args.projectId).replace(/%20/g, "-"),
-    "assets",
-    encodeURIComponent(fileSetAssetId).replace(/%20/g, "-"),
-    "versions",
-    encodeURIComponent(fileSetVersionId).replace(/%20/g, "-"),
-  ].join("/");
-  const filesPrefix = `${versionRoot}/files`;
-  const manifestKey = `${versionRoot}/manifest.json`;
-  const s3 = await args.getS3Client(args.bucket);
-  const ddb = await args.getDdbClient();
-  const childAssetRefs: Array<{ path: string; assetId: string; versionId: string; key: string; mimeType: string; sizeBytes: number }> = [];
-
-  for (const file of args.files) {
-    const bytes = new TextEncoder().encode(file.content);
-    const key = `${filesPrefix}/${file.path}`;
-    const mimeType = file.mimeType ?? guessMimeType(file.path, "text/plain");
-    await s3.send(new PutObjectCommand({
-      Bucket: args.bucket,
-      Key: key,
-      Body: bytes,
-      ContentType: mimeType,
-    }));
-    const assetId = createAssetId();
-    const versionId = createAssetVersionId();
-    await createAsset({
-      ddb,
-      tableName: args.assetsTable,
-      asset: createAssetRecord({
-        projectId: args.projectId,
-        assetId,
-        label: basename(file.path),
-        version: {
-          versionId,
-          bucket: args.bucket,
-          key,
-          mimeType,
-          sizeBytes: bytes.byteLength,
-        },
-        meta: {
-          kind: "file",
-          parentAssetId: fileSetAssetId,
-          path: file.path,
-          moduleInstanceId: args.moduleInstanceId,
-          moduleType: "module-markdown-viewer",
-        },
-      }),
-    });
-    childAssetRefs.push({ path: file.path, assetId, versionId, key, mimeType, sizeBytes: bytes.byteLength });
-  }
-
-  const manifestBytes = new TextEncoder().encode(JSON.stringify({
-    kind: "markdown-file-set",
-    entryPath: args.entryPath,
-    moduleInstanceId: args.moduleInstanceId,
-    files: childAssetRefs,
-  }, null, 2));
-
-  await s3.send(new PutObjectCommand({
-    Bucket: args.bucket,
-    Key: manifestKey,
-    Body: manifestBytes,
-    ContentType: "application/json",
-  }));
-
-  await createAsset({
-    ddb,
-    tableName: args.assetsTable,
-    asset: createAssetRecord({
-      projectId: args.projectId,
-      assetId: fileSetAssetId,
-      label: args.label,
-      version: {
-        versionId: fileSetVersionId,
-        bucket: args.bucket,
-        key: manifestKey,
-        mimeType: "application/json",
-        sizeBytes: manifestBytes.byteLength,
-      },
-      meta: {
-        kind: "file-set",
-        entryPath: args.entryPath,
-        moduleInstanceId: args.moduleInstanceId,
-        moduleType: "module-markdown-viewer",
-        fileCount: args.files.length,
-      },
-    }),
-  });
-
-  return {
-    assetId: fileSetAssetId,
-    versionId: fileSetVersionId,
-    bucket: args.bucket,
-    manifestKey,
-    prefix: filesPrefix,
-    rootKey: `${filesPrefix}/${args.entryPath}`,
-    fileCount: args.files.length,
-  };
-}
-
-async function readMarkdownSlotState(args: {
-  getS3Client: ReturnType<typeof useAwsS3Client>;
-  slot: ChildSlot;
-  configBucket: string;
-  maxCharsPerFile?: number;
-}) {
-  const meta = (args.slot.meta ?? {}) as Record<string, unknown>;
-  const bucket = typeof meta["bucket"] === "string" && meta["bucket"]
-    ? meta["bucket"]
-    : args.configBucket;
-  const rootKey = typeof meta["rootKey"] === "string" ? meta["rootKey"] : "";
-  const manifestKey = typeof meta["manifestKey"] === "string" ? meta["manifestKey"] : "";
-  const assetId = typeof meta["assetId"] === "string" ? meta["assetId"] : undefined;
-  const versionId = typeof meta["versionId"] === "string" ? meta["versionId"] : undefined;
-  const maxCharsPerFile = Math.max(200, Math.min(args.maxCharsPerFile ?? 12000, 50000));
-
-  if (!rootKey) {
-    throw new Error(`Markdown slot ${args.slot.slotId} does not have a rootKey configured.`);
-  }
-
-  const files: Array<{
-    path: string;
-    key: string;
-    mimeType?: string;
-    assetId?: string;
-    versionId?: string;
-    content: string;
-    contentPreview: string;
-  }> = [];
-
-  let entryPath = basename(rootKey);
-  let prefix = dirnamePath(rootKey);
-
-  if (manifestKey) {
-    const manifest = JSON.parse(await readTextObject(args.getS3Client, bucket, manifestKey)) as {
-      entryPath?: string;
-      files?: Array<{ path?: string; key?: string; mimeType?: string; assetId?: string; versionId?: string }>;
-    };
-    entryPath = manifest.entryPath || entryPath;
-    if (Array.isArray(manifest.files)) {
-      for (const file of manifest.files) {
-        if (!file?.path || !file?.key) continue;
-        const content = await readTextObject(args.getS3Client, bucket, file.key);
-        files.push({
-          path: file.path,
-          key: file.key,
-          mimeType: file.mimeType,
-          assetId: file.assetId,
-          versionId: file.versionId,
-          content: content.slice(0, maxCharsPerFile),
-          contentPreview: content.slice(0, 600),
-        });
-      }
-    }
-  } else {
-    const content = await readTextObject(args.getS3Client, bucket, rootKey);
-    files.push({
-      path: basename(rootKey),
-      key: rootKey,
-      mimeType: guessMimeType(rootKey, "text/plain"),
-      content: content.slice(0, maxCharsPerFile),
-      contentPreview: content.slice(0, 600),
-    });
-  }
-
-  return {
-    bucket,
-    prefix,
-    rootKey,
-    manifestKey: manifestKey || undefined,
-    assetId,
-    versionId,
-    entryPath,
-    files,
-  };
-}
 
 function flattenSlots(children: ChildSlot[] | undefined, depth = 0): Array<{
   slotId: string;
@@ -4338,20 +3662,25 @@ function toInputItems(messages: ChatMessage[]): InputMessageItem[] {
 function summarizeInputItem(item: InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem): string {
   if ((item as FunctionCallOutputItem).type === "function_call_output") {
     const outputItem = item as FunctionCallOutputItem;
-    const snippet = outputItem.output.replace(/\s+/g, " ").slice(0, 220);
+    const snippet = outputItem.output.replace(/\s+/g, " ").slice(0, 300);
     return `tool-output ${outputItem.call_id}: ${snippet}`;
   }
 
   if ((item as ResponsesApiFunctionCall).type === "function_call") {
     const call = item as ResponsesApiFunctionCall;
-    const args = call.arguments.replace(/\s+/g, " ").slice(0, 180);
+    const args = call.arguments.replace(/\s+/g, " ").slice(0, 240);
     return `tool-call ${call.name}: ${args}`;
   }
 
   if ((item as InputMessageItem).type === "message") {
     const message = item as InputMessageItem;
-    const text = message.content.map((part) => part.text).join(" ").replace(/\s+/g, " ").slice(0, 240);
-    return `${message.role}: ${text}`;
+    // User-authored messages are never re-derivable the way a tool result is — the user's stated
+    // intent (e.g. exact content they want written) has to survive compaction intact, or the agent
+    // ends up re-asking for information it was already given. Assistant messages can stay short
+    // since they're just restating what the agent already did.
+    const text = message.content.map((part) => part.text).join(" ").replace(/\s+/g, " ");
+    const limit = message.role === "user" ? 600 : 240;
+    return `${message.role}: ${text.length > limit ? `${text.slice(0, limit)}...` : text}`;
   }
 
   const raw = JSON.stringify(item);
@@ -4405,6 +3734,43 @@ function repairToolHistoryItems(inputItems: Array<InputMessageItem | ResponsesAp
     }
     return true;
   });
+}
+
+function warmSkillKey(entry: { moduleName: string; skillId: string }): string {
+  return `${entry.moduleName}::${entry.skillId}`;
+}
+
+// Drops anything not used within SKILL_WARM_TURN_WINDOW turns, then keeps only the
+// SKILL_WARM_MAX_COUNT most-recently-used of what's left — see the constants' own comment for why
+// both a window and a cap are needed together.
+function pruneWarmSkills(entries: WarmSkillEntry[], currentTurn: number): WarmSkillEntry[] {
+  return entries
+    .filter((entry) => currentTurn - entry.lastUsedTurn <= SKILL_WARM_TURN_WINDOW)
+    .sort((a, b) => b.lastUsedTurn - a.lastUsedTurn)
+    .slice(0, SKILL_WARM_MAX_COUNT);
+}
+
+// Folds skills actually unlocked this run into the (already-pruned) warm set, refreshing
+// lastUsedTurn for anything reused and re-applying the cap in case this pushed it over.
+function mergeWarmSkills(
+  pruned: WarmSkillEntry[],
+  used: Array<{ moduleName: string; skillId: string; tools: ToolDefinition[] }>,
+  currentTurn: number,
+): WarmSkillEntry[] {
+  if (!used.length) return pruned;
+  const byKey = new Map(pruned.map((entry) => [warmSkillKey(entry), entry]));
+  for (const entry of used) {
+    byKey.set(warmSkillKey(entry), { ...entry, lastUsedTurn: currentTurn });
+  }
+  return [...byKey.values()].sort((a, b) => b.lastUsedTurn - a.lastUsedTurn).slice(0, SKILL_WARM_MAX_COUNT);
+}
+
+function warmToolsFrom(entries: WarmSkillEntry[]): ToolDefinition[] {
+  const byName = new Map<string, ToolDefinition>();
+  for (const entry of entries) {
+    for (const tool of entry.tools) byName.set(tool.name, tool);
+  }
+  return [...byName.values()];
 }
 
 function compactInputItems(inputItems: Array<InputMessageItem | ResponsesApiOutputItem | FunctionCallOutputItem>) {
@@ -5122,92 +4488,6 @@ async function executeTool(args: {
       };
     }
 
-    case "create_markdown_file_set": {
-      const parsed = parseToolArgs<{
-        label: string;
-        entryPath: string;
-        files: MarkdownFileInput[];
-      }>(toolCall.arguments);
-      if (!assetsTable) throw new Error("Project asset table is not configured.");
-      const created = await createMarkdownFileSetAsset({
-        getS3Client,
-        getDdbClient,
-        assetsTable,
-        projectId,
-        bucket: configBucket,
-        label: parsed.label,
-        entryPath: parsed.entryPath,
-        files: parsed.files,
-        moduleInstanceId: config.id,
-      });
-
-      return {
-        output: JSON.stringify({ status: "ok", ...created }, null, 2),
-        toolMessage: `Created markdown file set ${parsed.label}.`,
-      };
-    }
-
-    case "create_markdown_slot_from_content": {
-      const parsed = parseToolArgs<{
-        parentSlotPath?: string[];
-        slotId: string;
-        title: string;
-        entryPath: string;
-        files: MarkdownFileInput[];
-      }>(toolCall.arguments);
-      if (!assetsTable) throw new Error("Project asset table is not configured.");
-      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
-      const entry = findModuleEntry(registryEntries, "modules/markdown-viewer");
-      if (!entry) throw new Error("Published module not found: modules/markdown-viewer");
-      const created = await createMarkdownFileSetAsset({
-        getS3Client,
-        getDdbClient,
-        assetsTable,
-        projectId,
-        bucket: configBucket,
-        label: parsed.title,
-        entryPath: parsed.entryPath,
-        files: parsed.files,
-        moduleInstanceId: parsed.slotId,
-      });
-      const parentPath = parsed.parentSlotPath ?? [];
-      const nextSlot: ChildSlot = {
-        slotId: parsed.slotId,
-        app: { bucket: entry.bundleBucket, key: entry.bundlePath },
-        meta: {
-          tabName: parsed.title,
-          title: parsed.title,
-          prefix: created.prefix,
-          rootKey: created.rootKey,
-          bucket: created.bucket,
-          assetId: created.assetId,
-          versionId: created.versionId,
-          manifestKey: created.manifestKey,
-        },
-      };
-      const updatedRoot: ModuleConfig = {
-        ...context.rootConfig,
-        children: upsertSlotAtPath({
-          children: context.rootConfig.children,
-          parentSlotPath: parentPath,
-          slot: nextSlot,
-        }),
-      };
-      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
-      return {
-        output: JSON.stringify({
-          status: "ok",
-          slotPath: [...parentPath, parsed.slotId],
-          moduleKey: nextSlot.app.key,
-          assetId: created.assetId,
-          versionId: created.versionId,
-          rootKey: created.rootKey,
-        }, null, 2),
-        toolMessage: `Created markdown slot ${[...parentPath, parsed.slotId].join(" / ")} with new content.`,
-        mutatedWorkspace: true,
-      };
-    }
-
     case "create_document_viewer_slot": {
       const parsed = parseToolArgs<{
         parentSlotPath?: string[];
@@ -5300,57 +4580,6 @@ async function executeTool(args: {
           doc: docMeta,
         }, null, 2),
         toolMessage: `Created document viewer slot ${[...parentPath, parsed.slotId].join(" / ")}.`,
-        mutatedWorkspace: true,
-      };
-    }
-
-    case "create_task_tracker_slot": {
-      const parsed = parseToolArgs<{
-        parentSlotPath?: string[];
-        slotId: string;
-        title: string;
-        tasks?: Array<Partial<TaskRecord> & { title: string }>;
-      }>(toolCall.arguments);
-      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
-      const entry = findModuleEntry(registryEntries, "modules/task-tracker");
-      if (!entry) throw new Error("Published module not found: modules/task-tracker");
-      const parentPath = parsed.parentSlotPath ?? [];
-      const nextSlot: ChildSlot = {
-        slotId: parsed.slotId,
-        app: { bucket: entry.bundleBucket, key: entry.bundlePath },
-        meta: { title: parsed.title },
-      };
-      const updatedRoot: ModuleConfig = {
-        ...context.rootConfig,
-        children: upsertSlotAtPath({
-          children: context.rootConfig.children,
-          parentSlotPath: parentPath,
-          slot: nextSlot,
-        }),
-      };
-      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
-      const slotConfig: ModuleConfig = { id: parsed.slotId, app: nextSlot.app, meta: nextSlot.meta };
-      const { storage, store } = await loadTaskTrackerStore(getS3Client, slotConfig, configBucket, configPath, projectId);
-      const created = (parsed.tasks ?? []).map((task) => defaultTaskRecord(userEmail, {
-        title: task.title,
-        description: task.description ?? "",
-        notes: task.notes ?? "",
-        status: task.status ?? "open",
-        priority: task.priority ?? "normal",
-        assignee: task.assignee,
-        tags: task.tags ?? [],
-        repeatable: task.repeatable ?? false,
-      }));
-      if (created.length) {
-        await saveTaskTrackerStore(getS3Client, storage, { ...store, tasks: [...created, ...store.tasks] });
-      }
-      return {
-        output: JSON.stringify({
-          status: "ok",
-          slotPath: [...parentPath, parsed.slotId],
-          createdTaskIds: created.map((task) => task.id),
-        }, null, 2),
-        toolMessage: `Created task tracker slot ${[...parentPath, parsed.slotId].join(" / ")}${created.length ? ` with ${created.length} initial task${created.length === 1 ? "" : "s"}` : ""}.`,
         mutatedWorkspace: true,
       };
     }
@@ -5672,87 +4901,6 @@ async function executeTool(args: {
           items,
         }, null, 2),
         toolMessage: `Listed ${items.length} organizer item${items.length === 1 ? "" : "s"}.`,
-      };
-    }
-
-    case "list_work_objectives": {
-      const parsed = parseToolArgs<{
-        query?: string;
-        status?: WorkScopeStatus;
-        includeArchived?: boolean;
-        limit?: number;
-      }>(toolCall.arguments);
-      const { store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
-      const limit = Math.max(1, Math.min(100, parsed.limit ?? 50));
-      const objectives = (store.scopes ?? [])
-        .filter((scope) => (parsed.includeArchived ? true : scope.status !== "archived"))
-        .filter((scope) => (parsed.status ? scope.status === parsed.status : true))
-        .filter((scope) => matchesQuery(buildScopeQueryText(scope), parsed.query ?? ""))
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-        .slice(0, limit);
-      return {
-        output: JSON.stringify({
-          count: objectives.length,
-          totalVisible: (store.scopes ?? []).filter((scope) => scope.status !== "archived").length,
-          objectives,
-        }, null, 2),
-        toolMessage: `Listed ${objectives.length} work scope${objectives.length === 1 ? "" : "s"} through the legacy objective tool.`,
-      };
-    }
-
-    case "create_work_objectives": {
-      const parsed = parseToolArgs<{ objectives: WorkObjectiveInput[] }>(toolCall.arguments);
-      if (!parsed.objectives?.length) {
-        throw new Error("At least one work objective is required.");
-      }
-      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
-      const created = parsed.objectives.map((input) => normalizeWorkScope({ input, userEmail }));
-      const nextStore: OrganizerStore = {
-        ...store,
-        scopes: [...created, ...(store.scopes ?? [])],
-      };
-      await saveOrganizerStore(getS3Client, storage, nextStore);
-      return {
-        output: JSON.stringify({ ok: true, created }, null, 2),
-        toolMessage: `Created ${created.length} work scope${created.length === 1 ? "" : "s"} through the legacy objective tool.`,
-      };
-    }
-
-    case "update_work_objective": {
-      const parsed = parseToolArgs<{ objectiveId: string; patch: Partial<WorkScope> }>(toolCall.arguments);
-      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
-      const existing = (store.scopes ?? []).find((scope) => scope.id === parsed.objectiveId);
-      if (!existing) {
-        throw new Error(`Work scope not found: ${parsed.objectiveId}`);
-      }
-      const updated = normalizeWorkScope({ input: parsed.patch, existing, userEmail });
-      const nextStore: OrganizerStore = {
-        ...store,
-        scopes: (store.scopes ?? []).map((scope) => scope.id === parsed.objectiveId ? updated : scope),
-      };
-      await saveOrganizerStore(getS3Client, storage, nextStore);
-      return {
-        output: JSON.stringify({ ok: true, objective: updated }, null, 2),
-        toolMessage: `Updated work scope ${updated.title} through the legacy objective tool.`,
-      };
-    }
-
-    case "archive_work_objective": {
-      const parsed = parseToolArgs<{ objectiveId: string }>(toolCall.arguments);
-      const { storage, store } = await loadOrganizerStore(getS3Client, configBucket, configPath, projectId, config.id);
-      const existing = (store.scopes ?? []).find((scope) => scope.id === parsed.objectiveId);
-      if (!existing) {
-        throw new Error(`Work scope not found: ${parsed.objectiveId}`);
-      }
-      const archived = normalizeWorkScope({ input: { status: "archived" }, existing, userEmail });
-      const nextStore: OrganizerStore = {
-        ...store,
-        scopes: (store.scopes ?? []).map((scope) => scope.id === parsed.objectiveId ? archived : scope),
-      };
-      await saveOrganizerStore(getS3Client, storage, nextStore);
-      return {
-        output: JSON.stringify({ ok: true, objective: archived }, null, 2),
-        toolMessage: `Archived work scope ${archived.title} through the legacy objective tool.`,
       };
     }
 
@@ -6130,86 +5278,6 @@ async function executeTool(args: {
           upsertedItemIds: prepared.map((item) => item.id),
         }, null, 2),
         toolMessage: `${parsed.replaceExisting ? "Replaced" : "Upserted"} ${prepared.length} work item${prepared.length === 1 ? "" : "s"} in ${parsed.slotPath.join(" / ")}.`,
-      };
-    }
-
-    case "read_markdown_slot": {
-      const parsed = parseToolArgs<{ slotPath: string[]; maxCharsPerFile?: number }>(toolCall.arguments);
-      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
-      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-markdown-viewer");
-      const state = await readMarkdownSlotState({
-        getS3Client,
-        slot,
-        configBucket,
-        maxCharsPerFile: parsed.maxCharsPerFile,
-      });
-      return {
-        output: JSON.stringify({
-          slotPath: parsed.slotPath,
-          ...state,
-        }, null, 2),
-        toolMessage: `Read markdown slot ${parsed.slotPath.join(" / ")}.`,
-      };
-    }
-
-    case "replace_markdown_slot_content": {
-      const parsed = parseToolArgs<{
-        slotPath: string[];
-        title?: string;
-        entryPath: string;
-        files: MarkdownFileInput[];
-      }>(toolCall.arguments);
-      if (!assetsTable) throw new Error("Project asset table is not configured.");
-      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
-      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-markdown-viewer");
-      const title = parsed.title?.trim()
-        || (typeof slot.meta?.["title"] === "string" ? slot.meta["title"] as string : "")
-        || (typeof slot.meta?.["tabName"] === "string" ? slot.meta["tabName"] as string : "")
-        || slot.slotId;
-      const created = await createMarkdownFileSetAsset({
-        getS3Client,
-        getDdbClient,
-        assetsTable,
-        projectId,
-        bucket: configBucket,
-        label: title,
-        entryPath: parsed.entryPath,
-        files: parsed.files,
-        moduleInstanceId: slot.slotId,
-      });
-      const nextMeta = {
-        ...(slot.meta ?? {}),
-        title,
-        tabName: title,
-        prefix: created.prefix,
-        rootKey: created.rootKey,
-        bucket: created.bucket,
-        assetId: created.assetId,
-        versionId: created.versionId,
-        manifestKey: created.manifestKey,
-      };
-      const updatedRoot: ModuleConfig = {
-        ...context.rootConfig,
-        children: upsertSlotAtPath({
-          children: context.rootConfig.children,
-          parentSlotPath: parsed.slotPath.slice(0, -1),
-          slot: {
-            ...slot,
-            meta: nextMeta,
-          },
-        }),
-      };
-      await writeRootConfig({ getS3Client, configBucket, configPath, rootConfig: updatedRoot });
-      return {
-        output: JSON.stringify({
-          status: "ok",
-          slotPath: parsed.slotPath,
-          assetId: created.assetId,
-          versionId: created.versionId,
-          rootKey: created.rootKey,
-        }, null, 2),
-        toolMessage: `Replaced markdown content for ${parsed.slotPath.join(" / ")}.`,
-        mutatedWorkspace: true,
       };
     }
 
@@ -6613,6 +5681,15 @@ async function executeTool(args: {
 
     case "upsert_root_slot": {
       const parsed = parseToolArgs<ModuleToolArgs>(toolCall.arguments);
+      // This tool only ever creates the one top-level slot named here — it has no children concept.
+      // Silently dropping an unexpected "children" argument would look like success while quietly
+      // discarding most of what was asked for, so reject it with a pointer to the right tool instead.
+      if ((parsed as Record<string, unknown>)["children"] !== undefined) {
+        throw new Error(
+          "upsert_root_slot does not accept children. Create this slot first, then add each child " +
+          "with its own upsert_slot(parentSlotPath: [slotId], ...) call.",
+        );
+      }
       const entry = findModuleEntry(registryEntries, parsed.moduleName);
       if (!entry) {
         throw new Error(`Published module not found: ${parsed.moduleName}`);
@@ -6727,183 +5804,6 @@ async function executeTool(args: {
           navigatedToProject: Boolean(parsed.bucket && parsed.configPath),
         }, null, 2),
         toolMessage: `Focused slot ${parsed.slotPath.join(" / ")}.`,
-      };
-    }
-
-    case "list_task_tracker_tasks": {
-      const parsed = parseToolArgs<{ slotPath: string[] }>(toolCall.arguments);
-      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
-      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
-      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
-        id: slot.slotId,
-        app: slot.app,
-        meta: slot.meta,
-        resources: slot.resources,
-        children: slot.children,
-      }, configBucket, configPath, projectId);
-      return {
-        output: JSON.stringify({
-          slotPath: parsed.slotPath,
-          bucket: storage.bucket,
-          tasksKey: storage.tasksKey,
-          count: store.tasks.length,
-          tasks: store.tasks,
-        }, null, 2),
-        toolMessage: `Listed ${store.tasks.length} task-tracker tasks.`,
-      };
-    }
-
-    case "create_task_tracker_tasks": {
-      const parsed = parseToolArgs<{
-        slotPath: string[];
-        tasks: Array<Partial<TaskRecord> & { title: string }>;
-      }>(toolCall.arguments);
-      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
-      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
-      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
-        id: slot.slotId,
-        app: slot.app,
-        meta: slot.meta,
-        resources: slot.resources,
-        children: slot.children,
-      }, configBucket, configPath, projectId);
-      const created = parsed.tasks.map((task) => defaultTaskRecord(userEmail, {
-        title: task.title,
-        description: task.description ?? "",
-        notes: task.notes ?? "",
-        status: task.status ?? "open",
-        priority: task.priority ?? "normal",
-        assignee: task.assignee,
-        tags: task.tags ?? [],
-        repeatable: task.repeatable ?? false,
-      }));
-      const nextStore: TaskStore = { ...store, tasks: [...created, ...store.tasks] };
-      await saveTaskTrackerStore(getS3Client, storage, nextStore);
-      return {
-        output: JSON.stringify({
-          status: "ok",
-          slotPath: parsed.slotPath,
-          createdTaskIds: created.map((task) => task.id),
-          taskCount: nextStore.tasks.length,
-        }, null, 2),
-        toolMessage: `Created ${created.length} task${created.length === 1 ? "" : "s"} in ${parsed.slotPath.join(" / ")}.`,
-      };
-    }
-
-    case "update_task_tracker_task": {
-      const parsed = parseToolArgs<{
-        slotPath: string[];
-        taskId: string;
-        patch: Partial<TaskRecord>;
-      }>(toolCall.arguments);
-      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
-      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
-      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
-        id: slot.slotId,
-        app: slot.app,
-        meta: slot.meta,
-        resources: slot.resources,
-        children: slot.children,
-      }, configBucket, configPath, projectId);
-      const existing = store.tasks.find((task) => task.id === parsed.taskId);
-      if (!existing) throw new Error(`Task not found: ${parsed.taskId}`);
-      const nextStore: TaskStore = {
-        ...store,
-        tasks: store.tasks.map((task) => (
-          task.id === parsed.taskId
-            ? { ...task, ...parsed.patch, updatedAt: nowIso() }
-            : task
-        )),
-      };
-      await saveTaskTrackerStore(getS3Client, storage, nextStore);
-      return {
-        output: JSON.stringify({
-          status: "ok",
-          slotPath: parsed.slotPath,
-          taskId: parsed.taskId,
-        }, null, 2),
-        toolMessage: `Updated task ${parsed.taskId}.`,
-      };
-    }
-
-    case "delete_task_tracker_task": {
-      const parsed = parseToolArgs<{ slotPath: string[]; taskId: string }>(toolCall.arguments);
-      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
-      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
-      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
-        id: slot.slotId,
-        app: slot.app,
-        meta: slot.meta,
-        resources: slot.resources,
-        children: slot.children,
-      }, configBucket, configPath, projectId);
-      const existing = store.tasks.find((task) => task.id === parsed.taskId);
-      if (!existing) throw new Error(`Task not found: ${parsed.taskId}`);
-      const s3 = await getS3Client(storage.bucket);
-      await Promise.all(existing.attachments.map((attachment) =>
-        deleteObjectIfExists(s3, attachment.bucket, attachment.key)
-      ));
-      const nextStore: TaskStore = {
-        ...store,
-        tasks: store.tasks.filter((task) => task.id !== parsed.taskId),
-      };
-      await saveTaskTrackerStore(getS3Client, storage, nextStore);
-      return {
-        output: JSON.stringify({
-          status: "ok",
-          slotPath: parsed.slotPath,
-          taskId: parsed.taskId,
-        }, null, 2),
-        toolMessage: `Deleted task ${parsed.taskId}.`,
-      };
-    }
-
-    case "attach_project_asset_to_task": {
-      const parsed = parseToolArgs<{ slotPath: string[]; taskId: string; assetId: string }>(toolCall.arguments);
-      if (!assetsTable) throw new Error("Project asset table is not configured.");
-      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
-      const slot = requireModuleAtPath(context.rootConfig, parsed.slotPath, "module-task-tracker");
-      const { storage, store } = await loadTaskTrackerStore(getS3Client, {
-        id: slot.slotId,
-        app: slot.app,
-        meta: slot.meta,
-        resources: slot.resources,
-        children: slot.children,
-      }, configBucket, configPath, projectId);
-      const existing = store.tasks.find((task) => task.id === parsed.taskId);
-      if (!existing) throw new Error(`Task not found: ${parsed.taskId}`);
-      const ddb = await getDdbClient();
-      const assets = await listAssets({ ddb, tableName: assetsTable, projectId });
-      const asset = assets.find((item) => item.assetId === parsed.assetId);
-      if (!asset) throw new Error(`Project asset not found: ${parsed.assetId}`);
-      const version = getCurrentAssetVersion(asset);
-      const attachment: TaskAttachment = {
-        id: makeAttachmentId(),
-        name: asset.label || basename(version.key),
-        bucket: version.bucket,
-        key: version.key,
-        size: version.sizeBytes ?? 0,
-        contentType: version.mimeType,
-        uploadedAt: nowIso(),
-        uploadedBy: userEmail,
-      };
-      const nextStore: TaskStore = {
-        ...store,
-        tasks: store.tasks.map((task) => (
-          task.id === parsed.taskId
-            ? { ...task, attachments: [...task.attachments, attachment], updatedAt: nowIso() }
-            : task
-        )),
-      };
-      await saveTaskTrackerStore(getS3Client, storage, nextStore);
-      return {
-        output: JSON.stringify({
-          status: "ok",
-          slotPath: parsed.slotPath,
-          taskId: parsed.taskId,
-          attachment,
-        }, null, 2),
-        toolMessage: `Attached asset ${parsed.assetId} to task ${parsed.taskId}.`,
       };
     }
 
@@ -7259,9 +6159,9 @@ async function executeTool(args: {
         : normalizeResources(parsed.resources, `Slot ${[...parentPath, parsed.slotId].join(" / ")}`);
 
       const nextChildren = parsed.replaceChildren
-        ? normalizeChildSlots(parsed.children ?? [], `Slot ${[...parentPath, parsed.slotId].join(" / ")}`)
+        ? normalizeChildSlots(parsed.children ?? [], `Slot ${[...parentPath, parsed.slotId].join(" / ")}`, registryEntries)
         : (parsed.children
-            ? normalizeChildSlots(parsed.children, `Slot ${[...parentPath, parsed.slotId].join(" / ")}`)
+            ? normalizeChildSlots(parsed.children, `Slot ${[...parentPath, parsed.slotId].join(" / ")}`, registryEntries)
             : existing?.children);
 
       const nextSlot: ChildSlot = {
@@ -7364,6 +6264,13 @@ async function executeTool(args: {
         }, null, 2),
         toolMessage: "Updated root app-space config.",
         mutatedWorkspace: true,
+      };
+    }
+
+    case "get_test_manager_schema_guide": {
+      return {
+        output: testManagerSchemaGuideMd,
+        toolMessage: "Read the test-manager YAML authoring guide and worked example.",
       };
     }
 
@@ -7490,31 +6397,241 @@ async function executeTool(args: {
       };
     }
 
-    case "list_agent_skills": {
-      const modules = [...moduleSkills.values()].map((entry) => ({
-        instanceId: entry.instanceId,
-        moduleName: entry.moduleName,
-        displayName: entry.displayName,
-        description: entry.description,
-        skills: entry.skills.map((skill) => ({ id: skill.id, description: skill.description })),
+    case "list_test_manager_cases": {
+      const parsed = parseToolArgs<{ slot_id?: string; slotPath?: string[]; runId?: string }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const resolved = resolveTestManagerSlotRef(context.rootConfig, parsed);
+      const storage = getTestManagerStorage(resolved.slotId, configBucket, configPath);
+      const yaml = await readOptionalText(getS3Client, storage.bucket, storage.definitionKey);
+      if (!yaml) {
+        return {
+          output: JSON.stringify({ ok: false, error: "No spec found for this slot. The test-manager may not have a definition.yaml yet." }),
+          toolMessage: `No test spec found for slot "${resolved.slotPath.join(" / ")}".`,
+        };
+      }
+      const cases = listTestManagerCasesFromYaml(yaml);
+      const workspaceText = await readOptionalText(getS3Client, storage.bucket, storage.resultsKey);
+      let run: TestManagerRun | null = null;
+      if (workspaceText) {
+        try { run = resolveTestManagerRun(JSON.parse(workspaceText) as TestManagerWorkspace, parsed.runId); } catch { run = null; }
+      }
+      const results = run?.resultsByTestId ?? {};
+      const excludedIds = new Set(run?.excludedTestIds ?? []);
+      const excludedReasons = run?.excludedTestReasons ?? {};
+      const enriched = cases.map((c) => ({
+        ...c,
+        status: results[c.testId]?.status ?? "not-run",
+        notes: results[c.testId]?.notes || undefined,
+        excluded: excludedIds.has(c.testId),
+        exclusionReason: excludedReasons[c.testId],
       }));
       return {
-        output: JSON.stringify({ modules }, null, 2),
-        toolMessage: `Listed ${modules.reduce((sum, m) => sum + m.skills.length, 0)} skill(s) across ${modules.length} mounted module instance(s).`,
+        output: JSON.stringify({ ok: true, runId: run?.id ?? null, totalCases: enriched.length, cases: enriched }, null, 2),
+        toolMessage: `Listed ${enriched.length} test-manager case(s) for slot "${resolved.slotPath.join(" / ")}".`,
+      };
+    }
+
+    case "get_test_manager_result": {
+      const parsed = parseToolArgs<{ slot_id?: string; slotPath?: string[]; testId: string; runId?: string }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const resolved = resolveTestManagerSlotRef(context.rootConfig, parsed);
+      const storage = getTestManagerStorage(resolved.slotId, configBucket, configPath);
+      const workspaceText = await readOptionalText(getS3Client, storage.bucket, storage.resultsKey);
+      if (!workspaceText) {
+        return {
+          output: JSON.stringify({ ok: true, hasData: false, message: "No run data yet — no tests have been executed for this slot." }),
+          toolMessage: `No run data found for test-manager slot "${resolved.slotPath.join(" / ")}".`,
+        };
+      }
+      const workspace = JSON.parse(workspaceText) as TestManagerWorkspace;
+      const run = resolveTestManagerRun(workspace, parsed.runId);
+      const result = run.resultsByTestId?.[parsed.testId] ?? null;
+      return {
+        output: JSON.stringify({ ok: true, runId: run.id, testId: parsed.testId, result: result ?? { status: "not-run" } }, null, 2),
+        toolMessage: `Read result for test "${parsed.testId}" in run "${run.id}" of slot "${resolved.slotPath.join(" / ")}".`,
+      };
+    }
+
+    case "set_test_manager_result": {
+      const parsed = parseToolArgs<{
+        slot_id?: string;
+        slotPath?: string[];
+        testId: string;
+        runId?: string;
+        status?: string;
+        notes?: string;
+        inputValues?: Record<string, unknown>;
+      }>(toolCall.arguments);
+      if (parsed.status !== undefined && parsed.status !== null && !TEST_MANAGER_STATUS_OPTIONS.includes(parsed.status)) {
+        return {
+          output: JSON.stringify({ ok: false, error: `status must be one of: ${TEST_MANAGER_STATUS_OPTIONS.join(", ")}.` }),
+          toolMessage: `Rejected invalid test-manager status "${parsed.status}".`,
+        };
+      }
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const resolved = resolveTestManagerSlotRef(context.rootConfig, parsed);
+      const storage = getTestManagerStorage(resolved.slotId, configBucket, configPath);
+      const workspaceText = await readOptionalText(getS3Client, storage.bucket, storage.resultsKey);
+      if (!workspaceText) {
+        return {
+          output: JSON.stringify({ ok: false, error: "No run data yet for this slot. Create a run first with create_test_manager_run." }),
+          toolMessage: `No run data found for test-manager slot "${resolved.slotPath.join(" / ")}".`,
+        };
+      }
+      const workspace = JSON.parse(workspaceText) as TestManagerWorkspace;
+      const run = resolveTestManagerRun(workspace, parsed.runId);
+      const existing: TestManagerResultRecord = run.resultsByTestId?.[parsed.testId] ?? {
+        status: "not-run",
+        inputValues: {},
+        notes: "",
+        stepResultsById: {},
+        typedArtifacts: {},
+        supportingArtifacts: [],
+      };
+      const nextResult: TestManagerResultRecord = {
+        ...existing,
+        status: parsed.status ?? existing.status,
+        notes: parsed.notes ?? existing.notes,
+        inputValues: parsed.inputValues ? { ...existing.inputValues, ...parsed.inputValues } : existing.inputValues,
+        startedAt: existing.startedAt ?? nowIso(),
+        updatedAt: nowIso(),
+        updatedBy: userEmail,
+      };
+      const nextWorkspace: TestManagerWorkspace = {
+        ...workspace,
+        runs: workspace.runs.map((r) => r.id !== run.id ? r : {
+          ...r,
+          updatedAt: nowIso(),
+          resultsByTestId: { ...(r.resultsByTestId ?? {}), [parsed.testId]: nextResult },
+        }),
+      };
+      await writeTextRaw(getS3Client, storage.bucket, storage.resultsKey, JSON.stringify(nextWorkspace, null, 2), "application/json");
+      return {
+        output: JSON.stringify({ ok: true, runId: run.id, testId: parsed.testId, result: nextResult }, null, 2),
+        toolMessage: `Updated result for test "${parsed.testId}" in run "${run.id}" (status: ${nextResult.status}).`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "set_test_manager_exclusion": {
+      const parsed = parseToolArgs<{
+        slot_id?: string;
+        slotPath?: string[];
+        testId: string;
+        runId?: string;
+        excluded: boolean;
+        reason?: string;
+      }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const resolved = resolveTestManagerSlotRef(context.rootConfig, parsed);
+      const storage = getTestManagerStorage(resolved.slotId, configBucket, configPath);
+      const workspaceText = await readOptionalText(getS3Client, storage.bucket, storage.resultsKey);
+      if (!workspaceText) {
+        return {
+          output: JSON.stringify({ ok: false, error: "No run data yet for this slot. Create a run first with create_test_manager_run." }),
+          toolMessage: `No run data found for test-manager slot "${resolved.slotPath.join(" / ")}".`,
+        };
+      }
+      const workspace = JSON.parse(workspaceText) as TestManagerWorkspace;
+      const run = resolveTestManagerRun(workspace, parsed.runId);
+      const excludedIds = new Set(run.excludedTestIds ?? []);
+      const reasons = { ...(run.excludedTestReasons ?? {}) };
+      if (parsed.excluded) {
+        excludedIds.add(parsed.testId);
+        if (parsed.reason !== undefined) reasons[parsed.testId] = parsed.reason;
+      } else {
+        excludedIds.delete(parsed.testId);
+        delete reasons[parsed.testId];
+      }
+      const nextWorkspace: TestManagerWorkspace = {
+        ...workspace,
+        runs: workspace.runs.map((r) => r.id !== run.id ? r : {
+          ...r,
+          updatedAt: nowIso(),
+          excludedTestIds: [...excludedIds],
+          excludedTestReasons: reasons,
+        }),
+      };
+      await writeTextRaw(getS3Client, storage.bucket, storage.resultsKey, JSON.stringify(nextWorkspace, null, 2), "application/json");
+      return {
+        output: JSON.stringify({ ok: true, runId: run.id, testId: parsed.testId, excluded: parsed.excluded }, null, 2),
+        toolMessage: `${parsed.excluded ? "Excluded" : "Included"} test "${parsed.testId}" in run "${run.id}" of slot "${resolved.slotPath.join(" / ")}".`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "create_test_manager_run": {
+      const parsed = parseToolArgs<{ slot_id?: string; slotPath?: string[]; label?: string }>(toolCall.arguments);
+      const context = await loadWorkspaceContext(getS3Client, configBucket, configPath, projectId);
+      const resolved = resolveTestManagerSlotRef(context.rootConfig, parsed);
+      const storage = getTestManagerStorage(resolved.slotId, configBucket, configPath);
+      const workspaceText = await readOptionalText(getS3Client, storage.bucket, storage.resultsKey);
+      const yaml = await readOptionalText(getS3Client, storage.bucket, storage.definitionKey);
+      const workspace: TestManagerWorkspace = workspaceText
+        ? JSON.parse(workspaceText) as TestManagerWorkspace
+        : { version: 3, runs: [] };
+      const createdAt = nowIso();
+      const newRun: TestManagerRun = {
+        id: `run-${Math.random().toString(36).slice(2, 10)}`,
+        label: parsed.label?.trim() || `Run ${workspace.runs.length + 1}`,
+        createdAt,
+        updatedAt: createdAt,
+        overviewNotes: "",
+        overviewArtifacts: [],
+        instrumentSessions: [],
+        resultsByTestId: {},
+      };
+      const nextWorkspace: TestManagerWorkspace = {
+        ...workspace,
+        version: 3,
+        activeRunId: newRun.id,
+        runs: [
+          newRun,
+          ...workspace.runs.map((r) =>
+            r.id === workspace.activeRunId && !r.definitionSnapshot
+              ? { ...r, definitionSnapshot: yaml ?? undefined }
+              : r
+          ),
+        ],
+      };
+      await writeTextRaw(getS3Client, storage.bucket, storage.resultsKey, JSON.stringify(nextWorkspace, null, 2), "application/json");
+      return {
+        output: JSON.stringify({ ok: true, runId: newRun.id, label: newRun.label }, null, 2),
+        toolMessage: `Created new test-manager run "${newRun.label}" (${newRun.id}) for slot "${resolved.slotPath.join(" / ")}" and made it active.`,
+        mutatedWorkspace: true,
+      };
+    }
+
+    case "list_skills": {
+      const parsed = parseToolArgs<{ moduleName: string }>(toolCall.arguments);
+      // A module type can have more than one mounted instance (e.g. two Work Manager slots); its
+      // skill definitions are a property of the code, identical across instances, so the catalog is
+      // taken from whichever entry matched first — only the instance list actually varies per entry.
+      const entries = [...moduleSkills.values()].filter((entry) => entry.moduleName === parsed.moduleName);
+      if (!entries.length) {
+        const known = [...new Set([...moduleSkills.values()].map((entry) => entry.moduleName))];
+        throw new Error(`Unknown moduleName "${parsed.moduleName}". Known modules right now: ${known.join(", ") || "(none)"}.`);
+      }
+      const skills = entries[0]!.skills.map((skill) => ({ id: skill.id, description: skill.description }));
+      const instances = entries.map((entry) => ({ instanceId: entry.instanceId, description: entry.description }));
+      return {
+        output: JSON.stringify({ moduleName: parsed.moduleName, displayName: entries[0]!.displayName, skills, instances }, null, 2),
+        toolMessage: `Listed ${skills.length} skill(s) and ${instances.length} instance(s) for ${parsed.moduleName}.`,
       };
     }
 
     case "use_skill": {
-      const parsed = parseToolArgs<{ instanceId: string; skillId: string }>(toolCall.arguments);
-      const moduleEntry = moduleSkills.get(parsed.instanceId);
+      const parsed = parseToolArgs<{ moduleName: string; skillId: string }>(toolCall.arguments);
+      const moduleEntry = [...moduleSkills.values()].find((entry) => entry.moduleName === parsed.moduleName);
       const skill = moduleEntry?.skills.find((candidate) => candidate.id === parsed.skillId);
       if (!moduleEntry || !skill) {
-        throw new Error(`No skill "${parsed.skillId}" found for instanceId "${parsed.instanceId}". Call list_agent_skills first.`);
+        throw new Error(`No skill "${parsed.skillId}" found for moduleName "${parsed.moduleName}". Call list_skills("${parsed.moduleName}") first.`);
       }
       return {
         output: JSON.stringify({ prompt: skill.prompt, tools: skill.tools.map((tool) => tool.name) }, null, 2),
         toolMessage: `Loaded skill "${skill.id}" from ${moduleEntry.displayName}: ${skill.tools.map((tool) => tool.name).join(", ") || "(no tools)"}.`,
         unlockedTools: skill.tools as ToolDefinition[],
+        unlockedSkillKey: { moduleName: parsed.moduleName, skillId: parsed.skillId },
       };
     }
 
@@ -7545,19 +6662,35 @@ export default function AgentChatModule({ config }: ModuleProps) {
   const resources = useAllResources();
   const { entries: registryEntries } = useModuleRegistry();
   const moduleSkills = useAllAgentSkills();
-  // agent-chat registers its own built-in skills into the same registry a real module would, for
-  // capabilities that aren't owned by any mountable module — see BUILTIN_AGENT_SKILLS. This makes
-  // list_agent_skills/use_skill the uniform discovery path for everything, module-owned or not.
+  // This module's own skill (organizer memory — see AGENT_CHAT_SKILLS for why that's the only thing
+  // that actually belongs here now).
   useRegisterAgentSkills(
     useMemo(
       () => ({
         instanceId: config.id,
         moduleName: "module-agent-chat",
-        displayName: "Agent Chat (built-in)",
-        description: "Cross-cutting capabilities not tied to a specific mounted module: organizer memory, work manager, task tracker, documentation, project assets, content slots, and app-space slot management.",
-        skills: BUILTIN_AGENT_SKILLS,
+        displayName: "Agent Chat",
+        description: "Maintains its own work-scope/objective/notes graph for this project instance.",
+        skills: AGENT_CHAT_SKILLS,
       }),
       [config.id],
+    ),
+  );
+  // Platform capabilities (see MODULE_CORE_SKILLS) registered separately under moduleName
+  // "module-core" — not because this component owns them, but because it's the only thing that
+  // executes them today and the only thing that ever reads this registry. A fixed instanceId is
+  // used since these aren't tied to any particular mounted slot; list_skills("module-core") returns
+  // an empty instances list for exactly that reason.
+  useRegisterAgentSkills(
+    useMemo(
+      () => ({
+        instanceId: "module-core",
+        moduleName: "module-core",
+        displayName: "Core",
+        description: "Always-available platform capabilities: workspace inspection, local file/shell/Python/network access, the project asset store, slot/root-config management, and web search.",
+        skills: MODULE_CORE_SKILLS,
+      }),
+      [],
     ),
   );
 
@@ -7616,6 +6749,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
   const [busy, setBusy] = useState(false);
   const [stopRequested, setStopRequested] = useState(false);
   const [pendingContinuation, setPendingContinuation] = useState<PendingContinuation | null>(null);
+  const [warmSkills, setWarmSkills] = useState<WarmSkillEntry[]>([]);
   const [hydratedSessionKey, setHydratedSessionKey] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | undefined>();
   const [saveError, setSaveError] = useState<string | undefined>();
@@ -7629,6 +6763,12 @@ export default function AgentChatModule({ config }: ModuleProps) {
   const runAbortRef = useRef<AbortController | null>(null);
   const organizerDragRef = useRef<{ startX: number; startY: number; left: number; top: number } | null>(null);
   const organizerWindowRef = useRef<HTMLDivElement>(null);
+  // Backing store for the debounced composer-autosave effect below — see its comment.
+  const latestSessionPartsRef = useRef<{
+    messages: ChatMessage[];
+    pendingContinuation: PendingContinuation | null;
+    warmSkills: WarmSkillEntry[];
+  }>({ messages: [], pendingContinuation: null, warmSkills: [] });
 
   useEffect(() => {
     const stored = safeReadLocalStorage(storageKey);
@@ -7641,11 +6781,13 @@ export default function AgentChatModule({ config }: ModuleProps) {
     setMessages([]);
     setComposer("");
     setPendingContinuation(null);
+    setWarmSkills([]);
     const storedSession = readPersistedChatSession(chatSessionKey);
     if (storedSession) {
       setMessages(storedSession.messages ?? []);
       setComposer(storedSession.composer ?? "");
       setPendingContinuation(storedSession.pendingContinuation ?? null);
+      setWarmSkills(storedSession.warmSkills ?? []);
     }
     setHydratedSessionKey(chatSessionKey);
   }, [chatSessionKey]);
@@ -7708,14 +6850,38 @@ export default function AgentChatModule({ config }: ModuleProps) {
     setItemNoteDraft("");
   }, [selectedOrganizerItemId]);
 
+  // Split in two deliberately. messages/pendingContinuation/warmSkills only change once per agent
+  // turn, so writing immediately here is cheap in practice — composer changes on every keystroke,
+  // and JSON.stringify-ing the *entire* session (including however many tool calls/outputs have
+  // piled up in messages by then) on every character typed is what made typing feel sluggish in a
+  // long-running session. composer is read from the current closure (not listed as a dependency) —
+  // that's intentional: this effect should fire when the expensive parts change, not on every
+  // keystroke, and the closure still has whatever composer value was current at that render.
   useEffect(() => {
     if (hydratedSessionKey !== chatSessionKey) return;
     safeWriteLocalStorage(chatSessionKey, JSON.stringify({
       messages,
       composer,
       pendingContinuation,
+      warmSkills,
     } satisfies PersistedChatSession));
-  }, [chatSessionKey, composer, hydratedSessionKey, messages, pendingContinuation]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- composer deliberately excluded, see above
+  }, [chatSessionKey, hydratedSessionKey, messages, pendingContinuation, warmSkills]);
+
+  // Debounced composer-only persistence — the actual fix for the sluggish-typing issue. Reads the
+  // other fields from a ref updated every render (not this effect's deps) so a burst of keystrokes
+  // only serializes/writes once, shortly after the user pauses, instead of on every character.
+  latestSessionPartsRef.current = { messages, pendingContinuation, warmSkills };
+  useEffect(() => {
+    if (hydratedSessionKey !== chatSessionKey) return;
+    const timeout = window.setTimeout(() => {
+      safeWriteLocalStorage(chatSessionKey, JSON.stringify({
+        ...latestSessionPartsRef.current,
+        composer,
+      } satisfies PersistedChatSession));
+    }, 400);
+    return () => window.clearTimeout(timeout);
+  }, [chatSessionKey, composer, hydratedSessionKey]);
 
   useEffect(() => () => {
     window.removeEventListener("mousemove", handleOrganizerDragMove);
@@ -8313,15 +7479,26 @@ export default function AgentChatModule({ config }: ModuleProps) {
     bridge: BridgeConfig | null;
     signal: AbortSignal;
     onProgress: (event: AgentProgressEvent) => void;
+    // Tools from skills the caller has decided are still "warm" (see pruneWarmSkills) — pre-seeded
+    // into the active set so a recently-used skill doesn't need list_skills/use_skill called again.
+    initialWarmTools: ToolDefinition[];
   }): Promise<AgentRunResult> {
     let inputItems = args.initialInputItems;
     let assistantText = "";
     let lastToolMessages: string[] = [];
     let shouldNavigate = false;
-    // Starts at just the always-on core tools; grows as use_skill calls unlock more for the rest
-    // of this run. Deliberately not persisted beyond this one runAgentSession call — the next user
-    // submission starts fresh from core again, same as contextBits already does.
-    const activeTools: ToolDefinition[] = [...CORE_TOOL_DEFINITIONS];
+    // Starts at the always-on core tools plus whatever's still warm from recent turns; grows further
+    // as use_skill calls unlock more for the rest of this run. Deliberately not carried forward
+    // beyond that — the warm-skill cache (see submitUserPrompt) is what persists across turns, not
+    // this array itself.
+    const activeToolNames = new Set<string>();
+    const activeTools: ToolDefinition[] = [];
+    for (const tool of [...CORE_TOOL_DEFINITIONS, ...args.initialWarmTools]) {
+      if (activeToolNames.has(tool.name)) continue;
+      activeToolNames.add(tool.name);
+      activeTools.push(tool);
+    }
+    const usedSkills = new Map<string, { moduleName: string; skillId: string; tools: ToolDefinition[] }>();
 
     for (let i = 0; i < TOOL_ITERATION_LIMIT; i++) {
       if (args.signal.aborted) {
@@ -8367,6 +7544,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
             lastToolMessages: [message],
             pending: null,
             shouldNavigate,
+            usedSkills: [...usedSkills.values()],
           };
         }
         if (isReasoningItemMismatchError(error)) {
@@ -8384,6 +7562,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
             lastToolMessages: [message],
             pending: null,
             shouldNavigate,
+            usedSkills: [...usedSkills.values()],
           };
         }
         throw error;
@@ -8403,7 +7582,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
 
       if (!functionCalls.length) {
         assistantText = extractAssistantText(response) || "The model returned no text output.";
-        return { assistantText, lastToolMessages, pending: null, shouldNavigate };
+        return { assistantText, lastToolMessages, pending: null, shouldNavigate, usedSkills: [...usedSkills.values()] };
       }
 
       const toolOutputs: FunctionCallOutputItem[] = [];
@@ -8455,6 +7634,9 @@ export default function AgentChatModule({ config }: ModuleProps) {
             if (existingIndex >= 0) activeTools[existingIndex] = tool;
             else activeTools.push(tool);
           }
+          if (result.unlockedSkillKey) {
+            usedSkills.set(warmSkillKey(result.unlockedSkillKey), { ...result.unlockedSkillKey, tools: result.unlockedTools });
+          }
         }
 
         console.debug("[agent-chat] tool result", {
@@ -8497,6 +7679,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
         lastToolMessages,
       },
       shouldNavigate,
+      usedSkills: [...usedSkills.values()],
     };
   }
 
@@ -8505,6 +7688,12 @@ export default function AgentChatModule({ config }: ModuleProps) {
 
     const userMessage = createMessage("user", input);
     const history = [...messages, userMessage];
+    // history.length doubles as a cheap monotonic turn counter for the warm-skill cache — see
+    // WarmSkillEntry/pruneWarmSkills. Pruned once up front so this turn's request only carries
+    // tools that are still actually warm, not whatever expired since the last one.
+    const currentTurn = history.length;
+    const prunedWarmSkills = pruneWarmSkills(warmSkills, currentTurn);
+    const initialWarmTools = warmToolsFrom(prunedWarmSkills);
     setMessages(history);
     setComposer("");
     setBusy(true);
@@ -8523,26 +7712,16 @@ export default function AgentChatModule({ config }: ModuleProps) {
       const bridge = activeBridge;
       await syncBridgeAppspaceContext(bridge);
       await processQueuedBridgeAppspaceOperations(bridge);
+      const moduleLines = uniqueModuleSkillEntries(moduleSkills).map((entry) =>
+        `\`${entry.moduleName}\`${entry.moduleName === "module-agent-chat" ? " (this module)" : ""} — ${entry.description}`
+      );
       const contextBits: string[] = [
         systemPrompt,
-        `Current user request for this run: ${input}`,
-        "You are running inside a browser-based project workspace shell.",
-        "Prefer calling tools before making assumptions about project structure or available files/modules.",
-        "The browser agent and local runtime share the same appspace operation names. When the local runtime is enabled, it can read the synced appspace context from the bridge and queue appspace operations for the browser to execute.",
-        "When the user asks about information 'in here' or app documentation, start with project assets and registered resources before the local bridge workspace unless they explicitly ask for local files.",
-        `Current project ID: ${projectId}.`,
-        `Current module ID: ${config.id}.`,
-        assetsTable ? `Project asset table is available as ${assetsTable}.` : "Project asset table is not configured.",
-        `Loaded resource count: ${resources.size}.`,
-        `Published module count: ${registryEntries.length}.`,
-        bridge
-          ? `Local runtime is enabled with workspace root ${bridgeWorkspaceRoot || "unknown"}.`
-          : "Local runtime is disabled for this project/module. Do not use local filesystem, shell, Python, or PDF bridge tools unless the user enables it in settings.",
+        bridge ? `Local runtime: ON (workspace root ${bridgeWorkspaceRoot || "unknown"}).` : "Local runtime: OFF.",
         organizerSummary,
-        moduleSkills.size > 0
-          ? `${[...moduleSkills.values()].reduce((sum, m) => sum + m.skills.length, 0)} agent skill(s) are on offer from ${moduleSkills.size} mounted module instance(s) right now. Call list_agent_skills to see them, then use_skill before acting on that module's data — do not guess at its tools or file format.`
-          : "No mounted module instance has registered any agent skills for this project right now.",
-        user?.email ? `Signed-in user: ${user.email}.` : undefined,
+        moduleLines.length > 0
+          ? `Loaded modules:\n${moduleLines.join("\n")}`
+          : "No modules have registered any agent skills for this project right now.",
       ].filter((value): value is string => Boolean(value));
 
       const session = await runAgentSession({
@@ -8550,6 +7729,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
         contextBits,
         bridge,
         signal: controller.signal,
+        initialWarmTools,
         onProgress: (event) => {
           const text =
             event.kind === "status"
@@ -8561,6 +7741,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
         },
       });
       setPendingContinuation(session.pending);
+      setWarmSkills(mergeWarmSkills(prunedWarmSkills, session.usedSkills, currentTurn));
       setMessages((current) => {
         const nextMessages = [...current, createMessage("assistant", session.assistantText || "The model returned no text output.")];
         persistChatSessionNow(chatSessionKey, {
@@ -8638,11 +7819,14 @@ export default function AgentChatModule({ config }: ModuleProps) {
       const bridge = activeBridge;
       await syncBridgeAppspaceContext(bridge);
       await processQueuedBridgeAppspaceOperations(bridge);
+      const currentTurn = messages.length;
+      const prunedWarmSkills = pruneWarmSkills(warmSkills, currentTurn);
       const session = await runAgentSession({
         initialInputItems: pending.inputItems,
         contextBits: pending.contextBits,
         bridge,
         signal: controller.signal,
+        initialWarmTools: warmToolsFrom(prunedWarmSkills),
         onProgress: (event) => {
           const text =
             event.kind === "status"
@@ -8654,6 +7838,7 @@ export default function AgentChatModule({ config }: ModuleProps) {
         },
       });
       setPendingContinuation(session.pending);
+      setWarmSkills(mergeWarmSkills(prunedWarmSkills, session.usedSkills, currentTurn));
       setMessages((current) => {
         const nextMessages = [...current, createMessage("assistant", session.assistantText || "The model returned no text output.")];
         persistChatSessionNow(chatSessionKey, {
@@ -9586,7 +8771,13 @@ function ChatMarkdownImage({ src, alt }: { src?: string; alt?: string }) {
   );
 }
 
-function MessageBody({ role, text }: { role: ChatMessage["role"]; text: string }) {
+// Memoized deliberately: chat messages are never mutated after creation (submitUserPrompt only ever
+// appends new ones), so once a message has rendered it never needs to again — but without this,
+// every keystroke in the composer re-renders the whole component tree, and this function re-parses
+// Markdown (react-markdown + remark-gfm) for every past assistant/tool message on every single one
+// of those re-renders. In a long session with hundreds of tool-progress messages, that's the other
+// half of what made typing feel sluggish (the localStorage write above being the first half).
+const MessageBody = memo(function MessageBody({ role, text }: { role: ChatMessage["role"]; text: string }) {
   if (role === "user" || role === "error") {
     return <div style={{ fontSize: "0.86rem", lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{text}</div>;
   }
@@ -9621,7 +8812,7 @@ function MessageBody({ role, text }: { role: ChatMessage["role"]; text: string }
       </Markdown>
     </div>
   );
-}
+});
 
 function sendButtonStyle(enabled: boolean): CSSProperties {
   return {

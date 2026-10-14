@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
-import type { ModuleProps } from "module-core";
-import { useEditMode, useUpdateSlotMeta } from "module-core";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import type { ModuleProps, AgentModuleSkills } from "module-core";
+import { useEditMode, useRegisterAgentSkills, useUpdateSlotMeta } from "module-core";
 
 /**
  * Web View — loads any URL in a full-frame iframe.
@@ -17,6 +17,57 @@ import { useEditMode, useUpdateSlotMeta } from "module-core";
 export default function WebView({ config }: ModuleProps) {
   const { editMode } = useEditMode();
   const updateSlotMeta = useUpdateSlotMeta();
+
+  const agentSkills = useMemo<AgentModuleSkills>(() => ({
+    instanceId: config.id,
+    moduleName: "module-webview",
+    displayName: "Web View",
+    description: "Change the URL shown in this slot.",
+    skills: [
+      {
+        id: "manage-webview",
+        description: "Create a webview slot or change the URL it loads.",
+        prompt: "Use create_webview_slot to add a new webview slot with an initial URL, and set_webview_url to change the URL in an existing one. Every call needs the slot's full slotPath \u2014 use list_slot_tree (from module-core's workspace skill) if you do not already have it.",
+        tools: [
+  {
+    type: "function",
+    name: "create_webview_slot",
+    description: "Create a webview slot with an initial URL.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        url: { type: "string" },
+      },
+      required: ["slotId", "title", "url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "set_webview_url",
+    description: "Update the URL inside a webview slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        url: { type: "string" },
+      },
+      required: ["slotPath", "url"],
+      additionalProperties: false,
+    },
+  }
+        ],
+      },
+    ],
+  }), [config.id]);
+  useRegisterAgentSkills(agentSkills);
 
   const savedUrl = (config.meta?.url as string | undefined) ?? "";
 

@@ -1212,7 +1212,15 @@ function renderDiagramSvg(diagram: DiagramDefinition): string {
   if (queue.length === 0 && nodes[0]) queue.push(nodes[0].id);
   for (const nodeId of queue) levels.set(nodeId, 0);
 
-  while (queue.length) {
+  // Longest-path leveling only terminates on a DAG: each node's level can only ever increase, and in
+  // an acyclic graph that happens at most nodes.length times total across every node combined. A
+  // cycle (e.g. a test diagram's patch adding an edge back toward an earlier node) makes "nextLevel"
+  // grow forever around the loop with nothing to stop it — this hung the tab outright before this
+  // cap existed. Bailing out past this bound just freezes the layout where it is instead of hanging.
+  const maxLevelingSteps = nodes.length * nodes.length + diagram.edges.length + 1;
+  let levelingSteps = 0;
+  while (queue.length && levelingSteps < maxLevelingSteps) {
+    levelingSteps++;
     const nodeId = queue.shift()!;
     const nextLevel = (levels.get(nodeId) ?? 0) + 1;
     for (const targetId of outgoing.get(nodeId) ?? []) {
@@ -4274,12 +4282,28 @@ function TestManagerInner({ config }: ModuleProps) {
         prompt: [
           "Start with summarize_test_manager_spec or get_test_manager_spec to understand the current YAML, linked values, and procedure definitions before proposing any change.",
           "Use get_test_manager_run_summary to understand test progress before suggesting what to add or run next.",
-          "Always call validate_test_manager_spec on a candidate rewrite before calling set_test_manager_spec — it returns parse/structure issues and a compact summary so problems surface before anything is written.",
-          "Only call set_test_manager_spec after discussing the proposed change with the user and getting explicit confirmation; it replaces the entire spec, and the module reflects changes on next reload.",
+          "If there's no spec yet, or you're unsure of an idiom (diagram patches on a test, linked-value enums, reusable steps/procedures), call get_test_manager_schema_guide first — it has the full schema reference plus a complete real-world example spec. Pattern-match against that example rather than inventing structure from scratch.",
+          "pre_test_assets (diagrams, images, etc.) exist at three different levels and only render where you put them: program.pre_test_assets renders ONLY on the program overview/cover page, never on any individual test; a pre_test_assets list placed directly on a test_groups[] entry is the shared default for every test in that group; a pre_test_assets list placed directly on one test_groups[].tests[] entry renders only on that one test and overrides the group default. When the user asks for a diagram \"on test X\" or \"for this test case,\" it must go under that exact test object's own pre_test_assets — adding it to program.pre_test_assets instead is a common mistake and means the user will never see it on the test page.",
+          "Every diagram — a base diagrams.<id> entry, an inline pre_test_assets diagram, or a diagram_ref patch applied on top of a base — must be a DAG: no edge (including one added by add_edges in a patch) may create a path back to a node already reachable from it. A cycle doesn't error, it silently wrecks the layout (nodes end up scattered arbitrarily far apart instead of a clean flow), so validate_test_manager_spec checks for this and will fail with the exact cycle path if you introduce one. If you want to depict retry/repeat/loop semantics, use a label, note, or annotation to say so in words rather than an actual edge pointing back to an earlier node.",
+          "If the user describes what they want in general terms (a topic, a rough list, \"simple tests for X\") rather than literal YAML, you write the full candidate YAML yourself from that description, the schema guide, and your understanding of this spec's schema — never respond by asking the user to supply the YAML or exact test content themselves; that's your job.",
+          "Always call validate_test_manager_spec on a candidate rewrite before calling set_test_manager_spec — it returns parse/structure issues and a compact summary so problems surface before anything is written. If it fails, fix the candidate and validate again yourself; don't hand the error back to the user unless you're genuinely stuck.",
+          "Confirmation is only needed once: give a short summary of what the draft will contain, then write it as soon as the user affirms (\"yes\", \"do it\", \"go ahead\", or similar) — do not repeat the same not-written-yet status back to them or re-ask after they've already said go. If you already have enough to draft something reasonable, proposing the draft itself counts as asking, so don't stall on a bare status report first.",
+          "set_test_manager_spec replaces the entire spec and the module reflects changes on next reload.",
           "Never edit this module's backing files directly through the workspace bridge — these tools are the only supported way to change a test spec.",
           `This skill was offered by the test manager instance with slot_id "${config.id}" — use that unless the user points you at a different slotPath.`,
         ].join(" "),
         tools: [
+          {
+            type: "function",
+            name: "get_test_manager_schema_guide",
+            description: "Return the module-test-manager YAML authoring guide: the full schema reference (program, diagrams, instruments, linked_values, input_fields, test_defined_fields, steps, procedures, test_groups) plus a complete real-world example spec demonstrating idioms like diagram patches on individual tests and reusable procedures. Call this before drafting a spec from scratch or when unsure of a schema idiom — don't guess the shape.",
+            parameters: {
+              type: "object",
+              properties: {},
+              required: [],
+              additionalProperties: false,
+            },
+          },
           {
             type: "function",
             name: "get_test_manager_spec",
@@ -4367,6 +4391,130 @@ function TestManagerInner({ config }: ModuleProps) {
                 },
               },
               required: ["slot_id", "slotPath"],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+      {
+        id: "manage-test-results",
+        description: "List test cases, read and record per-test results/notes, manage run scope exclusions, and start new runs.",
+        prompt: [
+          "Use list_test_manager_cases to see every test case defined in the spec, each joined with its current status, notes, and exclusion state for a run — start here before recording or discussing results.",
+          "Use get_test_manager_result for the full detail (input values, step results, artifact counts) of a single test when list_test_manager_cases isn't enough.",
+          `status must be one of: ${STATUS_OPTIONS.join(", ")}.`,
+          "Use set_test_manager_result to record a status and/or notes for a test in a run; only the fields you pass are changed, everything else on the result is left as-is. Confirm findings with the user before recording pass/fail unless they've clearly already told you the outcome.",
+          "Use set_test_manager_exclusion to include or exclude a test from a run's scope, optionally with a reason — this does not delete the test from the spec, only from this run's active set.",
+          "Use create_test_manager_run to start a new run when the user wants a fresh pass rather than overwriting an existing run's results; it becomes the active run and snapshots the current spec onto the previous run if it didn't have one yet.",
+          "All of these operate on the run resolved by runId, or the slot's active run when runId is omitted — check get_test_manager_run_summary first if you're unsure which run is active.",
+          `This skill was offered by the test manager instance with slot_id "${config.id}" — use that unless the user points you at a different slotPath.`,
+        ].join(" "),
+        tools: [
+          {
+            type: "function",
+            name: "list_test_manager_cases",
+            description: "List every test case defined in a test-manager slot's spec, each joined with its current status, notes, and exclusion state from a run. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. Start here before discussing or recording results.",
+            parameters: {
+              type: "object",
+              properties: {
+                slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+                slotPath: {
+                  type: ["array", "null"],
+                  items: { type: "string" },
+                  minItems: 1,
+                  description: "Full slot path to the test-manager instance, or null when using slot_id.",
+                },
+                runId: { type: ["string", "null"], description: "Which run to join case status against, or null to use the slot's active run." },
+              },
+              required: ["slot_id", "slotPath", "runId"],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: "function",
+            name: "get_test_manager_result",
+            description: "Read the full recorded result for one test in a run: status, notes, input values, step results, and artifact counts. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut.",
+            parameters: {
+              type: "object",
+              properties: {
+                slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+                slotPath: {
+                  type: ["array", "null"],
+                  items: { type: "string" },
+                  minItems: 1,
+                  description: "Full slot path to the test-manager instance, or null when using slot_id.",
+                },
+                testId: { type: "string", description: "The test's id, as returned by list_test_manager_cases." },
+                runId: { type: ["string", "null"], description: "Which run to read from, or null to use the slot's active run." },
+              },
+              required: ["slot_id", "slotPath", "testId", "runId"],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: "function",
+            name: "set_test_manager_result",
+            description: `Record a status and/or notes and/or input values for one test in a run. Only the fields you pass are changed. status must be one of: ${STATUS_OPTIONS.join(", ")}. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut. The module reflects changes on next reload.`,
+            parameters: {
+              type: "object",
+              properties: {
+                slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+                slotPath: {
+                  type: ["array", "null"],
+                  items: { type: "string" },
+                  minItems: 1,
+                  description: "Full slot path to the test-manager instance, or null when using slot_id.",
+                },
+                testId: { type: "string", description: "The test's id, as returned by list_test_manager_cases." },
+                runId: { type: ["string", "null"], description: "Which run to write to, or null to use the slot's active run." },
+                status: { type: ["string", "null"], enum: [...STATUS_OPTIONS, null], description: "New status for this test, or null to leave it unchanged." },
+                notes: { type: ["string", "null"], description: "New free-text notes for this test, or null to leave them unchanged." },
+                inputValues: { type: ["object", "null"], additionalProperties: true, description: "Input field values to merge into this test's recorded inputs, or null to leave them unchanged." },
+              },
+              required: ["slot_id", "slotPath", "testId", "runId", "status", "notes", "inputValues"],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: "function",
+            name: "set_test_manager_exclusion",
+            description: "Include or exclude a test from a run's scope, optionally with a reason. Excluding does not delete the test from the spec, only from this run's active set. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut.",
+            parameters: {
+              type: "object",
+              properties: {
+                slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+                slotPath: {
+                  type: ["array", "null"],
+                  items: { type: "string" },
+                  minItems: 1,
+                  description: "Full slot path to the test-manager instance, or null when using slot_id.",
+                },
+                testId: { type: "string", description: "The test's id, as returned by list_test_manager_cases." },
+                runId: { type: ["string", "null"], description: "Which run to update, or null to use the slot's active run." },
+                excluded: { type: "boolean", description: "true to exclude this test from the run's scope, false to include it." },
+                reason: { type: ["string", "null"], description: "Reason for exclusion, or null to leave any existing reason as-is (cleared automatically when excluded is false)." },
+              },
+              required: ["slot_id", "slotPath", "testId", "runId", "excluded", "reason"],
+              additionalProperties: false,
+            },
+          },
+          {
+            type: "function",
+            name: "create_test_manager_run",
+            description: "Start a new run for a test-manager slot and make it active. Snapshots the current spec onto the previously active run if it didn't already have one. Prefer slotPath for consistency with other module APIs; slot_id is supported as a shortcut.",
+            parameters: {
+              type: "object",
+              properties: {
+                slot_id: { type: ["string", "null"], description: "The slot ID of the test-manager instance, or null when using slotPath." },
+                slotPath: {
+                  type: ["array", "null"],
+                  items: { type: "string" },
+                  minItems: 1,
+                  description: "Full slot path to the test-manager instance, or null when using slot_id.",
+                },
+                label: { type: ["string", "null"], description: "Label for the new run, or null to default to \"Run N\"." },
+              },
+              required: ["slot_id", "slotPath", "label"],
               additionalProperties: false,
             },
           },

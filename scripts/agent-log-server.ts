@@ -63,6 +63,18 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
 
 type AnyItem = Record<string, unknown>;
 
+// The instructions string is almost always identical call-to-call (it's the fixed root prompt plus
+// slow-changing context bits like loaded modules/organizer summary) — printing it in full on every
+// single call just buries the actually-interesting INPUT/OUTPUT items. Print it once per distinct
+// string seen this process, then collapse repeats to a marker.
+const seenInstructions = new Set<string>();
+
+function renderInstructions(instructions: string): string {
+  if (seenInstructions.has(instructions)) return "<ROOT PROMPT>";
+  seenInstructions.add(instructions);
+  return instructions;
+}
+
 function logEntry(entry: Record<string, unknown>): void {
   const at = typeof entry["at"] === "string" ? entry["at"] : new Date().toISOString();
   const model = entry["model"] ?? "?";
@@ -78,12 +90,29 @@ function logEntry(entry: Record<string, unknown>): void {
   lines.push(`\n${"=".repeat(8)} agent-chat OpenAI call — ${at} ${"=".repeat(8)}`);
   lines.push(`model=${model}  status=${status}`);
   lines.push(`--- INSTRUCTIONS sent to the model ---`);
-  lines.push(instructions);
+  lines.push(renderInstructions(instructions));
   lines.push(`--- INPUT sent to the model (${input.length} item(s)) ---`);
   for (const item of input) lines.push(JSON.stringify(item));
   lines.push(`--- OUTPUT received from the model (${output.length} item(s)) ---`);
   for (const item of output) lines.push(JSON.stringify(item));
   if (outputText) lines.push(`--- output_text ---\n${outputText}`);
+
+  // response["status"]/incomplete_details/usage are normally excluded as routine API bookkeeping
+  // (see file header), but when the model's own status isn't "completed" or every output item came
+  // back with empty text, they're the only thing that explains why — e.g. incomplete_details:
+  // {"reason":"max_output_tokens"} means reasoning tokens ate the whole budget before any visible
+  // answer was produced. Surface them only in that case, not on every routine call.
+  const responseStatus = typeof response["status"] === "string" ? response["status"] : undefined;
+  const allOutputTextEmpty = output.length > 0 && output.every((item) => {
+    const content = (item as AnyItem)["content"];
+    if (!Array.isArray(content)) return true;
+    return content.every((part) => !(part as AnyItem)?.["text"]);
+  });
+  if ((responseStatus && responseStatus !== "completed") || allOutputTextEmpty) {
+    lines.push(`--- DIAGNOSTIC: response.status=${responseStatus ?? "?"}, output text empty=${allOutputTextEmpty} ---`);
+    if (response["incomplete_details"] !== undefined) lines.push(`incomplete_details: ${JSON.stringify(response["incomplete_details"])}`);
+    if (response["usage"] !== undefined) lines.push(`usage: ${JSON.stringify(response["usage"])}`);
+  }
   if (apiError) lines.push(`--- API ERROR ---\n${apiError}`);
 
   const body = lines.join("\n");

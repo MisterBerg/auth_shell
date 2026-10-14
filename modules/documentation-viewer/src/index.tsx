@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DependencyList, ReactNode } from "react";
-import type { ExportContext, ModuleProps } from "module-core";
+import type { ExportContext, ModuleProps, AgentModuleSkills } from "module-core";
 import {
   AuthProvider,
   useAuthContext,
   useAwsS3Client,
   useEditMode,
+  useRegisterAgentSkills,
   useUpdateSlotMeta,
 } from "module-core";
 import { GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
@@ -1320,6 +1321,211 @@ export default function DocumentationViewer({ config }: ModuleProps) {
   const auth = useAuthContext();
   const { editMode } = useEditMode();
   const updateSlotMeta = useUpdateSlotMeta();
+
+  const agentSkills = useMemo<AgentModuleSkills>(() => ({
+    instanceId: config.id,
+    moduleName: "module-documentation-viewer",
+    displayName: "Documentation Editor",
+    description: "Read, search, and edit pages in this documentation tree.",
+    skills: [
+      {
+        id: "manage-pages",
+        description: "Read, search, and edit pages inside this documentation-viewer slot.",
+        prompt: "Use read_documentation_tree for the page manifest, search_documentation_content or read_documentation_pages before editing anything so you understand what is there, then create_documentation_page/update_documentation_page/rename_documentation_page/move_documentation_page/delete_documentation_page to change it. Every call needs the slot's full slotPath \u2014 use list_slot_tree (from module-core's workspace skill) if you do not already have it.",
+        tools: [
+  {
+    type: "function",
+    name: "create_documentation_slot",
+    description: "Create a documentation-viewer slot and initialize it with starter pages and content in one operation.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        pages: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              content: { type: "string" },
+              action: { type: "string", enum: ["child", "sibling"] },
+              afterDocTitle: { type: "string" },
+            },
+            required: ["title"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_documentation_tree",
+    description: "Read the manifest and page summaries for a documentation-viewer module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        includeContent: { type: "boolean" },
+        maxCharsPerDoc: { type: "integer", minimum: 200, maximum: 50000 },
+      },
+      required: ["slotPath"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "search_documentation_content",
+    description: "Search titles and markdown content inside a documentation-viewer module slot and return matching pages with snippets.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        query: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+        maxSnippetChars: { type: "integer", minimum: 80, maximum: 4000 },
+      },
+      required: ["slotPath", "query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "read_documentation_pages",
+    description: "Read specific documentation-viewer pages by doc id, including full or truncated content.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docIds: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        maxCharsPerDoc: { type: "integer", minimum: 200, maximum: 50000 },
+      },
+      required: ["slotPath", "docIds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "create_documentation_page",
+    description: "Create a child or sibling page in a documentation-viewer module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        currentDocId: { type: "string" },
+        title: { type: "string" },
+        action: { type: "string", enum: ["child", "sibling"] },
+        content: { type: "string" },
+      },
+      required: ["slotPath", "currentDocId", "title", "action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "update_documentation_page",
+    description: "Replace the markdown content of a documentation-viewer page.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docId: { type: "string" },
+        content: { type: "string" },
+      },
+      required: ["slotPath", "docId", "content"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "rename_documentation_page",
+    description: "Rename a documentation-viewer page title.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docId: { type: "string" },
+        title: { type: "string" },
+      },
+      required: ["slotPath", "docId", "title"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "move_documentation_page",
+    description: "Reorder or reparent a documentation-viewer page using the module's native move directions.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docId: { type: "string" },
+        direction: { type: "string", enum: ["up", "down", "promote", "demote"] },
+      },
+      required: ["slotPath", "docId", "direction"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "delete_documentation_page",
+    description: "Delete a page from a documentation-viewer module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        docId: { type: "string" },
+      },
+      required: ["slotPath", "docId"],
+      additionalProperties: false,
+    },
+  }
+        ],
+      },
+    ],
+  }), [config.id]);
+  useRegisterAgentSkills(agentSkills);
+
   const storage = useMemo(() => getStorageConfig(config), [config]);
   const hasPersistedStorageMeta =
     (config.meta?.["storageBucket"] as string | undefined) === storage.bucket &&

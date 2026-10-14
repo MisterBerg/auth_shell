@@ -1,9 +1,9 @@
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import type { CSSProperties } from "react";
 import type { MouseEvent } from "react";
-import type { ModuleProps } from "module-core";
-import { useEditMode, useUpdateSlotMeta } from "module-core";
+import type { ModuleProps, AgentModuleSkills } from "module-core";
+import { useEditMode, useRegisterAgentSkills, useUpdateSlotMeta } from "module-core";
 
 type LinkItem = {
   text: string;
@@ -45,6 +45,80 @@ function normalizeUrl(rawUrl: string): string {
 export default function LinksModule({ config }: ModuleProps) {
   const { editMode } = useEditMode();
   const updateSlotMeta = useUpdateSlotMeta();
+
+  const agentSkills = useMemo<AgentModuleSkills>(() => ({
+    instanceId: config.id,
+    moduleName: "module-links",
+    displayName: "Links",
+    description: "Manage the list of links shown in this slot.",
+    skills: [
+      {
+        id: "manage-links",
+        description: "Create a links slot or replace the links shown in an existing one.",
+        prompt: "Use create_links_slot to add a new links slot with an initial list, and set_links_slot_items to replace the links in an existing one. Every call needs the slot's full slotPath \u2014 use list_slot_tree (from module-core's workspace skill) if you do not already have it.",
+        tools: [
+  {
+    type: "function",
+    name: "create_links_slot",
+    description: "Create a links module slot with an initial set of links.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentSlotPath: { type: "array", items: { type: "string" } },
+        slotId: { type: "string" },
+        title: { type: "string" },
+        links: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              text: { type: "string" },
+              url: { type: "string" },
+            },
+            required: ["text", "url"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotId", "title", "links"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "set_links_slot_items",
+    description: "Replace the configured links inside a links module slot.",
+    parameters: {
+      type: "object",
+      properties: {
+        slotPath: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+        },
+        links: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              text: { type: "string" },
+              url: { type: "string" },
+            },
+            required: ["text", "url"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["slotPath", "links"],
+      additionalProperties: false,
+    },
+  }
+        ],
+      },
+    ],
+  }), [config.id]);
+  useRegisterAgentSkills(agentSkills);
+
   const hasConfiguredLinks = Array.isArray(config.meta?.links);
   const savedLinks = readLinks(config.meta?.links);
   const links = hasConfiguredLinks ? savedLinks : DEFAULT_LINKS;

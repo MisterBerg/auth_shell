@@ -41,10 +41,6 @@ export default function LayoutTabsLeft({ config }: ModuleProps) {
   useEffect(() => { setSlots(config.children ?? []); }, [config]);
 
   const [activeId,   setActiveId]   = useState<string | undefined>(() => (config.children ?? [])[0]?.slotId);
-  const [everActive, setEverActive] = useState<Set<string>>(() => {
-    const first = (config.children ?? [])[0]?.slotId;
-    return new Set(first ? [first] : []);
-  });
   const [showPicker, setShowPicker] = useState(false);
   const [addError,   setAddError]   = useState<string | undefined>();
   const [isAdding,   setIsAdding]   = useState(false);
@@ -98,7 +94,6 @@ export default function LayoutTabsLeft({ config }: ModuleProps) {
     }
     setSlots(updated);
     setActiveId(newSlot.slotId);
-    setEverActive((prev) => new Set([...prev, newSlot.slotId]));
     setIsAdding(false);
   }, [isAdding, slots, writeConfig]);
 
@@ -140,7 +135,7 @@ export default function LayoutTabsLeft({ config }: ModuleProps) {
             return (
               <div
                 key={slot.slotId}
-                onClick={() => { if (editingId !== slot.slotId) { setActiveId(slot.slotId); setEverActive((prev) => new Set([...prev, slot.slotId])); } }}
+                onClick={() => { if (editingId !== slot.slotId) { setActiveId(slot.slotId); } }}
                 style={{
                   display: "flex", alignItems: "center", gap: "0.4rem",
                   padding: "0.45rem 0.6rem", borderRadius: 6,
@@ -217,11 +212,17 @@ export default function LayoutTabsLeft({ config }: ModuleProps) {
       </div>
 
       {/* ── Content pane — all slots mounted, only active visible ── */}
+      {/* Genuinely all of them now, not just ones a human has clicked into: a module sitting in a
+          tab nobody has opened yet still needs to be mounted for its useRegisterAgentSkills call to
+          fire, or the agent can't see or act on it at all — see the agent-chat conversation this
+          fixed. Tabs are still cheap to mount for the same reason SlotContainer is already used
+          everywhere: modules only fetch their own data on mount, so this doesn't front-load any more
+          work than opening every tab by hand would. */}
       <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: "relative" }}>
         {slots.length === 0 ? (
           <EmptyState editMode={editMode} onAdd={() => setShowPicker(true)} />
         ) : (
-          slots.filter((slot) => everActive.has(slot.slotId)).map((slot) => (
+          slots.map((slot) => (
             <div
               key={slot.slotId}
               style={{
